@@ -1,0 +1,19 @@
+[package]
+name = "vakya"
+description = "A modern, powerful rust http library"
+repository = "https://github.com/karmaio-rs/vakya"
+readme = "README.md"
+authors = ["Tarak Sharma <tarak@taraksharma.com>"]
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+
+categories = ["asynchronous", "network-programming", "web-programming"]
+keywords = ["async", "http", "karmaio"]
+
+rust-version = "1.95"
+edition = "2024"
+
+[dependencies]
+http = { version = "1.5.0" }
+karmaio = { version = "0.1.0-alpha.1", features = ["net", "signal"] }
