@@ -7,11 +7,11 @@ use http::HeaderMap;
 /// occur at most once; producers and consumers enforce that sequence.
 #[derive(Debug)]
 pub struct Frame<D> {
-    kind: Kind<D>,
+    pub(super) kind: Kind<D>,
 }
 
 #[derive(Debug)]
-enum Kind<D> {
+pub(super) enum Kind<D> {
     Data(D),
     Trailers(HeaderMap),
 }

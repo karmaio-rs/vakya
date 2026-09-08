@@ -10,7 +10,9 @@ pub mod body;
 pub mod error;
 pub mod service;
 
-pub use body::{Frame, SizeHint, TrailerHint};
+mod future;
+
+pub use body::{Body, CollectError, Collected, Either, Empty, Frame, Full, MapError, SizeHint, TrailerHint, collect};
 pub use error::{Error, ErrorKind};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 pub use service::{Service, service_fn};
