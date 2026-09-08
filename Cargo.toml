@@ -5,6 +5,7 @@ repository = "https://github.com/karmaio-rs/vakya"
 readme = "README.md"
 authors = ["Tarak Sharma <tarak@taraksharma.com>"]
 license = "MIT OR Apache-2.0"
+exclude = ["AGENTS.md"]
 
 version = "0.1.0"
 
@@ -14,6 +15,22 @@ keywords = ["async", "http", "karmaio"]
 rust-version = "1.95"
 edition = "2024"
 
+[features]
+default = []
+http1 = ["dep:httparse"]
+client = ["http1"]
+server = ["http1", "dep:httpdate"]
+tls = ["karmaio/tls-rustls"]
+tracing = ["dep:tracing"]
+full = ["client", "server", "tls", "tracing"]
+
 [dependencies]
-http = { version = "1.5.0" }
-karmaio = { version = "0.1.0-alpha.1", features = ["net", "signal"] }
+bytes = "1"
+http = "1.5.0"
+karmaio = { version = "0.1.0", default-features = false, features = ["bytes", "net"] }
+httparse = { version = "1", optional = true }
+httpdate = { version = "1", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
