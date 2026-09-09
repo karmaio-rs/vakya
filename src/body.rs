@@ -1,18 +1,22 @@
 //! Completion-native streaming bodies and payload metadata.
 
+mod boxed;
 mod collect;
 mod combinator;
 mod frame;
 mod simple;
 mod size_hint;
+mod stream;
 
 use karmaio::buf::IoBuf;
 
+pub use boxed::BoxBody;
 pub use collect::{CollectError, Collected, collect};
-pub use combinator::{Either, MapError};
+pub use combinator::{Either, InspectFrame, MapError, MapFrame, WithTrailers};
 pub use frame::Frame;
 pub use simple::{Empty, Full};
 pub use size_hint::SizeHint;
+pub use stream::{BodyDataStream, BodyStream, StreamBody};
 
 /// A completion-native producer of owned data and trailing headers.
 ///
@@ -111,6 +115,102 @@ impl<B: Body + ?Sized> Body for &mut B {
         (**self).recycle(data);
     }
 }
+
+/// Native conveniences for composing and consuming bodies.
+///
+/// Composition retains concrete types and futures unless [`BodyExt::boxed`]
+/// explicitly erases them. Borrow with `&mut body` when the underlying producer
+/// should remain available after a consuming operation.
+#[allow(async_fn_in_trait)]
+pub trait BodyExt: Body {
+    /// Erases this body locally, preserving metadata and recycling.
+    ///
+    /// This boxes the producer and each driven frame future. Payload and error
+    /// types remain fixed. No `Send`, `Sync`, or `'static` bound is added.
+    #[inline]
+    fn boxed<'a>(self) -> BoxBody<'a, Self::Data, Self::Error>
+    where
+        Self: Sized + 'a,
+    {
+        BoxBody::new(self)
+    }
+
+    /// Collects this body within an explicit payload-byte limit.
+    ///
+    /// See [`collect`] for errors, trailer preservation, and cancellation.
+    async fn collect(mut self, max_bytes: usize) -> Result<Collected, CollectError<Self::Error>>
+    where
+        Self: Sized,
+    {
+        collect(&mut self, max_bytes).await
+    }
+
+    /// Maps errors while preserving frame ownership, metadata, and recycling.
+    #[inline]
+    fn map_err<F, E>(self, map: F) -> MapError<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(Self::Error) -> E,
+    {
+        MapError::new(self, map)
+    }
+
+    /// Observes frames without changing metadata or recycling.
+    #[inline]
+    fn inspect_frame<F>(self, inspect: F) -> InspectFrame<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(&Frame<Self::Data>),
+    {
+        InspectFrame::new(self, inspect)
+    }
+
+    /// Transforms frames, resetting size/trailer hints and dropping recycled output.
+    ///
+    /// The transformation must preserve valid data/trailer ordering.
+    #[inline]
+    fn map_frame<F, D>(self, map: F) -> MapFrame<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(Frame<Self::Data>) -> Frame<D>,
+        D: IoBuf,
+    {
+        MapFrame::new(self, map)
+    }
+
+    /// Appends fields to existing trailers or emits them after successful EOF.
+    #[inline]
+    fn with_trailers(self, trailers: http::HeaderMap) -> WithTrailers<Self>
+    where
+        Self: Sized,
+    {
+        WithTrailers::new(self, trailers)
+    }
+
+    /// Converts to a Karmaio frame stream, preserving trailers and errors.
+    ///
+    /// Stream consumption has no automatic body-recycling callback.
+    #[inline]
+    fn into_frame_stream(self) -> BodyStream<Self>
+    where
+        Self: Sized,
+    {
+        BodyStream::new(self)
+    }
+
+    /// Converts to a Karmaio data stream, explicitly discarding trailers.
+    ///
+    /// Stream consumption has no automatic body-recycling callback.
+    #[inline]
+    fn into_data_stream(self) -> BodyDataStream<Self>
+    where
+        Self: Sized,
+    {
+        BodyDataStream::new(self)
+    }
+}
+
+impl<B: Body + ?Sized> BodyExt for B {}
 
 /// Whether a body may produce trailing header fields.
 ///

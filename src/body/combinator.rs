@@ -183,6 +183,213 @@ where
     }
 }
 
+/// A body that observes frames without changing payloads or metadata.
+///
+/// The observer is called once for each yielded frame. Recycling is forwarded
+/// to the original producer. Errors pass through without calling the observer.
+#[derive(Debug)]
+pub struct InspectFrame<B, F> {
+    body: B,
+    inspect: F,
+}
+
+impl<B, F> InspectFrame<B, F> {
+    /// Wraps a body with a synchronous frame observer.
+    #[inline]
+    pub const fn new(body: B, inspect: F) -> Self {
+        Self { body, inspect }
+    }
+}
+
+impl<B: Body, F: FnMut(&Frame<B::Data>)> Body for InspectFrame<B, F> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    async fn next_frame(&mut self) -> Result<Option<Frame<Self::Data>>, Self::Error> {
+        let frame = self.body.next_frame().await?;
+        if let Some(frame) = &frame {
+            (self.inspect)(frame);
+        }
+        Ok(frame)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+    #[inline]
+    fn trailer_hint(&self) -> TrailerHint {
+        self.body.trailer_hint()
+    }
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    #[inline]
+    fn recycle(&mut self, data: Self::Data) {
+        self.body.recycle(data);
+    }
+}
+
+/// A body that transforms each frame and invalidates its original metadata.
+///
+/// The mapping function must preserve valid data/trailer ordering. Size is
+/// unknown and trailers are possible until termination. Recovered output is
+/// dropped: arbitrary transformations do not retain a route to the original
+/// producer's buffer. Use error mapping or inspection to preserve recycling.
+#[derive(Debug)]
+pub struct MapFrame<B, F> {
+    body: B,
+    map: F,
+    done: bool,
+}
+
+impl<B, F> MapFrame<B, F> {
+    /// Wraps a body with a synchronous frame transformation.
+    #[inline]
+    pub const fn new(body: B, map: F) -> Self {
+        Self { body, map, done: false }
+    }
+}
+
+impl<B, F, D> Body for MapFrame<B, F>
+where
+    B: Body,
+    F: FnMut(Frame<B::Data>) -> Frame<D>,
+    D: IoBuf,
+{
+    type Data = D;
+    type Error = B::Error;
+
+    async fn next_frame(&mut self) -> Result<Option<Frame<D>>, Self::Error> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.body.next_frame().await {
+            Ok(Some(frame)) => Ok(Some((self.map)(frame))),
+            result => {
+                self.done = true;
+                result.map(|_| None)
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> SizeHint {
+        if self.done {
+            SizeHint::with_exact(0)
+        } else {
+            SizeHint::new()
+        }
+    }
+    #[inline]
+    fn trailer_hint(&self) -> TrailerHint {
+        if self.done {
+            TrailerHint::None
+        } else {
+            TrailerHint::MayHave
+        }
+    }
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+}
+
+/// A body that appends supplied fields to its trailing headers.
+///
+/// Existing trailer values are preserved, including duplicate names. If the
+/// source has no trailers, one frame is emitted after successful completion.
+/// Producer errors are preserved, even after an existing trailers frame. On
+/// error, fields not yet attached are discarded. Payload metadata and recycling
+/// are forwarded; pending trailers prevent an early end-of-stream hint.
+#[derive(Debug)]
+pub struct WithTrailers<B> {
+    body: B,
+    pending: Option<http::HeaderMap>,
+    done: bool,
+}
+
+impl<B> WithTrailers<B> {
+    /// Attaches fields without copying their values or allocating another map.
+    ///
+    /// Merging into existing trailers can grow that map. HTTP execution is
+    /// responsible for validating trailer fields and wire-size limits.
+    #[inline]
+    pub fn new(body: B, trailers: http::HeaderMap) -> Self {
+        Self {
+            body,
+            pending: Some(trailers),
+            done: false,
+        }
+    }
+}
+
+impl<B: Body> Body for WithTrailers<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    async fn next_frame(&mut self) -> Result<Option<Frame<Self::Data>>, Self::Error> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.body.next_frame().await {
+            Ok(Some(mut frame)) => {
+                if let super::frame::Kind::Trailers(fields) = &mut frame.kind
+                    && let Some(pending) = self.pending.take()
+                {
+                    let mut name = None;
+                    for (next_name, value) in pending {
+                        if next_name.is_some() {
+                            name = next_name;
+                        }
+                        // HeaderMap's owned iterator uses None only for
+                        // subsequent values of the preceding field name.
+                        fields.append(name.as_ref().expect("trailer value has a field name"), value);
+                    }
+                }
+                Ok(Some(frame))
+            }
+            Ok(None) => {
+                self.done = true;
+                Ok(self.pending.take().map(Frame::trailers))
+            }
+            Err(error) => {
+                self.done = true;
+                self.pending = None;
+                Err(error)
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> SizeHint {
+        if self.done {
+            SizeHint::with_exact(0)
+        } else {
+            self.body.size_hint()
+        }
+    }
+    #[inline]
+    fn trailer_hint(&self) -> TrailerHint {
+        if self.done {
+            TrailerHint::None
+        } else if self.pending.is_some() {
+            TrailerHint::MayHave
+        } else {
+            self.body.trailer_hint()
+        }
+    }
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+    #[inline]
+    fn recycle(&mut self, data: Self::Data) {
+        self.body.recycle(data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Body, Either, Frame, MapError, SizeHint};
