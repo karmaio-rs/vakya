@@ -19,3 +19,6 @@ pub use body::{
 pub use error::{Error, ErrorKind};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 pub use service::{Service, service_fn};
+
+#[cfg(feature = "http1")]
+mod proto;
