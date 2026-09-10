@@ -13,7 +13,7 @@ use http::{
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct DecodeLimits {
+pub(crate) struct DecodeLimits {
     max_chunk_line_bytes: usize,
     max_trailer_bytes: usize,
     max_trailers: usize,

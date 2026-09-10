@@ -1,5 +1,7 @@
 //! Public error categories for HTTP and connection operations.
 
+#[cfg(feature = "http1")]
+use std::rc::Rc;
 use std::{error::Error as StdError, fmt, io};
 
 /// A stable, high-level category for a Vakya operation failure.
@@ -72,7 +74,13 @@ impl ErrorKind {
 pub struct Error {
     kind: ErrorKind,
     context: &'static str,
-    source: Option<Box<dyn StdError + 'static>>,
+    source: Option<Source>,
+}
+
+enum Source {
+    Owned(Box<dyn StdError + 'static>),
+    #[cfg(feature = "http1")]
+    Shared(Rc<dyn StdError + 'static>),
 }
 
 impl Error {
@@ -89,8 +97,29 @@ impl Error {
         E: StdError + 'static,
     {
         let mut error = Self::new(kind, context);
-        error.source = Some(Box::new(source));
+        error.source = Some(Source::Owned(Box::new(source)));
         error
+    }
+
+    /// Share a source only when both a body and its driver must report it.
+    /// The public error remains non-Clone and source downcasts stay unchanged.
+    #[cfg(feature = "http1")]
+    pub(crate) fn split(self) -> (Self, Self) {
+        let source = self.source.map(|source| match source {
+            Source::Owned(source) => Rc::from(source),
+            Source::Shared(source) => source,
+        });
+        let first = Self {
+            kind: self.kind,
+            context: self.context,
+            source: source.clone().map(Source::Shared),
+        };
+        let second = Self {
+            kind: self.kind,
+            context: self.context,
+            source: source.map(Source::Shared),
+        };
+        (first, second)
     }
 
     pub(crate) fn from_io(source: io::Error) -> Self {
@@ -134,7 +163,11 @@ impl fmt::Display for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_deref()
+        self.source.as_ref().map(|source| match source {
+            Source::Owned(source) => source.as_ref(),
+            #[cfg(feature = "http1")]
+            Source::Shared(source) => source.as_ref(),
+        })
     }
 }
 

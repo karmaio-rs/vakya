@@ -37,9 +37,9 @@ impl BodyMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct EncodeLimits {
-    max_head_bytes: usize,
-    max_trailer_bytes: usize,
+pub(crate) struct EncodeLimits {
+    pub(super) max_head_bytes: usize,
+    pub(super) max_trailer_bytes: usize,
 }
 
 impl EncodeLimits {

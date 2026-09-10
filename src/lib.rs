@@ -29,3 +29,6 @@ mod io;
 #[cfg(all(test, feature = "http1"))]
 #[path = "../tests/support/transport.rs"]
 mod test_transport;
+
+#[cfg(feature = "server")]
+pub mod server;

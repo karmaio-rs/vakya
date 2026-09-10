@@ -145,6 +145,22 @@ impl Exchange {
         Ok((head, HeadAction::Final))
     }
 
+    /// Record a validated final head committed by the server writer. Upload
+    /// completion remains independent and is acknowledged through `settle`.
+    pub(super) fn sent_final(&mut self, persistence: Persistence) -> Result<(), crate::Error> {
+        if self.failed || self.phase != ResponsePhase::AwaitingHead {
+            return Err(crate::Error::new(
+                crate::ErrorKind::Internal,
+                "invalid final response transition",
+            ));
+        }
+        self.phase = ResponsePhase::Final;
+        if persistence == Persistence::Close {
+            self.persistence = Persistence::Close;
+        }
+        Ok(())
+    }
+
     /// Release an Expect wait after a driver's explicit timeout/proceed decision.
     pub(super) fn allow_request_body(&mut self) {
         self.waiting_continue = false;

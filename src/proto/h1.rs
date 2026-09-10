@@ -2,12 +2,14 @@ mod syntax;
 use syntax::trim_ows;
 
 pub(super) mod bridge;
-pub(super) mod config;
+pub(crate) mod config;
 pub(super) mod decode;
 pub(super) mod encode;
 pub(super) mod exchange;
 pub(super) mod head;
 mod inline;
+#[cfg(feature = "server")]
+pub(crate) mod server;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BodyMode {

@@ -34,3 +34,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"], optio
 
 [package.metadata.docs.rs]
 all-features = true
+
+[[example]]
+name = "server"
+required-features = ["server"]
+
+[[example]]
+name = "streaming_echo"
+required-features = ["server"]

@@ -117,7 +117,12 @@ pub(super) async fn receive_body<R, S: Receive<R>>(
         match cancellable_wait(producer.offer(frame), cancellation).await {
             Some(Ok(())) => {}
             Some(Err(OfferError::Abandoned(_))) => return (ReceiveEnd::Abandoned, buffer),
-            Some(Err(OfferError::Closed(_))) => return (ReceiveEnd::Failed(ErrorKind::Closed), buffer),
+            Some(Err(OfferError::Closed(_))) => {
+                return (
+                    ReceiveEnd::Failed(Error::new(ErrorKind::Closed, "body handoff closed")),
+                    buffer,
+                );
+            }
             None => return (ReceiveEnd::fail(producer, Error::from(operation_canceled())), buffer),
         }
     }
@@ -151,20 +156,19 @@ async fn read_or_abandoned<R, S: Receive<R>>(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(super) enum ReceiveEnd {
     Complete,
     Abandoned,
-    /// The original error is delivered through Incoming; the activity reports
-    /// its category without cloning or erasing a local source a second time.
-    Failed(ErrorKind),
+    /// Shares the original source with the error delivered to Incoming.
+    Failed(Error),
 }
 
 impl ReceiveEnd {
     fn fail(producer: IncomingProducer, error: Error) -> Self {
-        let kind = error.kind();
-        producer.fail(error);
-        Self::Failed(kind)
+        let (incoming, driver) = error.split();
+        producer.fail(incoming);
+        Self::Failed(driver)
     }
 }
 
@@ -374,7 +378,7 @@ mod tests {
                     );
                     let ((end, mut buffer), collected) = pair(driver, collect(&mut body, 16)).await;
                     let collected = collected.unwrap();
-                    assert_eq!(end, ReceiveEnd::Complete);
+                    assert!(matches!(end, ReceiveEnd::Complete));
                     assert_eq!(collected.as_ref(), expected);
                     if mode == BodyMode::Chunked {
                         assert_eq!(collected.trailers().unwrap()["x-end"], "yes");
@@ -441,7 +445,7 @@ mod tests {
             let Poll::Ready((end, _)) = poll(driver.as_mut()) else {
                 panic!("fixed completion required extra demand")
             };
-            assert_eq!(end, ReceiveEnd::Complete);
+            assert!(matches!(end, ReceiveEnd::Complete));
             assert_eq!(first.as_ref(), b"abc");
         });
     }
@@ -482,7 +486,7 @@ mod tests {
                 let Poll::Ready((end, buffer)) = poll(driver.as_mut()) else {
                     panic!("read not settled")
                 };
-                assert_eq!(end, ReceiveEnd::Abandoned);
+                assert!(matches!(end, ReceiveEnd::Abandoned));
                 assert_eq!(buffer.bytes(), if success { b"x".as_slice() } else { b"".as_slice() });
                 assert_eq!(calls.get(), 1);
             }
@@ -513,7 +517,7 @@ mod tests {
                         let Poll::Ready((end, _)) = poll(driver.as_mut()) else {
                             panic!("offer cancellation did not settle")
                         };
-                        assert_eq!(end, ReceiveEnd::Failed(ErrorKind::Canceled));
+                        assert!(matches!(end, ReceiveEnd::Failed(ref error) if error.kind() == ErrorKind::Canceled));
                     }
                 }
                 let Poll::Ready(Err(error)) = poll(pin!(body.next_frame())) else {
@@ -551,7 +555,7 @@ mod tests {
                     None,
                 );
                 let ((end, _), result) = pair(driver, collect(&mut body, 16)).await;
-                assert_eq!(end, ReceiveEnd::Failed(ErrorKind::InvalidMessage));
+                assert!(matches!(end, ReceiveEnd::Failed(ref error) if error.kind() == ErrorKind::InvalidMessage));
                 let crate::CollectError::Body(error) = result.unwrap_err() else {
                     panic!("wrong failure")
                 };
@@ -593,7 +597,7 @@ mod tests {
                 None,
             );
             let ((end, buffer), sent) = pair(receive, send_body(&mut writer, &mut body, &mut encoder, None)).await;
-            assert_eq!(end, ReceiveEnd::Complete);
+            assert!(matches!(end, ReceiveEnd::Complete));
             assert_eq!(sent.unwrap().trailer_frames, 1);
             assert_eq!(writer.output, b"4\r\nbody\r\n0\r\nx-end: yes\r\n\r\n");
             assert_eq!(buffer.bytes(), b"NEXT");
@@ -963,7 +967,7 @@ mod tests {
             assert!(poll(driver.as_mut()).is_pending());
             drop(body);
             let (end, buffer) = driver.await;
-            assert_eq!(end, ReceiveEnd::Abandoned);
+            assert!(matches!(end, ReceiveEnd::Abandoned));
             assert!(buffer.bytes().is_empty());
         });
     }

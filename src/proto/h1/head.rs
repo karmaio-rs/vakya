@@ -8,7 +8,7 @@ use http::{
 use std::{marker::PhantomData, mem::MaybeUninit, slice};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct HeadLimits {
+pub(crate) struct HeadLimits {
     max_bytes: usize,
     max_headers: usize,
 }
