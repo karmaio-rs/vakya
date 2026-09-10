@@ -42,3 +42,7 @@ required-features = ["server"]
 [[example]]
 name = "streaming_echo"
 required-features = ["server"]
+
+[[example]]
+name = "client"
+required-features = ["client"]

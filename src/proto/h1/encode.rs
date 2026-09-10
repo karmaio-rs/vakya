@@ -100,10 +100,21 @@ pub(super) fn encode_request_head(
     method: Method,
     target: Uri,
     version: Version,
-    mut headers: HeaderMap,
+    headers: HeaderMap,
     metadata: BodyMetadata,
     limits: EncodeLimits,
 ) -> Result<EncodedHead, EncodeError> {
+    prepare_request_head(method, target, version, headers, metadata, limits).map(|(head, _)| head)
+}
+
+pub(super) fn prepare_request_head(
+    method: Method,
+    target: Uri,
+    version: Version,
+    mut headers: HeaderMap,
+    metadata: BodyMetadata,
+    limits: EncodeLimits,
+) -> Result<(EncodedHead, super::head::ValidatedRequestHead), EncodeError> {
     let mode = plan_request_framing(&mut headers, version, metadata)?;
     let validated = RequestHead {
         method,
@@ -126,12 +137,15 @@ pub(super) fn encode_request_head(
     writer.push(b"\r\n")?;
     write_headers(&mut writer, &validated.head.headers)?;
     writer.push(b"\r\n")?;
-    Ok(EncodedHead {
-        bytes: writer.finish(),
-        mode,
-        persistence: validated.persistence,
-        upgrade: None,
-    })
+    Ok((
+        EncodedHead {
+            bytes: writer.finish(),
+            mode,
+            persistence: validated.persistence,
+            upgrade: None,
+        },
+        validated,
+    ))
 }
 
 pub(super) fn encode_response_head(

@@ -11,6 +11,9 @@ mod inline;
 #[cfg(feature = "server")]
 pub(crate) mod server;
 
+#[cfg(feature = "client")]
+pub(crate) mod client;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BodyMode {
     None,
