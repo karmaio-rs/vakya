@@ -13,8 +13,8 @@ pub mod service;
 mod future;
 
 pub use body::{
-    Body, BodyDataStream, BodyExt, BodyStream, BoxBody, CollectError, Collected, Either, Empty, Frame, Full,
-    InspectFrame, MapError, MapFrame, SizeHint, StreamBody, TrailerHint, WithTrailers, collect,
+    Body, BodyDataStream, BodyExt, BodyStream, BoxBody, CollectError, Collected, Either, Empty, Frame, Full, Incoming,
+    IncomingData, InspectFrame, MapError, MapFrame, SizeHint, StreamBody, TrailerHint, WithTrailers, collect,
 };
 pub use error::{Error, ErrorKind};
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};

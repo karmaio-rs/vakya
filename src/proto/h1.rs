@@ -1,6 +1,7 @@
 mod syntax;
 use syntax::trim_ows;
 
+pub(super) mod bridge;
 pub(super) mod config;
 pub(super) mod decode;
 pub(super) mod encode;

@@ -129,6 +129,16 @@ impl BodyDecoder {
         }
     }
 
+    /// Whether framing is already complete without consuming more input.
+    /// This permits closing a delivered fixed body or trailers without asking
+    /// the application for another frame solely to acknowledge EOF.
+    pub(super) fn is_complete(&self) -> bool {
+        matches!(
+            self.state,
+            DecoderState::Empty | DecoderState::Fixed { remaining: 0 } | DecoderState::Done
+        )
+    }
+
     /// Consume only the reported prefix before calling again. Payload ranges
     /// refer to this input and must be transferred or copied before its storage
     /// is reused. EOF applies after all supplied bytes, so a final data range can

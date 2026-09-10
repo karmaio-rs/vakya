@@ -4,6 +4,8 @@ mod boxed;
 mod collect;
 mod combinator;
 mod frame;
+#[allow(dead_code)] // Connection constructors are introduced in subsequent phases.
+pub(crate) mod incoming;
 mod simple;
 mod size_hint;
 mod stream;
@@ -14,6 +16,7 @@ pub use boxed::BoxBody;
 pub use collect::{CollectError, Collected, collect};
 pub use combinator::{Either, InspectFrame, MapError, MapFrame, WithTrailers};
 pub use frame::Frame;
+pub use incoming::{Incoming, IncomingData};
 pub use simple::{Empty, Full};
 pub use size_hint::SizeHint;
 pub use stream::{BodyDataStream, BodyStream, StreamBody};
@@ -224,3 +227,7 @@ pub enum TrailerHint {
     #[default]
     MayHave,
 }
+
+// The incoming-body bridge is integrated in this phase.
+#[allow(dead_code)]
+pub(crate) mod pipe;
