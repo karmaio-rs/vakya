@@ -8,13 +8,17 @@ use super::{
 };
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
-    future::{Race, WorkBudget, race},
+    future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
         send::write_all,
         transport::Receive,
     },
-    server::{RequestContext, conn::http1::Builder},
+    server::{
+        RequestContext,
+        conn::http1::Builder,
+        context::{self, Command, InformationalReceiver},
+    },
 };
 use http::{
     HeaderValue, Method, Request, Response, Version,
@@ -28,7 +32,6 @@ use std::{
     cell::Cell,
     future::poll_fn,
     pin::pin,
-    rc::Rc,
     task::Poll,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -71,14 +74,6 @@ where
                 }
             }
         };
-        // Continue demand and informational serialization land together. Reject
-        // this unsupported policy now instead of hanging a waiting peer.
-        if head.expectation == Expectation::Continue && !matches!(head.body, BodyMode::None | BodyMode::Fixed(0)) {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "100 Continue handling is not available yet",
-            ));
-        }
         let (result, returned) = exchange(
             &mut reader,
             &mut writer,
@@ -123,7 +118,8 @@ where
     let mut state = Exchange::new(&head, config.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
-    let close = Rc::new(Cell::new(head.persistence == Persistence::Close));
+    let (context, informationals) = context::channel(head.persistence == Persistence::Close);
+    let close = informationals.close_flag();
     let (producer, body) = incoming(head.body);
     let mut request = Request::new(body);
     *request.method_mut() = head.head.method;
@@ -132,7 +128,29 @@ where
     *request.headers_mut() = head.head.headers;
     let receive = async {
         match producer {
-            Some(producer) => {
+            Some(mut producer) => {
+                if head.expectation == Expectation::Continue && version == Version::HTTP_11 {
+                    match cancellable_wait(producer.demand(), Some(source.token())).await {
+                        Some(Ok(())) => {}
+                        Some(Err(_)) => return (ReceiveEnd::Abandoned, buffer),
+                        None => {
+                            return (
+                                ReceiveEnd::fail(producer, Error::new(ErrorKind::Canceled, "request receive canceled")),
+                                buffer,
+                            );
+                        }
+                    }
+                    match cancellable_wait(informationals.continue_permission(), Some(source.token())).await {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => return (ReceiveEnd::fail(producer, error), buffer),
+                        None => {
+                            return (
+                                ReceiveEnd::fail(producer, Error::new(ErrorKind::Canceled, "Continue demand canceled")),
+                                buffer,
+                            );
+                        }
+                    }
+                }
                 receive_body(
                     reader,
                     strategy,
@@ -149,9 +167,22 @@ where
     let mut receive = pin!(receive);
     let mut received = None;
     let response = {
-        let mut call = pin!(service.call((request, RequestContext::new(close.clone()))));
+        let mut call = pin!(call_service(
+            writer,
+            service,
+            request,
+            context,
+            &informationals,
+            version,
+            config,
+            &source
+        ));
         match race(receive.as_mut(), call.as_mut()).await {
-            Race::First((ReceiveEnd::Failed(error), buffer)) => return (Err(error), buffer),
+            Race::First((ReceiveEnd::Failed(error), buffer)) => {
+                source.cancel();
+                let _ = call.await;
+                return (Err(error), buffer);
+            }
             Race::First(result) => {
                 received = Some(result);
                 call.await
@@ -167,10 +198,7 @@ where
                 Some(result) => result,
                 None => receive.await,
             };
-            return (
-                Err(Error::with_source(ErrorKind::Service, "HTTP service failed", error)),
-                buffer,
-            );
+            return (Err(error), buffer);
         }
     };
     // Observe body abandonment caused by the completed service before committing
@@ -188,7 +216,7 @@ where
         close.set(true);
     }
     let sent = {
-        let send = write_response(writer, response, &method, version, &close, date, config, &source);
+        let send = write_response(writer, response, &method, version, close, date, config, &source);
         let mut send = pin!(send);
         if received.is_some() {
             send.await
@@ -237,6 +265,131 @@ where
         })
     })();
     (result, buffer)
+}
+
+#[allow(clippy::too_many_arguments)] // Service and the sole head writer progress in the same scope.
+async fn call_service<W, S, B>(
+    writer: &mut W,
+    service: &S,
+    request: Request<Incoming>,
+    context: RequestContext,
+    informationals: &InformationalReceiver,
+    version: Version,
+    config: &Builder,
+    source: &CancellationSource,
+) -> Result<Response<B>, Error>
+where
+    W: AsyncWrite,
+    S: Service<(Request<Incoming>, RequestContext), Response = Response<B>>,
+    S::Error: std::error::Error + 'static,
+{
+    let mut call = pin!(cancellable_wait(service.call((request, context)), Some(source.token())));
+    let mut heads = pin!(write_informationals(writer, informationals, version, config, source));
+    match race(call.as_mut(), heads.as_mut()).await {
+        Race::First(result) => {
+            informationals.select_final();
+            if !matches!(result, Some(Ok(_))) {
+                source.cancel();
+            }
+            // A selected final response cannot drop an in-flight informational
+            // write, even if its application waiter has already disappeared.
+            let written = heads.await;
+            let response = match result {
+                Some(Ok(response)) => response,
+                Some(Err(error)) => return Err(Error::with_source(ErrorKind::Service, "HTTP service failed", error)),
+                None => return Err(Error::new(ErrorKind::Canceled, "HTTP service canceled")),
+            };
+            written?;
+            Ok(response)
+        }
+        Race::Second(result) => {
+            source.cancel();
+            let _ = call.await;
+            result?;
+            Err(Error::new(ErrorKind::Canceled, "informational writer stopped"))
+        }
+    }
+}
+
+async fn write_informationals<W: AsyncWrite>(
+    writer: &mut W,
+    receiver: &InformationalReceiver,
+    version: Version,
+    config: &Builder,
+    source: &CancellationSource,
+) -> Result<(), Error> {
+    use karmaio::runtime::FutureExt;
+    let mut count = 0;
+    loop {
+        let command = match cancellable_wait(receiver.next(), Some(source.token())).await {
+            Some(Some(command)) => command,
+            Some(None) => return Ok(()),
+            None => return Err(Error::new(ErrorKind::Canceled, "informational writer canceled")),
+        };
+        let automatic = matches!(command, Command::Continue);
+        let response = match command {
+            Command::Continue => Response::builder()
+                .status(100)
+                .body(())
+                .expect("valid automatic Continue"),
+            Command::Application(response) => response,
+        };
+        let head = (|| {
+            if version != Version::HTTP_11 {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "informational responses require HTTP/1.1",
+                ));
+            }
+            if count == config.protocol.max_informational {
+                return Err(Error::new(ErrorKind::Limit, "too many informational responses"));
+            }
+            let (parts, ()) = response.into_parts();
+            let head = encode_response_head(
+                parts.status,
+                parts.version,
+                parts.headers,
+                BodyMetadata {
+                    size: crate::SizeHint::with_exact(0),
+                    trailers: crate::TrailerHint::None,
+                },
+                &Method::GET,
+                config.protocol.encode,
+            )?;
+            Ok(head)
+        })();
+        let head = match head {
+            Ok(head) => head,
+            Err(error) if !automatic => {
+                receiver.complete(Err(error));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (result, _) = write_all(writer, head.bytes, Some(source.token())).await.into_parts();
+        let result = match result {
+            Ok(_) => writer
+                .flush()
+                .with_cancellation(source.token())
+                .await
+                .map_err(Error::from),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = result {
+            if !automatic {
+                let (driver, observer) = error.split();
+                receiver.complete(Err(observer));
+                return Err(driver);
+            }
+            return Err(error);
+        }
+        count += 1;
+        if automatic {
+            receiver.continued();
+        } else {
+            receiver.complete(Ok(()));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Scoped writer state, all borrowed rather than cloned or shared.

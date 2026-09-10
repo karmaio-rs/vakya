@@ -7,4 +7,4 @@ pub(crate) mod dispatch;
 pub(crate) mod response;
 
 pub use dispatch::{RequestPermit, SendError, SendRequest, SubmitError};
-pub use response::{PendingResponse, UploadControl};
+pub use response::{PendingResponse, ResponseEvent, UploadControl};

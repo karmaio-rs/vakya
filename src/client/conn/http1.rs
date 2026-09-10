@@ -21,7 +21,7 @@ impl<F: Future<Output = Result<(), Error>>> Connection<F> {
     ///
     /// # Errors
     /// Returns protocol, body, and transport failures with their sources.
-    /// Informational observations and transport handoff are not yet available.
+    /// Transport handoff is not yet available.
     pub async fn run(self) -> Result<(), Error> {
         self.future.await
     }

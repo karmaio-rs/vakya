@@ -1,5 +1,5 @@
 use super::{
-    BodyMode, Persistence,
+    BodyMode, Expectation, Persistence,
     bridge::{ReceiveEnd, SendBodyError, incoming, receive_body, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_request_head},
@@ -7,9 +7,10 @@ use super::{
     head::{HeadParser, ParseOutcome, ResponseRole},
 };
 use crate::{
-    Body, Error, ErrorKind, Incoming, Response,
+    Body, Error, ErrorKind, Response,
     body::pipe::Producer,
     client::{
+        ResponseEvent,
         conn::http1::Builder,
         dispatch::{Job, Receiver},
         response::Control,
@@ -126,7 +127,7 @@ async fn exchange_inner<R, W, B, T>(
     parser: &mut HeadParser<ResponseRole>,
     buffer: RecvBuffer,
     request: http::Request<B>,
-    response: &mut Option<Producer<Response<Incoming>, Error>>,
+    response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
     config: &Builder,
 ) -> Result<(RecvBuffer, Persistence), Error>
@@ -160,13 +161,34 @@ where
             .await
             .into_parts();
         result?;
+        if request.expectation == Expectation::Continue
+            && !matches!(head.mode, BodyMode::None | BodyMode::Fixed(0))
+            && let Some(timeout) = config.continue_wait
+        {
+            writer.flush().with_cancellation(control.upload.token()).await?;
+
+            // The read half releases permission before offering an observed 100
+            // or final event; an application pause cannot hold that permission.
+            let waited = cancellable_wait(
+                karmaio::time::timeout(timeout, control.wait_continue()),
+                Some(control.upload.token()),
+            )
+            .await;
+
+            if waited.is_none() {
+                return Err(Error::new(ErrorKind::Canceled, "Continue wait canceled"));
+            }
+        }
+
         if head.mode != BodyMode::None {
             send_body(writer, &mut body, &mut encoder, Some(control.upload.token()))
                 .await
                 .map_err(map_send_error)?;
         }
+
         writer.flush().with_cancellation(control.upload.token()).await?;
         control.upload_complete.set(true);
+
         Ok::<(), Error>(())
     }
     .with_cancellation(control.exchange.token());
@@ -258,7 +280,7 @@ async fn receive<R, T: Receive<R>>(
     parser: &mut HeadParser<ResponseRole>,
     mut buffer: RecvBuffer,
     mut state: Exchange,
-    response: &mut Option<Producer<Response<Incoming>, Error>>,
+    response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
     config: &Builder,
 ) -> Result<(ReceiveEnd, RecvBuffer, Exchange), Error> {
@@ -266,12 +288,28 @@ async fn receive<R, T: Receive<R>>(
         match parser.parse(buffer.bytes())? {
             ParseOutcome::Complete { head, consumed } => {
                 buffer.consume(consumed)?;
+
                 let (head, action) = state.receive_head(head)?;
+
                 match action {
-                    HeadAction::Final => break head,
-                    // Immediate upload is the phase-8 default. The protocol
-                    // enforces informational limits; observation lands next.
-                    HeadAction::Informational => continue,
+                    HeadAction::Final => {
+                        control.allow_continue();
+                        break head;
+                    }
+                    HeadAction::Informational => {
+                        if head.head.status == 100 {
+                            control.allow_continue();
+                        }
+
+                        let mut message = Response::new(());
+                        *message.status_mut() = head.head.status;
+                        *message.version_mut() = head.head.version;
+                        *message.headers_mut() = head.head.headers;
+
+                        offer_event(response, ResponseEvent::Informational(message), control).await?;
+
+                        continue;
+                    }
                     HeadAction::Upgrade(_) => {
                         return Err(Error::new(
                             ErrorKind::Unsupported,
@@ -283,6 +321,7 @@ async fn receive<R, T: Receive<R>>(
             ParseOutcome::NeedMore => {
                 let (result, returned) = strategy.read(reader, buffer, Some(control.exchange.token())).await;
                 buffer = returned;
+
                 if result? == ReadStatus::Eof {
                     return Err(Error::new(
                         if buffer.bytes().is_empty() {
@@ -304,16 +343,7 @@ async fn receive<R, T: Receive<R>>(
     *message.version_mut() = head.head.version;
     *message.headers_mut() = head.head.headers;
 
-    let observed = cancellable_wait(
-        response.as_mut().expect("final response offered once").offer(message),
-        Some(control.exchange.token()),
-    )
-    .await;
-
-    if !matches!(observed, Some(Ok(()))) {
-        return Err(Error::new(ErrorKind::Canceled, "response observation abandoned"));
-    }
-
+    offer_event(response, ResponseEvent::Final(message), control).await?;
     response.take().expect("final response offered once").close();
 
     let (end, buffer) = match producer {
@@ -335,6 +365,24 @@ async fn receive<R, T: Receive<R>>(
         ReceiveEnd::Failed(error) => Err(error),
         end => Ok((end, buffer, state)),
     }
+}
+
+async fn offer_event(
+    response: &mut Option<Producer<ResponseEvent, Error>>,
+    event: ResponseEvent,
+    control: &Control,
+) -> Result<(), Error> {
+    let observed = cancellable_wait(
+        response.as_mut().expect("response stream remains open").offer(event),
+        Some(control.exchange.token()),
+    )
+    .await;
+
+    if !matches!(observed, Some(Ok(()))) {
+        return Err(Error::new(ErrorKind::Canceled, "response observation abandoned"));
+    }
+
+    Ok(())
 }
 
 fn map_send_error<E: std::error::Error + 'static>(error: SendBodyError<E>) -> Error {

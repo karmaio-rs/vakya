@@ -165,7 +165,7 @@ pub(super) enum ReceiveEnd {
 }
 
 impl ReceiveEnd {
-    fn fail(producer: IncomingProducer, error: Error) -> Self {
+    pub(super) fn fail(producer: IncomingProducer, error: Error) -> Self {
         let (incoming, driver) = error.split();
         producer.fail(incoming);
         Self::Failed(driver)

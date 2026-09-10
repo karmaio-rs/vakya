@@ -48,6 +48,13 @@ impl Builder {
         Ok(self)
     }
 
+    /// Set the maximum informational heads per exchange, including automatic
+    /// 100 Continue. Defaults to 16; zero disables informational responses.
+    pub fn max_informational(&mut self, count: usize) -> &mut Self {
+        self.protocol.max_informational = count;
+        self
+    }
+
     /// Set incoming chunk-line, trailer-byte, and trailer-field limits.
     ///
     /// # Errors

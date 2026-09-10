@@ -17,6 +17,7 @@ pub struct Builder {
     pub(crate) protocol: Config,
     pub(crate) preferred_read: usize,
     pub(crate) max_retained: usize,
+    pub(crate) continue_wait: Option<std::time::Duration>,
 }
 
 impl Default for Builder {
@@ -25,6 +26,7 @@ impl Default for Builder {
             protocol: Config::default(),
             preferred_read: 16 * 1024,
             max_retained: 128 * 1024,
+            continue_wait: None,
         }
     }
 }
@@ -42,6 +44,13 @@ impl Builder {
     pub fn head_limits(&mut self, bytes: usize, fields: usize) -> Result<&mut Self, Error> {
         self.protocol.head_limits(bytes, fields)?;
         Ok(self)
+    }
+
+    /// Set the maximum informational heads per exchange, including automatic
+    /// 100 Continue. Defaults to 16; zero disables informational responses.
+    pub fn max_informational(&mut self, count: usize) -> &mut Self {
+        self.protocol.max_informational = count;
+        self
     }
 
     /// Set incoming chunk-line, trailer-byte, and trailer-field limits.
@@ -74,6 +83,14 @@ impl Builder {
         self.preferred_read = preferred;
         self.max_retained = retained;
         Ok(self)
+    }
+
+    /// Configure bounded waiting after flushing an Expect: 100-continue request
+    /// head. A peer 100, any final response, or timeout permits the upload.
+    /// `None` (the default) sends immediately. This does not add an Expect header.
+    pub fn continue_wait(&mut self, timeout: Option<std::time::Duration>) -> &mut Self {
+        self.continue_wait = timeout;
+        self
     }
 
     /// Create a sender and unboxed driver over established Karmaio I/O.

@@ -1,5 +1,5 @@
 use super::{
-    PendingResponse,
+    PendingResponse, ResponseEvent,
     response::{self, Control},
 };
 use crate::{Error, ErrorKind, Incoming, Request, Response, body::pipe::Producer};
@@ -23,7 +23,7 @@ struct State<B> {
 
 pub(crate) struct Job<B> {
     pub(crate) request: Request<B>,
-    pub(crate) response: Producer<Response<Incoming>, Error>,
+    pub(crate) response: Producer<ResponseEvent, Error>,
     pub(crate) control: Rc<Control>,
 }
 

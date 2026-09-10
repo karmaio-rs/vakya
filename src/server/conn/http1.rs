@@ -21,8 +21,7 @@ impl<F: Future<Output = Result<(), Error>>> Connection<F> {
     ///
     /// # Errors
     /// Returns protocol, service, body, and transport failures with their sources.
-    /// Nonempty requests expecting 100 Continue, informational responses, and
-    /// successful CONNECT responses are currently unsupported.
+    /// Successful CONNECT responses and transport handoff are not yet supported.
     pub async fn run(self) -> Result<(), Error> {
         self.future.await
     }
