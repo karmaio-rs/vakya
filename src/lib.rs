@@ -22,3 +22,10 @@ pub use service::{Service, service_fn};
 
 #[cfg(feature = "http1")]
 mod proto;
+
+#[cfg(feature = "http1")]
+mod io;
+
+#[cfg(all(test, feature = "http1"))]
+#[path = "../tests/support/transport.rs"]
+mod test_transport;
