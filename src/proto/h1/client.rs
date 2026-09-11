@@ -1,5 +1,5 @@
 use super::{
-    BodyMode, Expectation, Persistence,
+    BodyMode, Expectation,
     bridge::{ReceiveEnd, SendBodyError, incoming, receive_body, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_request_head},
@@ -15,12 +15,14 @@ use crate::{
         dispatch::{Job, Receiver},
         response::Control,
     },
+    connection::ConnectionOutcome,
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
         send::write_all,
         transport::Receive,
     },
+    upgrade::Upgraded,
 };
 use karmaio::{
     io::{AsyncWrite, IntoOwnedSplit},
@@ -33,7 +35,7 @@ pub(crate) async fn run<I, B, T>(
     mut requests: Receiver<B>,
     mut strategy: T,
     config: Builder,
-) -> Result<(), Error>
+) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
     I: IntoOwnedSplit,
     B: Body,
@@ -57,16 +59,30 @@ where
         )
         .await?;
         buffer = next;
-        if persistence == Persistence::Close {
-            break;
+
+        match persistence {
+            Outcome::Handoff(kind) => {
+                drop(requests);
+                return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
+                    reader,
+                    writer,
+                    buffer.take_all(),
+                    kind,
+                )));
+            }
+            Outcome::Close => break,
+            Outcome::Reusable => {}
+            Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled client exchange")),
         }
+
         requests.release();
     }
     // Close admission before awaiting transport shutdown so reservations cannot
     // wait for an exchange that will never run.
     drop(requests);
     writer.shutdown().await?;
-    Ok(())
+
+    Ok(ConnectionOutcome::Closed)
 }
 
 async fn exchange<R, W, B, T>(
@@ -77,7 +93,7 @@ async fn exchange<R, W, B, T>(
     buffer: RecvBuffer,
     job: Job<B>,
     config: &Builder,
-) -> Result<(RecvBuffer, Persistence), Error>
+) -> Result<(RecvBuffer, Outcome), Error>
 where
     W: AsyncWrite,
     B: Body,
@@ -130,7 +146,7 @@ async fn exchange_inner<R, W, B, T>(
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
     config: &Builder,
-) -> Result<(RecvBuffer, Persistence), Error>
+) -> Result<(RecvBuffer, Outcome), Error>
 where
     W: AsyncWrite,
     B: Body,
@@ -236,7 +252,7 @@ where
             {
                 return Err(error);
             }
-            return Ok((buffer, Persistence::Close));
+            return Ok((buffer, Outcome::Close));
         }
         ReceiveEnd::Complete => {}
     }
@@ -261,10 +277,10 @@ where
 
     Ok((
         buffer,
-        if state.outcome() == Outcome::Reusable {
-            Persistence::Reusable
+        if explicit_abort(control) {
+            Outcome::Close
         } else {
-            Persistence::Close
+            state.outcome()
         },
     ))
 }
@@ -311,10 +327,8 @@ async fn receive<R, T: Receive<R>>(
                         continue;
                     }
                     HeadAction::Upgrade(_) => {
-                        return Err(Error::new(
-                            ErrorKind::Unsupported,
-                            "transport handoff is not available yet",
-                        ));
+                        control.allow_continue();
+                        break head;
                     }
                 }
             }

@@ -2,12 +2,13 @@ use super::{
     BodyMode, Expectation, Persistence,
     bridge::{ReceiveEnd, SendBodyError, incoming, receive_body, send_body},
     decode::BodyDecoder,
-    encode::{BodyEncoder, BodyMetadata, encode_response_head},
+    encode::{BodyEncoder, BodyMetadata, encode_response_head, prepare_response_head},
     exchange::{Direction, Exchange, Outcome},
     head::{HeadParser, ParseOutcome, RequestRole, ValidatedRequestHead},
 };
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
+    connection::ConnectionOutcome,
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -19,6 +20,7 @@ use crate::{
         conn::http1::Builder,
         context::{self, Command, InformationalReceiver},
     },
+    upgrade::Upgraded,
 };
 use http::{
     HeaderValue, Method, Request, Response, Version,
@@ -36,7 +38,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) async fn run<I, S, B, T>(io: I, service: S, mut strategy: T, config: Builder) -> Result<(), Error>
+pub(crate) async fn run<I, S, B, T>(
+    io: I,
+    service: S,
+    mut strategy: T,
+    config: Builder,
+) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
     I: IntoOwnedSplit,
     T: Receive<I::ReadHalf>,
@@ -69,7 +76,7 @@ where
                             ));
                         }
                         writer.shutdown().await?;
-                        return Ok(());
+                        return Ok(ConnectionOutcome::Closed);
                     }
                 }
             }
@@ -86,9 +93,21 @@ where
         )
         .await;
         buffer = returned;
-        if result? == Persistence::Close {
-            writer.shutdown().await?;
-            return Ok(());
+        match result? {
+            Outcome::Handoff(kind) => {
+                return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
+                    reader,
+                    writer,
+                    buffer.take_all(),
+                    kind,
+                )));
+            }
+            Outcome::Close => {
+                writer.shutdown().await?;
+                return Ok(ConnectionOutcome::Closed);
+            }
+            Outcome::Reusable => {}
+            Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled server exchange")),
         }
     }
 }
@@ -105,7 +124,7 @@ async fn exchange<R, W, S, B, T>(
     service: &S,
     config: &Builder,
     date: &mut DateCache,
-) -> (Result<Persistence, Error>, RecvBuffer)
+) -> (Result<Outcome, Error>, RecvBuffer)
 where
     W: AsyncWrite,
     T: Receive<R>,
@@ -216,7 +235,9 @@ where
         close.set(true);
     }
     let sent = {
-        let send = write_response(writer, response, &method, version, close, date, config, &source);
+        let send = write_response(
+            writer, response, &method, version, close, date, config, &source, &mut state,
+        );
         let mut send = pin!(send);
         if received.is_some() {
             send.await
@@ -242,27 +263,22 @@ where
         Some(result) => result,
         None => receive.await,
     };
-    let persistence = match sent {
-        Ok(persistence) => persistence,
+    match sent {
+        Ok(_) => {}
         Err(error) => return (Err(error), buffer),
     };
     match end {
         ReceiveEnd::Failed(error) => return (Err(error), buffer),
-        ReceiveEnd::Abandoned => return (Ok(Persistence::Close), buffer),
+        ReceiveEnd::Abandoned => return (Ok(Outcome::Close), buffer),
         ReceiveEnd::Complete => {}
     }
     let result = (|| {
-        state.sent_final(persistence)?;
         state.settle(Direction::Request, true)?;
         state.settle(Direction::Response, true)?;
         if close.get() {
             state.close_after_exchange();
         }
-        Ok(if state.outcome() == Outcome::Reusable {
-            Persistence::Reusable
-        } else {
-            Persistence::Close
-        })
+        Ok(state.outcome())
     })();
     (result, buffer)
 }
@@ -402,12 +418,13 @@ async fn write_response<W: AsyncWrite, B: Body>(
     date: &mut DateCache,
     config: &Builder,
     source: &CancellationSource,
+    state: &mut Exchange,
 ) -> Result<Persistence, Error>
 where
     B::Error: std::error::Error + 'static,
 {
     let (mut parts, mut body) = response.into_parts();
-    if parts.status.is_informational() || (method == Method::CONNECT && parts.status.is_success()) {
+    if parts.status.is_informational() && parts.status != http::StatusCode::SWITCHING_PROTOCOLS {
         return Err(Error::new(
             ErrorKind::Unsupported,
             "informational responses and transport handoff require their dedicated APIs",
@@ -428,7 +445,7 @@ where
         size: body.size_hint(),
         trailers: body.trailer_hint(),
     };
-    let head = encode_response_head(
+    let (head, validated) = prepare_response_head(
         parts.status,
         version,
         parts.headers,
@@ -436,6 +453,14 @@ where
         method,
         config.protocol.encode,
     )?;
+    if head.upgrade.is_some() && close.get() {
+        return Err(Error::new(
+            ErrorKind::Upgrade,
+            "closing exchange cannot transfer transport ownership",
+        ));
+    }
+    state.sent_response(&validated)?;
+    drop(validated); // The encoded bytes and exchange decisions now own what is needed.
     let mut encoder = BodyEncoder::new(head.mode, metadata, config.protocol.encode)?;
     let (result, _) = write_all(writer, head.bytes, Some(source.token())).await.into_parts();
     result?;

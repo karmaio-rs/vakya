@@ -1,6 +1,6 @@
 //! HTTP/1 connections over independently progressing Karmaio I/O halves.
 mod builder;
-use crate::Error;
+use crate::{Error, connection::ConnectionOutcome};
 pub use builder::Builder;
 use std::future::Future;
 
@@ -15,14 +15,16 @@ pub struct Connection<F> {
     future: F,
 }
 
-impl<F: Future<Output = Result<(), Error>>> Connection<F> {
+impl<R, W, F: Future<Output = Result<ConnectionOutcome<R, W>, Error>>> Connection<F> {
     /// Drive requests sequentially, with independent request-body reads and
     /// response writes, until closure or error.
     ///
+    /// A validated 101 or successful CONNECT returns settled transport halves
+    /// in `ConnectionOutcome::Upgraded`; ordinary closure returns `Closed`.
+    ///
     /// # Errors
     /// Returns protocol, service, body, and transport failures with their sources.
-    /// Successful CONNECT responses and transport handoff are not yet supported.
-    pub async fn run(self) -> Result<(), Error> {
+    pub async fn run(self) -> Result<ConnectionOutcome<R, W>, Error> {
         self.future.await
     }
 }

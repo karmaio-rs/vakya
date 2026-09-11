@@ -1,4 +1,5 @@
 use super::Connection;
+use crate::connection::ConnectionOutcome;
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
     io::transport::{Portable, Tcp},
@@ -111,14 +112,16 @@ impl Builder {
     ///         context.close_connection();
     ///         Ok::<_, std::convert::Infallible>(Response::new(Empty::new()))
     ///     });
-    ///     Builder::new().serve_connection(io, service).run().await
+    ///     Builder::new().serve_connection(io, service).run().await?;
+    ///     Ok(())
     /// }
     /// ```
+    #[allow(clippy::type_complexity)] // Preserve concrete halves and an unboxed future without transport erasure.
     pub fn serve_connection<I, S, B>(
         &self,
         io: I,
         service: S,
-    ) -> Connection<impl Future<Output = Result<(), Error>> + use<I, S, B>>
+    ) -> Connection<impl Future<Output = Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>> + use<I, S, B>>
     where
         I: IntoOwnedSplit,
         S: Service<(Request<Incoming>, RequestContext), Response = Response<B>>,
@@ -133,11 +136,19 @@ impl Builder {
 
     /// Create a connection from established TCP using the explicit TCP receive
     /// strategy. It currently uses portable reads; managed receive is internal.
+    #[allow(clippy::type_complexity)] // Preserve concrete halves and an unboxed future without transport erasure.
     pub fn serve_tcp<S, B>(
         &self,
         io: TcpStream,
         service: S,
-    ) -> Connection<impl Future<Output = Result<(), Error>> + use<S, B>>
+    ) -> Connection<
+        impl Future<
+            Output = Result<
+                ConnectionOutcome<<TcpStream as IntoOwnedSplit>::ReadHalf, <TcpStream as IntoOwnedSplit>::WriteHalf>,
+                Error,
+            >,
+        > + use<S, B>,
+    >
     where
         S: Service<(Request<Incoming>, RequestContext), Response = Response<B>>,
         S::Error: std::error::Error + 'static,

@@ -1,4 +1,5 @@
 use super::Connection;
+use crate::connection::ConnectionOutcome;
 use crate::{
     Body, Error, ErrorKind,
     client::{SendRequest, dispatch},
@@ -96,12 +97,13 @@ impl Builder {
     /// Create a sender and unboxed driver over established Karmaio I/O.
     /// The caller selects HTTP/1 on negotiated transports and drives `run()`
     /// concurrently with sender operations. No dialing or spawning occurs.
+    #[allow(clippy::type_complexity)] // Preserve concrete halves and an unboxed future without transport erasure.
     pub fn handshake<I, B>(
         &self,
         io: I,
     ) -> (
         SendRequest<B>,
-        Connection<impl Future<Output = Result<(), Error>> + use<I, B>>,
+        Connection<impl Future<Output = Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>> + use<I, B>>,
     )
     where
         I: IntoOwnedSplit,
@@ -118,12 +120,23 @@ impl Builder {
     }
 
     /// Create a sender and driver using the explicit TCP receive strategy.
+    #[allow(clippy::type_complexity)] // Preserve concrete halves and an unboxed future without transport erasure.
     pub fn handshake_tcp<B>(
         &self,
         io: TcpStream,
     ) -> (
         SendRequest<B>,
-        Connection<impl Future<Output = Result<(), Error>> + use<B>>,
+        Connection<
+            impl Future<
+                Output = Result<
+                    ConnectionOutcome<
+                        <TcpStream as IntoOwnedSplit>::ReadHalf,
+                        <TcpStream as IntoOwnedSplit>::WriteHalf,
+                    >,
+                    Error,
+                >,
+            > + use<B>,
+        >,
     )
     where
         B: Body,

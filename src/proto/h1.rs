@@ -28,11 +28,7 @@ pub(super) enum Persistence {
     Close,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum UpgradeKind {
-    Protocol,
-    Tunnel,
-}
+pub(super) use crate::upgrade::UpgradeKind;
 
 pub(super) fn upgrade_protocols_match(offered: &[http::HeaderValue], selected: &http::HeaderMap) -> bool {
     let mut selected_any = false;

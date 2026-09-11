@@ -50,3 +50,7 @@ required-features = ["client"]
 [[example]]
 name = "informational"
 required-features = ["server"]
+
+[[example]]
+name = "upgrade"
+required-features = ["server"]

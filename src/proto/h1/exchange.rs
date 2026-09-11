@@ -161,6 +161,30 @@ impl Exchange {
         Ok(())
     }
 
+    /// Validate the server's chosen transition before committing any bytes.
+    pub(super) fn sent_response(&mut self, head: &ValidatedResponseHead) -> Result<(), crate::Error> {
+        if let Some(upgrade) = head.upgrade {
+            if self.failed
+                || self.phase != ResponsePhase::AwaitingHead
+                || self.upgrade != Some(upgrade)
+                || (upgrade == UpgradeKind::Protocol
+                    && !upgrade_protocols_match(&self.offered_protocols, &head.head.headers))
+            {
+                return Err(crate::Error::new(
+                    crate::ErrorKind::Upgrade,
+                    "response did not match the requested upgrade",
+                ));
+            }
+
+            self.phase = ResponsePhase::Upgrade(upgrade);
+            self.waiting_continue = false;
+
+            Ok(())
+        } else {
+            self.sent_final(head.persistence)
+        }
+    }
+
     /// Release an Expect wait after a driver's explicit timeout/proceed decision.
     pub(super) fn allow_request_body(&mut self) {
         self.waiting_continue = false;

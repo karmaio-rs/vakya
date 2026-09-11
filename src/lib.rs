@@ -35,3 +35,8 @@ pub mod server;
 
 #[cfg(feature = "client")]
 pub mod client;
+
+#[cfg(feature = "http1")]
+pub mod connection;
+#[cfg(feature = "http1")]
+pub mod upgrade;
