@@ -7,3 +7,6 @@ pub(crate) mod send;
 pub(crate) mod transport;
 
 pub(crate) mod deadline;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod managed;

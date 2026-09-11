@@ -2,6 +2,13 @@ use super::{Body, Frame, SizeHint, TrailerHint, frame::Kind, pipe};
 use crate::{Error, ErrorKind};
 use bytes::Bytes;
 use karmaio::buf::IoBuf;
+#[cfg(target_os = "linux")]
+use karmaio::buf::PooledBuf;
+#[cfg(target_os = "linux")]
+use std::{
+    cell::Cell,
+    ops::{Bound, Range},
+};
 use std::{fmt, marker::PhantomData, ops::RangeBounds, rc::Rc};
 
 pub(crate) type IncomingProducer = pipe::Producer<Frame<IncomingData>, Error>;
@@ -164,53 +171,185 @@ impl fmt::Debug for Incoming {
     }
 }
 
-/// An immutable owned segment of received payload.
+/// An immutable owned payload segment from a received HTTP body.
 ///
-/// Clones and slices share storage without copying. Data stays valid after the
-/// body or connection is dropped. This value is local to the Karmaio execution
-/// context, leaving room for managed storage without changing its public API.
-/// Dropping the last view releases storage; no producer callback is required.
+/// The private storage may be backed by ordinary [`Bytes`] or a Karmaio-managed receive buffer.
+/// Moving or dropping the value preserves or releases that storage correctly;
+/// callers do not return received data through [`crate::Body::recycle`].
+/// Clones and slices share storage without copying.
+/// Data remains valid after its body, connection, or runtime is dropped.
+/// This type is local to the Karmaio execution context and is not `Send` or `Sync`.
+/// Retaining a managed view makes that connection use portable reads until all views of the lease are dropped.
 #[derive(Clone)]
 pub struct IncomingData {
-    bytes: Bytes,
+    storage: IncomingStorage,
     _local: PhantomData<Rc<()>>,
+}
+
+#[derive(Clone)]
+enum IncomingStorage {
+    Bytes(Bytes),
+    #[cfg(target_os = "linux")]
+    Managed {
+        incoming: Rc<ManagedIncoming>,
+        range: Range<usize>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+/// Limits one connection to one managed lease retained by application data.
+#[derive(Debug)]
+pub(crate) struct ManagedLeasePermit {
+    held: Cell<bool>,
+}
+
+#[cfg(target_os = "linux")]
+impl ManagedLeasePermit {
+    pub(crate) fn new() -> Self {
+        Self { held: Cell::new(false) }
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.get()
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ManagedIncoming {
+    buffer: PooledBuf,
+    permit: Rc<ManagedLeasePermit>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ManagedIncoming {
+    fn drop(&mut self) {
+        let was_held = self.permit.held.replace(false);
+        debug_assert!(was_held, "managed lease permit was not held");
+    }
 }
 
 impl IncomingData {
     pub(crate) fn from_bytes(bytes: Bytes) -> Self {
         Self {
-            bytes,
+            storage: IncomingStorage::Bytes(bytes),
             _local: PhantomData,
         }
     }
 
-    /// Returns the length of this payload view.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_managed(
+        buffer: PooledBuf,
+        range: Range<usize>,
+        permit: Rc<ManagedLeasePermit>,
+    ) -> Result<Self, Error> {
+        if range.start > range.end || range.end > buffer.len() {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "managed incoming-data view lies outside initialized bytes",
+            ));
+        }
+
+        if permit.held.replace(true) {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "connection attempted to transfer multiple managed leases",
+            ));
+        }
+
+        Ok(Self {
+            storage: IncomingStorage::Managed {
+                incoming: Rc::new(ManagedIncoming { buffer, permit }),
+                range,
+            },
+            _local: PhantomData,
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn managed_strong_count(&self) -> Option<usize> {
+        match &self.storage {
+            IncomingStorage::Managed { incoming, .. } => Some(Rc::strong_count(incoming)),
+            IncomingStorage::Bytes(_) => None,
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn is_managed(&self) -> bool {
+        matches!(&self.storage, IncomingStorage::Managed { .. })
+    }
+
+    /// Returns the number of bytes remaining in this payload view.
     #[inline]
     pub const fn len(&self) -> usize {
-        self.bytes.len()
+        match &self.storage {
+            IncomingStorage::Bytes(bytes) => bytes.len(),
+            #[cfg(target_os = "linux")]
+            IncomingStorage::Managed { range, .. } => range.end - range.start,
+        }
     }
 
-    /// Returns whether this payload view is empty.
+    /// Returns `true` when this payload view contains no remaining bytes.
     #[inline]
     pub const fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.len() == 0
     }
 
-    /// Creates an owned subview without copying. Advancing either view leaves
-    /// the other unchanged.
+    /// Returns an owned view of a subrange without copying its payload bytes.
+    ///
+    /// Advancing either value changes only that value's local view.
     ///
     /// # Panics
-    /// Panics if the range is invalid or outside this view.
+    ///
+    /// Panics when the range is invalid or out of bounds.
     #[inline]
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
-        Self::from_bytes(self.bytes.slice(range))
+        match &self.storage {
+            IncomingStorage::Bytes(bytes) => Self::from_bytes(bytes.slice(range)),
+            #[cfg(target_os = "linux")]
+            IncomingStorage::Managed {
+                incoming,
+                range: current,
+            } => {
+                let range = normalize_range(range, current.end - current.start);
+                Self {
+                    storage: IncomingStorage::Managed {
+                        incoming: Rc::clone(incoming),
+                        range: current.start + range.start..current.start + range.end,
+                    },
+                    _local: PhantomData,
+                }
+            }
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_range(range: impl RangeBounds<usize>, len: usize) -> Range<usize> {
+    let start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start.checked_add(1).expect("payload range start overflowed"),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&end) => end.checked_add(1).expect("payload range end overflowed"),
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => len,
+    };
+
+    assert!(start <= end, "payload range end precedes its start");
+    assert!(end <= len, "payload range exceeds initialized bytes");
+
+    start..end
 }
 
 impl AsRef<[u8]> for IncomingData {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        &self.bytes
+        match &self.storage {
+            IncomingStorage::Bytes(bytes) => bytes,
+            #[cfg(target_os = "linux")]
+            IncomingStorage::Managed { incoming, range } => &incoming.buffer[range.clone()],
+        }
     }
 }
 
@@ -226,13 +365,25 @@ impl bytes::Buf for IncomingData {
     fn remaining(&self) -> usize {
         self.len()
     }
+
     #[inline]
     fn chunk(&self) -> &[u8] {
         self.as_ref()
     }
+
     #[inline]
     fn advance(&mut self, count: usize) {
-        bytes::Buf::advance(&mut self.bytes, count);
+        match &mut self.storage {
+            IncomingStorage::Bytes(bytes) => bytes::Buf::advance(bytes, count),
+            #[cfg(target_os = "linux")]
+            IncomingStorage::Managed { range, .. } => {
+                assert!(
+                    count <= range.end - range.start,
+                    "cannot advance beyond remaining payload bytes"
+                );
+                range.start += count;
+            }
+        }
     }
 }
 

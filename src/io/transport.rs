@@ -51,8 +51,8 @@ impl<R: AsyncRead> Receive<R> for Portable {
     }
 }
 
-/// TCP currently uses portable reads too. Linux managed receive will specialize
-/// this policy without changing generic supplied-I/O paths or public body types.
+/// Explicit TCP policy: Linux uses demand-driven managed leases when possible;
+/// other targets and retained-lease/partial-prefix reads use portable I/O.
 #[derive(Debug, Default)]
 pub(crate) struct Tcp;
 
@@ -64,7 +64,15 @@ impl Receive<OwnedReadHalf<TcpStream>> for Tcp {
         buffer: RecvBuffer,
         cancellation: Option<CancellationToken>,
     ) -> (Result<ReadStatus, Error>, RecvBuffer) {
-        buffer.read(reader, cancellation).await
+        #[cfg(target_os = "linux")]
+        {
+            buffer.read_managed(reader, cancellation).await
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            buffer.read(reader, cancellation).await
+        }
     }
 }
 

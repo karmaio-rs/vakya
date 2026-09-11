@@ -140,7 +140,7 @@ pub trait BodyExt: Body {
 
     /// Collects this body within an explicit payload-byte limit.
     ///
-    /// See [`collect`] for errors, trailer preservation, and cancellation.
+    /// See [`collect()`] for errors, trailer preservation, and cancellation.
     async fn collect(mut self, max_bytes: usize) -> Result<Collected, CollectError<Self::Error>>
     where
         Self: Sized,

@@ -4,7 +4,7 @@ use super::{
     encode::{BodyEncoder, EncodeError},
 };
 use crate::{
-    Body, Error, ErrorKind, Frame, Incoming, IncomingData, SizeHint, TrailerHint,
+    Body, Error, ErrorKind, Frame, Incoming, SizeHint, TrailerHint,
     body::{incoming::IncomingProducer, pipe::OfferError},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
@@ -144,7 +144,7 @@ pub(super) async fn receive_body_configured<R, S: Receive<R>>(
             }
             DecodeOutcome::Data { payload, consumed } => {
                 let data = match buffer.take_payload(payload, consumed) {
-                    Ok(data) => IncomingData::from_bytes(data),
+                    Ok(data) => data,
                     Err(error) => return (ReceiveEnd::fail(producer, error), buffer),
                 };
                 Frame::data(data)

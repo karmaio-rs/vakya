@@ -180,8 +180,10 @@ impl Builder {
         }
     }
 
-    /// Create a connection from established TCP using the explicit TCP receive
-    /// strategy. It currently uses portable reads; managed receive is internal.
+    /// Create a connection from established TCP using the explicit TCP receive strategy.
+    /// Linux uses demand-driven managed receives and requires kernel 6.12+ with io_uring enabled, as required by Karmaio.
+    /// Other platforms use portable reads. Retained payload leases and partial parser prefixes use bounded portable fallback.
+    /// Use `serve_connection` to select portable I/O explicitly, including on Linux.
     #[allow(clippy::type_complexity)] // Preserve concrete halves and an unboxed future without transport erasure.
     pub fn serve_tcp<S, B>(
         &self,

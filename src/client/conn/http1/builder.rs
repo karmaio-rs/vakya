@@ -171,6 +171,9 @@ impl Builder {
     }
 
     /// Create a sender and driver using the explicit TCP receive strategy.
+    /// Linux uses demand-driven managed receives and requires kernel 6.12+ with io_uring enabled, as required by Karmaio.
+    /// Other platforms use portable reads. Retained payload leases and partial parser prefixes use bounded
+    /// portable fallback. Use `handshake` to select portable I/O explicitly, including on Linux.
     #[allow(clippy::type_complexity)] // Preserve concrete halves and an unboxed future without transport erasure.
     pub fn handshake_tcp<B>(
         &self,
