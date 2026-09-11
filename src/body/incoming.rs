@@ -22,6 +22,38 @@ pub struct Incoming {
 }
 
 impl Incoming {
+    /// Consume and discard the remaining body within an explicit payload limit.
+    /// Framing is additionally bounded to the payload limit plus 64 KiB, and a
+    /// five-second total deadline covers demand, transport, and framing work.
+    /// Successful draining permits connection reuse when the other direction
+    /// also settles. Trailers are discarded. Keep driving the connection.
+    ///
+    /// # Errors
+    /// Returns `Limit`, `Timeout`, or the original receive failure. Failure or
+    /// dropping this future abandons the body; the driver cancels and settles
+    /// pending reads. This operation itself does not wait for driver completion.
+    pub async fn drain(mut self, max_payload_bytes: u64) -> Result<(), Error> {
+        if let Some(consumer) = &self.consumer {
+            consumer.drain_budget(max_payload_bytes);
+        }
+        let drain = async {
+            let mut remaining = max_payload_bytes;
+            let mut budget = crate::future::WorkBudget::new();
+            while let Some(frame) = self.next_frame().await? {
+                budget.step().await;
+                if let Ok(data) = frame.into_data() {
+                    remaining = remaining
+                        .checked_sub(data.len() as u64)
+                        .ok_or_else(|| Error::new(ErrorKind::Limit, "body drain payload limit exceeded"))?;
+                }
+            }
+            Ok(())
+        };
+        karmaio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .map_err(|_| Error::new(ErrorKind::Timeout, "body drain deadline exceeded"))?
+    }
+
     /// Used only when protocol semantics establish that no body frames remain.
     pub(crate) fn empty() -> Self {
         Self {

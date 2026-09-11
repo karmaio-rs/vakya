@@ -1,6 +1,6 @@
 use super::{
     BodyMode, Expectation, Persistence,
-    bridge::{ReceiveEnd, SendBodyError, incoming, receive_body, send_body},
+    bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, encode_response_head, prepare_response_head},
     exchange::{Direction, Exchange, Outcome},
@@ -28,7 +28,7 @@ use http::{
 };
 use karmaio::{
     io::{AsyncWrite, IntoOwnedSplit},
-    runtime::CancellationSource,
+    runtime::{CancellationSource, FutureExt},
 };
 use std::{
     cell::Cell,
@@ -41,8 +41,9 @@ use std::{
 pub(crate) async fn run<I, S, B, T>(
     io: I,
     service: S,
-    mut strategy: T,
+    strategy: T,
     config: Builder,
+    connection: crate::connection::ConnectionControl,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
     I: IntoOwnedSplit,
@@ -52,22 +53,87 @@ where
     B: Body,
     B::Error: std::error::Error + 'static,
 {
-    let (mut reader, mut writer) = io.into_split();
+    let shutdown = karmaio::runtime::CancellationSource::new();
+
+    connection
+        .drive(
+            &shutdown,
+            pin!(run_inner(io, service, strategy, config, &connection, &shutdown)),
+        )
+        .await
+}
+
+async fn run_inner<I, S, B, T>(
+    io: I,
+    service: S,
+    mut strategy: T,
+    config: Builder,
+    connection: &crate::connection::ConnectionControl,
+    shutdown: &karmaio::runtime::CancellationSource,
+) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
+where
+    I: IntoOwnedSplit,
+    T: Receive<I::ReadHalf>,
+    S: Service<(Request<Incoming>, RequestContext), Response = Response<B>>,
+    S::Error: std::error::Error + 'static,
+    B: Body,
+    B::Error: std::error::Error + 'static,
+{
+    let (mut reader, writer) = io.into_split();
+    let mut writer = crate::io::deadline::Write {
+        inner: writer,
+        timeout: config.write_progress_timeout,
+    };
     let mut buffer = RecvBuffer::new(config.preferred_read, config.max_retained)?;
     let mut parser = HeadParser::<RequestRole>::request(config.protocol.head);
     let mut date = DateCache::default();
     let mut budget = WorkBudget::new();
-    loop {
+    // Graceful idle-read cancellation must leave transport shutdown usable.
+    let idle_read = CancellationSource::new();
+
+    'connection: loop {
         budget.step().await;
+
+        if connection.stopping() {
+            break;
+        }
+
+        let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
+
         let head = loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
+            }
+
             match parser.parse(buffer.bytes())? {
                 ParseOutcome::Complete { head, consumed } => {
                     buffer.consume(consumed)?;
                     break head.validate()?;
                 }
                 ParseOutcome::NeedMore => {
-                    let (result, returned) = strategy.read(&mut reader, buffer, None).await;
+                    let mut read = pin!(
+                        strategy
+                            .read_until(&mut reader, buffer, Some(idle_read.token()), deadline)
+                            .with_cancellation(shutdown.token())
+                    );
+                    let mut stopped = pin!(connection.stopped());
+
+                    let (result, returned) = match race(stopped.as_mut(), read.as_mut()).await {
+                        Race::First(()) => {
+                            idle_read.cancel();
+                            let (result, _) = read.await;
+                            if let Err(error) = result
+                                && !error.is_canceled()
+                            {
+                                return Err(error);
+                            }
+                            break 'connection;
+                        }
+                        Race::Second(result) => result,
+                    };
+
                     buffer = returned;
+
                     if result? == ReadStatus::Eof {
                         if !buffer.bytes().is_empty() {
                             return Err(Error::new(
@@ -75,8 +141,7 @@ where
                                 "connection ended inside a request head",
                             ));
                         }
-                        writer.shutdown().await?;
-                        return Ok(ConnectionOutcome::Closed);
+                        break 'connection;
                     }
                 }
             }
@@ -90,6 +155,7 @@ where
             &service,
             &config,
             &mut date,
+            shutdown,
         )
         .await;
         buffer = returned;
@@ -97,19 +163,18 @@ where
             Outcome::Handoff(kind) => {
                 return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
                     reader,
-                    writer,
+                    writer.inner,
                     buffer.take_all(),
                     kind,
                 )));
             }
-            Outcome::Close => {
-                writer.shutdown().await?;
-                return Ok(ConnectionOutcome::Closed);
-            }
+            Outcome::Close => break,
             Outcome::Reusable => {}
             Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled server exchange")),
         }
     }
+    writer.shutdown().with_cancellation(shutdown.token()).await?;
+    Ok(ConnectionOutcome::Closed)
 }
 
 // The reader and writer are borrowed exclusively by their own retained futures.
@@ -124,6 +189,7 @@ async fn exchange<R, W, S, B, T>(
     service: &S,
     config: &Builder,
     date: &mut DateCache,
+    source: &CancellationSource,
 ) -> (Result<Outcome, Error>, RecvBuffer)
 where
     W: AsyncWrite,
@@ -133,7 +199,6 @@ where
     B: Body,
     B::Error: std::error::Error + 'static,
 {
-    let source = CancellationSource::new();
     let mut state = Exchange::new(&head, config.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
@@ -170,13 +235,14 @@ where
                         }
                     }
                 }
-                receive_body(
+                receive_body_configured(
                     reader,
                     strategy,
                     buffer,
                     BodyDecoder::with_limits(head.body, config.protocol.decode),
                     producer,
                     Some(source.token()),
+                    config.body_progress_timeout,
                 )
                 .await
             }
@@ -194,7 +260,7 @@ where
             &informationals,
             version,
             config,
-            &source
+            source
         ));
         match race(receive.as_mut(), call.as_mut()).await {
             Race::First((ReceiveEnd::Failed(error), buffer)) => {
@@ -236,7 +302,7 @@ where
     }
     let sent = {
         let send = write_response(
-            writer, response, &method, version, close, date, config, &source, &mut state,
+            writer, response, &method, version, close, date, config, source, &mut state,
         );
         let mut send = pin!(send);
         if received.is_some() {

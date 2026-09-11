@@ -125,6 +125,8 @@ impl Error {
     pub(crate) fn from_io(source: io::Error) -> Self {
         let kind = if karmaio::runtime::is_operation_canceled(&source) {
             ErrorKind::Canceled
+        } else if source.kind() == io::ErrorKind::TimedOut {
+            ErrorKind::Timeout
         } else {
             ErrorKind::Io
         };

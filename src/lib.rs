@@ -12,6 +12,9 @@ pub mod service;
 
 mod future;
 
+#[cfg(feature = "http1")]
+mod trace;
+
 pub use body::{
     Body, BodyDataStream, BodyExt, BodyStream, BoxBody, CollectError, Collected, Either, Empty, Frame, Full, Incoming,
     IncomingData, InspectFrame, MapError, MapFrame, SizeHint, StreamBody, TrailerHint, WithTrailers, collect,

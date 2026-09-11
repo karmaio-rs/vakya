@@ -166,6 +166,7 @@ fn continue_and_final_release_upload_before_observation() {
             let (writer, bytes) = ObservedWriter::new();
             let (sender, driver) = Client::new()
                 .continue_wait(Some(Duration::from_secs(30)))
+                .unwrap()
                 .handshake((Reader::new([ReadStep::Data(Bytes::from(wire))]), writer));
             let mut pending = sender.start_request(upload()).await.unwrap();
             let mut driver = pin!(driver.run());
@@ -275,13 +276,16 @@ fn continue_timeout_sends_without_a_peer_permission() {
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )),
             ]);
-            let (sender, driver) = Client::new().continue_wait(Some(Duration::from_millis(1))).handshake((
-                reader,
-                NotifyWrite {
-                    writer: Writer::limited(128),
-                    uploaded: uploaded.clone(),
-                },
-            ));
+            let (sender, driver) = Client::new()
+                .continue_wait(Some(Duration::from_millis(1)))
+                .unwrap()
+                .handshake((
+                    reader,
+                    NotifyWrite {
+                        writer: Writer::limited(128),
+                        uploaded: uploaded.clone(),
+                    },
+                ));
             let pending = sender.start_request(upload()).await.unwrap();
             let (result, response) = pair(driver.run(), pending.response()).await;
             result.unwrap();
@@ -381,6 +385,7 @@ fn supplied_tcp_continue_supports_demand_before_and_after_service_return() {
                 let server = Server::new().serve_tcp(server, service);
                 let (sender, driver) = Client::new()
                     .continue_wait(Some(Duration::from_secs(30)))
+                    .unwrap()
                     .handshake_tcp(connected.unwrap());
                 let application = async {
                     let mut request = upload();

@@ -1,5 +1,5 @@
 use super::Connection;
-use crate::connection::ConnectionOutcome;
+use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
     io::transport::{Portable, Tcp},
@@ -18,6 +18,9 @@ use std::future::Future;
 #[derive(Clone, Debug)]
 pub struct Builder {
     pub(crate) protocol: Config,
+    pub(crate) head_timeout: Option<std::time::Duration>,
+    pub(crate) body_progress_timeout: Option<std::time::Duration>,
+    pub(crate) write_progress_timeout: Option<std::time::Duration>,
     pub(crate) preferred_read: usize,
     pub(crate) max_retained: usize,
     pub(crate) auto_date: bool,
@@ -27,6 +30,9 @@ impl Default for Builder {
     fn default() -> Self {
         Self {
             protocol: Config::default(),
+            head_timeout: Some(std::time::Duration::from_secs(30)),
+            body_progress_timeout: None,
+            write_progress_timeout: None,
             preferred_read: 16 * 1024,
             max_retained: 128 * 1024,
             auto_date: true,
@@ -54,6 +60,44 @@ impl Builder {
     pub fn max_informational(&mut self, count: usize) -> &mut Self {
         self.protocol.max_informational = count;
         self
+    }
+
+    /// Set the total deadline for a request head, including idle keep-alive.
+    /// Defaults to 30 seconds; `None` disables it. Incremental bytes do not
+    /// reset this budget. The clock starts when the driver awaits the head.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
+    /// Rejection preserves the previous setting. Zero is an immediately expired budget.
+    pub fn head_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
+        crate::io::deadline::configured_after(timeout)?;
+        self.head_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Set the maximum wait for each demanded body read to make peer progress.
+    /// Disabled by default. Application pauses without demand are excluded.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
+    /// Rejection preserves the previous setting. Zero is an immediately expired budget.
+    pub fn body_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
+        crate::io::deadline::configured_after(timeout)?;
+        self.body_progress_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Set the maximum wait for each write, flush, or shutdown completion.
+    /// Disabled by default. Waiting for the application to produce a body frame
+    /// is excluded. Submitted operations are canceled and settled on timeout.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
+    /// Rejection preserves the previous setting. Zero is an immediately expired budget.
+    pub fn write_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
+        crate::io::deadline::configured_after(timeout)?;
+        self.write_progress_timeout = timeout;
+        Ok(self)
     }
 
     /// Set incoming chunk-line, trailer-byte, and trailer-field limits.
@@ -129,8 +173,10 @@ impl Builder {
         B: Body,
         B::Error: std::error::Error + 'static,
     {
+        let control = ConnectionControl::new();
         Connection {
-            future: server::run(io, service, Portable, self.clone()),
+            future: server::run(io, service, Portable, self.clone(), control.clone()),
+            control,
         }
     }
 
@@ -155,8 +201,38 @@ impl Builder {
         B: Body,
         B::Error: std::error::Error + 'static,
     {
+        let control = ConnectionControl::new();
         Connection {
-            future: server::run(io, service, Tcp, self.clone()),
+            future: server::run(io, service, Tcp, self.clone(), control.clone()),
+            control,
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_validation_preserves_configuration_on_rejection() {
+        let mut builder = Builder::new();
+        macro_rules! check {
+            ($method:ident) => {{
+                let previous = builder.$method;
+                assert_eq!(
+                    builder.$method(Some(Duration::MAX)).unwrap_err().kind(),
+                    ErrorKind::LocalMessage
+                );
+                assert_eq!(builder.$method, previous);
+                for timeout in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
+                    builder.$method(timeout).unwrap();
+                    assert_eq!(builder.$method, timeout);
+                }
+            }};
+        }
+        check!(head_timeout);
+        check!(body_progress_timeout);
+        check!(write_progress_timeout);
     }
 }

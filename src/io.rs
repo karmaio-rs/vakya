@@ -5,3 +5,5 @@ pub(crate) mod recv;
 pub(crate) mod send;
 #[allow(dead_code)]
 pub(crate) mod transport;
+
+pub(crate) mod deadline;

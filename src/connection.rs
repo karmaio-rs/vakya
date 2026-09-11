@@ -1,4 +1,4 @@
-//! Outcomes of a caller-driven HTTP connection.
+//! Controls and outcomes of a caller-driven HTTP connection.
 use crate::upgrade::Upgraded;
 use std::fmt;
 
@@ -17,5 +17,173 @@ impl<R, W> fmt::Debug for ConnectionOutcome<R, W> {
             Self::Closed => f.write_str("Closed"),
             Self::Upgraded(io) => f.debug_tuple("Upgraded").field(io).finish(),
         }
+    }
+}
+
+/// A cloneable local control handle for a caller-driven connection.
+///
+/// Requests take effect while `run()` is driven. Dropping this handle does not
+/// stop the connection. Graceful shutdown completes accepted work; abort drops
+/// application waits but cancels and awaits retained transport operations.
+/// Custom transports must cooperate with Karmaio cancellation to finish.
+#[derive(Clone, Debug)]
+pub struct ConnectionControl {
+    shared: std::rc::Rc<ControlState>,
+}
+
+#[derive(Debug, Default)]
+struct ControlState {
+    stopping: std::cell::Cell<bool>,
+    abort: std::cell::Cell<bool>,
+    deadline: std::cell::Cell<Option<std::time::Instant>>,
+    driver: std::cell::RefCell<Option<std::task::Waker>>,
+    admission: std::cell::RefCell<Option<std::task::Waker>>,
+    idle: std::cell::RefCell<Option<std::task::Waker>>,
+}
+
+#[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
+impl ConnectionControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            shared: std::rc::Rc::new(ControlState::default()),
+        }
+    }
+
+    /// Stop new admission and finish accepted work without an implicit deadline.
+    /// This never relaxes an earlier deadline or abort request.
+    pub fn graceful_shutdown(&self) {
+        crate::trace::lifecycle("graceful shutdown requested");
+        self.shared.stopping.set(true);
+        self.wake();
+    }
+
+    /// Request immediate cancellation and settlement of the connection.
+    /// `run()` reports `Canceled` unless an originating failure is retained.
+    pub fn abort(&self) {
+        crate::trace::lifecycle("abort requested");
+        self.shared.abort.set(true);
+        self.graceful_shutdown();
+    }
+
+    /// Stop admission now and escalate to abort at this absolute deadline.
+    /// Repeated requests retain the earliest deadline. Expiration is reported
+    /// as `Timeout` after transport operations settle.
+    pub fn graceful_shutdown_with_deadline(&self, deadline: std::time::Instant) {
+        self.shared.deadline.set(Some(
+            self.shared.deadline.get().map_or(deadline, |old| old.min(deadline)),
+        ));
+        self.graceful_shutdown();
+    }
+
+    fn wake(&self) {
+        for slot in [&self.shared.driver, &self.shared.admission, &self.shared.idle] {
+            let wake = slot.borrow_mut().take();
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+        }
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.shared.stopping.get()
+    }
+
+    pub(crate) fn admission_waker(&self, waker: &std::task::Waker) {
+        self.shared.admission.borrow_mut().replace(waker.clone());
+    }
+
+    pub(crate) async fn stopped(&self) {
+        std::future::poll_fn(|cx| {
+            if self.stopping() {
+                return std::task::Poll::Ready(());
+            }
+            self.shared.idle.borrow_mut().replace(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    async fn abort_requested(&self) -> crate::ErrorKind {
+        use std::{future::poll_fn, task::Poll};
+        loop {
+            let deadline = poll_fn(|cx| {
+                self.shared.driver.borrow_mut().replace(cx.waker().clone());
+                if self.shared.abort.get() {
+                    return Poll::Ready(None);
+                }
+                match self.shared.deadline.get() {
+                    Some(deadline) => Poll::Ready(Some(deadline)),
+                    None => Poll::Pending,
+                }
+            })
+            .await;
+
+            let Some(deadline) = deadline else {
+                return crate::ErrorKind::Canceled;
+            };
+
+            let mut timer = std::pin::pin!(karmaio::time::sleep_until(deadline));
+
+            let changed = poll_fn(|cx| {
+                self.shared.driver.borrow_mut().replace(cx.waker().clone());
+                if self.shared.abort.get() || self.shared.deadline.get() != Some(deadline) {
+                    return Poll::Ready(true);
+                }
+                use std::future::Future;
+                timer.as_mut().poll(cx).map(|()| false)
+            })
+            .await;
+
+            if !changed {
+                return crate::ErrorKind::Timeout;
+            }
+        }
+    }
+
+    pub(crate) async fn drive<F, T>(
+        &self,
+        source: &karmaio::runtime::CancellationSource,
+        future: std::pin::Pin<&mut F>,
+    ) -> Result<T, crate::Error>
+    where
+        F: std::future::Future<Output = Result<T, crate::Error>>,
+    {
+        use crate::future::{Race, race};
+        struct Guard<'a>(&'a ConnectionControl);
+
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.shared.stopping.set(true);
+                self.0.wake();
+                crate::trace::lifecycle("driver released");
+            }
+        }
+
+        let _guard = Guard(self);
+
+        crate::trace::lifecycle("driver started");
+        let mut future = std::pin::pin!(future);
+        let mut abort = std::pin::pin!(self.abort_requested());
+
+        let result = match race(abort.as_mut(), future.as_mut()).await {
+            Race::Second(result) => result,
+            Race::First(kind) => {
+                crate::trace::lifecycle("canceling retained operations");
+                source.cancel();
+                let result = future.await;
+                match result {
+                    Err(error) if !error.is_canceled() => Err(error),
+                    _ => Err(crate::Error::new(kind, "connection shutdown requested")),
+                }
+            }
+        };
+
+        if let Err(error) = &result {
+            crate::trace::failure(error.kind());
+        } else {
+            crate::trace::lifecycle("driver settled");
+        }
+
+        result
     }
 }

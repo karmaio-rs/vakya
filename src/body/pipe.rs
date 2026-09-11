@@ -12,6 +12,7 @@ pub(crate) fn channel<T, E>() -> (Producer<T, E>, Consumer<T, E>) {
         state: RefCell::new(State::Idle),
         producer_waker: RefCell::new(None),
         consumer_waker: RefCell::new(None),
+        drain_remaining: std::cell::Cell::new(None),
     });
 
     (
@@ -36,6 +37,7 @@ struct Shared<T, E> {
     state: RefCell<State<T, E>>,
     producer_waker: RefCell<Option<Waker>>,
     consumer_waker: RefCell<Option<Waker>>,
+    drain_remaining: std::cell::Cell<Option<(u64, u64)>>,
 }
 
 enum State<T, E> {
@@ -55,6 +57,19 @@ pub(crate) struct Producer<T, E> {
 }
 
 impl<T, E> Producer<T, E> {
+    /// Charge consumed framing bytes only after a consumer opts into draining.
+    #[cfg(feature = "http1")]
+    pub(crate) fn charge_drain(&self, bytes: usize, payload: usize) -> bool {
+        let Some((wire, data)) = self.shared.drain_remaining.get() else {
+            return true;
+        };
+        let (Some(wire), Some(data)) = (wire.checked_sub(bytes as u64), data.checked_sub(payload as u64)) else {
+            return false;
+        };
+        self.shared.drain_remaining.set(Some((wire, data)));
+        true
+    }
+
     /// Waits until the body consumer asks for another item.
     pub(crate) fn demand(&mut self) -> Demand<'_, T, E> {
         Demand { producer: self }
@@ -132,6 +147,12 @@ pub(crate) struct Consumer<T, E> {
 }
 
 impl<T, E> Consumer<T, E> {
+    pub(crate) fn drain_budget(&self, bytes: u64) {
+        self.shared
+            .drain_remaining
+            .set(Some((bytes.saturating_add(64 * 1024), bytes)));
+    }
+
     /// Waits for the next offered item or producer termination.
     pub(crate) fn take(&mut self) -> Take<'_, T, E> {
         Take { consumer: self }

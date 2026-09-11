@@ -49,13 +49,26 @@ pub(super) fn incoming(mode: BodyMode) -> (Option<IncomingProducer>, Incoming) {
 /// Drive one receive activity inside its connection's scope. No spawned task
 /// or request-context lifetime is attached to the body. Awaiting this future
 /// recovers retained input even after abandonment cancels pending transport I/O.
+#[cfg(test)]
 pub(super) async fn receive_body<R, S: Receive<R>>(
+    reader: &mut R,
+    strategy: &mut S,
+    buffer: RecvBuffer,
+    decoder: BodyDecoder,
+    producer: IncomingProducer,
+    cancellation: Option<CancellationToken>,
+) -> (ReceiveEnd, RecvBuffer) {
+    receive_body_configured(reader, strategy, buffer, decoder, producer, cancellation, None).await
+}
+
+pub(super) async fn receive_body_configured<R, S: Receive<R>>(
     reader: &mut R,
     strategy: &mut S,
     mut buffer: RecvBuffer,
     mut decoder: BodyDecoder,
     mut producer: IncomingProducer,
     cancellation: Option<CancellationToken>,
+    progress_timeout: Option<std::time::Duration>,
 ) -> (ReceiveEnd, RecvBuffer) {
     let abandonment = CancellationSource::new();
     let mut eof = false;
@@ -75,22 +88,58 @@ pub(super) async fn receive_body<R, S: Receive<R>>(
             Ok(outcome) => outcome,
             Err(error) => return (ReceiveEnd::fail(producer, error.into()), buffer),
         };
+
+        let consumed = match &outcome {
+            DecodeOutcome::NeedMore { consumed }
+            | DecodeOutcome::Data { consumed, .. }
+            | DecodeOutcome::Trailers { consumed, .. }
+            | DecodeOutcome::End { consumed } => *consumed,
+        };
+
+        let payload = match &outcome {
+            DecodeOutcome::Data { payload, .. } => payload.len(),
+            _ => 0,
+        };
+
+        if !producer.charge_drain(consumed, payload) {
+            return (
+                ReceiveEnd::fail(
+                    producer,
+                    Error::new(ErrorKind::Limit, "body drain payload or wire limit exceeded"),
+                ),
+                buffer,
+            );
+        }
+
         let frame = match outcome {
             DecodeOutcome::NeedMore { consumed } => {
                 if let Err(error) = buffer.consume(consumed) {
                     return (ReceiveEnd::fail(producer, error), buffer);
                 }
-                let (result, returned) =
-                    read_or_abandoned(reader, strategy, buffer, &mut producer, &abandonment, cancellation).await;
+
+                let (result, returned) = read_or_abandoned(
+                    reader,
+                    strategy,
+                    buffer,
+                    &mut producer,
+                    &abandonment,
+                    cancellation,
+                    progress_timeout,
+                )
+                .await;
+
                 buffer = returned;
+
                 if producer.is_abandoned() {
                     return (ReceiveEnd::Abandoned, buffer);
                 }
+
                 match result {
                     Ok(ReadStatus::Eof) => eof = true,
                     Ok(ReadStatus::Data(_)) => {}
                     Err(error) => return (ReceiveEnd::fail(producer, error), buffer),
                 }
+
                 continue;
             }
             DecodeOutcome::Data { payload, consumed } => {
@@ -135,18 +184,26 @@ async fn read_or_abandoned<R, S: Receive<R>>(
     producer: &mut IncomingProducer,
     abandonment: &CancellationSource,
     cancellation: Option<CancellationToken>,
+    progress_timeout: Option<std::time::Duration>,
 ) -> (Result<ReadStatus, Error>, RecvBuffer) {
     // Both scopes must be installed before the first poll/submission. Retain
     // the read even when the abandonment wait wins; cancellation is fail-slow.
+    let deadline = match crate::io::deadline::configured_after(progress_timeout) {
+        Ok(deadline) => deadline,
+        Err(error) => return (Err(error), buffer),
+    };
     let read = async {
-        let read = strategy.read(reader, buffer, Some(abandonment.token()));
+        let read = strategy.read_until(reader, buffer, Some(abandonment.token()), deadline);
+
         match cancellation {
             Some(token) => read.with_cancellation(token).await,
             None => read.await,
         }
     };
+
     let mut read = pin!(read);
     let mut abandoned = pin!(producer.abandoned());
+
     match race(read.as_mut(), abandoned.as_mut()).await {
         Race::First(result) => result,
         Race::Second(()) => {

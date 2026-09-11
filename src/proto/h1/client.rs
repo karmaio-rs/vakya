@@ -1,6 +1,6 @@
 use super::{
     BodyMode, Expectation,
-    bridge::{ReceiveEnd, SendBodyError, incoming, receive_body, send_body},
+    bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_request_head},
     exchange::{Direction, Exchange, HeadAction, Outcome},
@@ -32,9 +32,10 @@ use std::pin::pin;
 
 pub(crate) async fn run<I, B, T>(
     io: I,
-    mut requests: Receiver<B>,
-    mut strategy: T,
+    requests: Receiver<B>,
+    strategy: T,
     config: Builder,
+    connection: crate::connection::ConnectionControl,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
     I: IntoOwnedSplit,
@@ -42,10 +43,39 @@ where
     B::Error: std::error::Error + 'static,
     T: Receive<I::ReadHalf>,
 {
-    let (mut reader, mut writer) = io.into_split();
+    let shutdown = karmaio::runtime::CancellationSource::new();
+
+    connection
+        .drive(
+            &shutdown,
+            pin!(run_inner(io, requests, strategy, config, &connection, &shutdown)),
+        )
+        .await
+}
+
+async fn run_inner<I, B, T>(
+    io: I,
+    mut requests: Receiver<B>,
+    mut strategy: T,
+    config: Builder,
+    connection: &crate::connection::ConnectionControl,
+    shutdown: &karmaio::runtime::CancellationSource,
+) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
+where
+    I: IntoOwnedSplit,
+    B: Body,
+    B::Error: std::error::Error + 'static,
+    T: Receive<I::ReadHalf>,
+{
+    let (mut reader, writer) = io.into_split();
+    let mut writer = crate::io::deadline::Write {
+        inner: writer,
+        timeout: config.write_progress_timeout,
+    };
     let mut buffer = RecvBuffer::new(config.preferred_read, config.max_retained)?;
     let mut budget = WorkBudget::new();
     let mut parser = HeadParser::<ResponseRole>::response(config.protocol.head);
+
     while let Some(job) = requests.next().await {
         budget.step().await;
         let (next, persistence) = exchange(
@@ -56,6 +86,7 @@ where
             buffer,
             job,
             &config,
+            shutdown,
         )
         .await?;
         buffer = next;
@@ -65,7 +96,7 @@ where
                 drop(requests);
                 return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
                     reader,
-                    writer,
+                    writer.inner,
                     buffer.take_all(),
                     kind,
                 )));
@@ -75,16 +106,21 @@ where
             Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled client exchange")),
         }
 
+        if connection.stopping() {
+            break;
+        }
+
         requests.release();
     }
     // Close admission before awaiting transport shutdown so reservations cannot
     // wait for an exchange that will never run.
     drop(requests);
-    writer.shutdown().await?;
+    writer.shutdown().with_cancellation(shutdown.token()).await?;
 
     Ok(ConnectionOutcome::Closed)
 }
 
+#[allow(clippy::too_many_arguments)] // Disjoint exchange resources and connection cancellation.
 async fn exchange<R, W, B, T>(
     reader: &mut R,
     writer: &mut W,
@@ -93,6 +129,7 @@ async fn exchange<R, W, B, T>(
     buffer: RecvBuffer,
     job: Job<B>,
     config: &Builder,
+    shutdown: &karmaio::runtime::CancellationSource,
 ) -> Result<(RecvBuffer, Outcome), Error>
 where
     W: AsyncWrite,
@@ -108,7 +145,7 @@ where
 
     let mut response = Some(response);
 
-    let result = exchange_inner(
+    let work = exchange_inner(
         reader,
         writer,
         strategy,
@@ -118,8 +155,19 @@ where
         &mut response,
         &control,
         config,
-    )
-    .await;
+    );
+    let result = {
+        let mut work = pin!(work);
+        let mut canceled = pin!(shutdown.token().cancelled());
+
+        match race(canceled.as_mut(), work.as_mut()).await {
+            Race::First(()) => {
+                control.cancel();
+                work.await
+            }
+            Race::Second(result) => result,
+        }
+    };
 
     match result {
         Err(error) => {
@@ -186,7 +234,10 @@ where
             // The read half releases permission before offering an observed 100
             // or final event; an application pause cannot hold that permission.
             let waited = cancellable_wait(
-                karmaio::time::timeout(timeout, control.wait_continue()),
+                karmaio::time::timeout_at(
+                    crate::io::deadline::configured_after(Some(timeout))?.expect("configured Continue duration"),
+                    control.wait_continue(),
+                ),
                 Some(control.upload.token()),
             )
             .await;
@@ -300,7 +351,12 @@ async fn receive<R, T: Receive<R>>(
     control: &Control,
     config: &Builder,
 ) -> Result<(ReceiveEnd, RecvBuffer, Exchange), Error> {
+    let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
     let head = loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
+        }
+
         match parser.parse(buffer.bytes())? {
             ParseOutcome::Complete { head, consumed } => {
                 buffer.consume(consumed)?;
@@ -322,7 +378,13 @@ async fn receive<R, T: Receive<R>>(
                         *message.version_mut() = head.head.version;
                         *message.headers_mut() = head.head.headers;
 
-                        offer_event(response, ResponseEvent::Informational(message), control).await?;
+                        let offer = offer_event(response, ResponseEvent::Informational(message), control);
+                        match deadline {
+                            Some(deadline) => karmaio::time::timeout_at(deadline, offer).await.map_err(|_| {
+                                Error::new(ErrorKind::Timeout, "final response head deadline exceeded")
+                            })??,
+                            None => offer.await?,
+                        }
 
                         continue;
                     }
@@ -333,7 +395,9 @@ async fn receive<R, T: Receive<R>>(
                 }
             }
             ParseOutcome::NeedMore => {
-                let (result, returned) = strategy.read(reader, buffer, Some(control.exchange.token())).await;
+                let (result, returned) = strategy
+                    .read_until(reader, buffer, Some(control.exchange.token()), deadline)
+                    .await;
                 buffer = returned;
 
                 if result? == ReadStatus::Eof {
@@ -362,13 +426,14 @@ async fn receive<R, T: Receive<R>>(
 
     let (end, buffer) = match producer {
         Some(producer) => {
-            receive_body(
+            receive_body_configured(
                 reader,
                 strategy,
                 buffer,
                 BodyDecoder::with_limits(head.body, config.protocol.decode),
                 producer,
                 Some(control.exchange.token()),
+                config.body_progress_timeout,
             )
             .await
         }

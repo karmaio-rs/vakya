@@ -8,12 +8,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     karmaio::Runtime::new()?.block_on(async {
         let socket = karmaio::net::tcp::TcpStream::connect("127.0.0.1:8080".parse::<std::net::SocketAddr>()?).await?;
         let (sender, connection) = Builder::new().handshake_tcp::<Empty>(socket);
+        let control = connection.control();
         let driver = karmaio::runtime::spawn_local(connection.run());
         let exchange = async {
             let request = Request::builder()
                 .uri("/")
                 .header("host", "127.0.0.1:8080")
-                .header("connection", "close")
                 .body(Empty::new())?;
             let mut pending = sender.start_request(request).await?;
             let response = loop {
@@ -29,9 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok::<(), Box<dyn std::error::Error>>(())
         }
         .await;
+        control.graceful_shutdown_with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5));
         drop(sender);
         // Observe both application and driver outcomes, including after an
-        // exchange error. Dropping the last sender lets accepted work finish.
+        // exchange error. The application bounds shutdown and keeps driving it.
         let settled = driver.await?;
         exchange?;
         settled?;

@@ -13,6 +13,7 @@ use std::{
 
 struct State<B> {
     closed: bool,
+    control: crate::connection::ConnectionControl,
     busy: bool,
     senders: usize,
     waiting: bool,
@@ -71,7 +72,7 @@ impl<B> SendRequest<B> {
 
         poll_fn(|cx| {
             let mut state = wait.shared.borrow_mut();
-            if state.closed {
+            if state.closed || state.control.stopping() {
                 return Poll::Ready(Err(closed()));
             }
             if !wait.registered && state.waiting {
@@ -90,6 +91,7 @@ impl<B> SendRequest<B> {
                     active: true,
                 }));
             }
+            state.control.admission_waker(cx.waker());
             state.waiting = true;
             state.waiter = Some(cx.waker().clone());
             wait.registered = true;
@@ -167,12 +169,14 @@ impl<B> RequestPermit<B> {
     /// Panics when submitting outside an active Karmaio runtime.
     pub fn send(mut self, request: Request<B>) -> Result<PendingResponse, SubmitError<B>> {
         let mut state = self.shared.borrow_mut();
-        if state.closed {
+
+        if state.closed || state.control.stopping() {
             return Err(SubmitError {
                 request: Box::new(request),
                 error: closed(),
             });
         }
+
         let (response, pending, control) = response::channel();
 
         state.queued = Some(Job {
@@ -280,9 +284,10 @@ pub(crate) struct Receiver<B> {
     shared: Rc<RefCell<State<B>>>,
 }
 
-pub(crate) fn channel<B>() -> (SendRequest<B>, Receiver<B>) {
+pub(crate) fn channel<B>(control: crate::connection::ConnectionControl) -> (SendRequest<B>, Receiver<B>) {
     let shared = Rc::new(RefCell::new(State {
         closed: false,
+        control,
         busy: false,
         senders: 1,
         waiting: false,
@@ -301,10 +306,14 @@ impl<B> Receiver<B> {
             if let Some(job) = state.queued.take() {
                 return Poll::Ready(Some(job));
             }
-            if state.closed || (state.senders == 0 && !state.busy) {
+
+            if state.closed || state.control.stopping() || (state.senders == 0 && !state.busy) {
                 return Poll::Ready(None);
             }
+
+            state.control.admission_waker(cx.waker());
             state.driver = Some(cx.waker().clone());
+
             Poll::Pending
         })
         .await

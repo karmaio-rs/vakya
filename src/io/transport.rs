@@ -10,6 +10,24 @@ use karmaio::{
 /// `Portable`; explicit TCP constructors select `Tcp`. These are Karmaio I/O
 /// policies, not a runtime abstraction or an erased transport registry.
 pub(crate) trait Receive<R> {
+    /// Apply an absolute deadline without dropping the retained read.
+    async fn read_until(
+        &mut self,
+        reader: &mut R,
+        buffer: RecvBuffer,
+        cancellation: Option<CancellationToken>,
+        deadline: Option<std::time::Instant>,
+    ) -> (Result<ReadStatus, Error>, RecvBuffer) {
+        let ((result, buffer), elapsed) =
+            super::deadline::settle(deadline, std::pin::pin!(self.read(reader, buffer, cancellation))).await;
+        let result = if elapsed && (result.is_ok() || result.as_ref().is_err_and(Error::is_canceled)) {
+            Err(Error::new(crate::ErrorKind::Timeout, "HTTP receive deadline exceeded"))
+        } else {
+            result
+        };
+        (result, buffer)
+    }
+
     async fn read(
         &mut self,
         reader: &mut R,
