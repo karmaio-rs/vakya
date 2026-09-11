@@ -1,6 +1,6 @@
 [package]
 name = "vakya"
-description = "A modern, powerful rust http library"
+description = "Completion-native HTTP building blocks for the Karmaio runtime"
 repository = "https://github.com/karmaio-rs/vakya"
 readme = "README.md"
 authors = ["Tarak Sharma <tarak@taraksharma.com>"]
@@ -34,6 +34,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"], optio
 
 [package.metadata.docs.rs]
 all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
 name = "server"

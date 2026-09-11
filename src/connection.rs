@@ -51,6 +51,10 @@ impl ConnectionControl {
 
     /// Stop new admission and finish accepted work without an implicit deadline.
     /// This never relaxes an earlier deadline or abort request.
+    ///
+    /// Completion is local: it does not acknowledge the peer's transport teardown
+    /// or guarantee that the peer's driver also returns success. Transport errors
+    /// observed while closing are still reported by `run()`.
     pub fn graceful_shutdown(&self) {
         crate::trace::lifecycle("graceful shutdown requested");
         self.shared.stopping.set(true);
@@ -88,10 +92,12 @@ impl ConnectionControl {
         self.shared.stopping.get()
     }
 
+    #[cfg(feature = "client")]
     pub(crate) fn admission_waker(&self, waker: &std::task::Waker) {
         self.shared.admission.borrow_mut().replace(waker.clone());
     }
 
+    #[cfg(feature = "server")]
     pub(crate) async fn stopped(&self) {
         std::future::poll_fn(|cx| {
             if self.stopping() {

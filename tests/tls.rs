@@ -2,7 +2,8 @@
 mod support;
 use bytes::Bytes;
 use karmaio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, IntoOwnedSplit},
     net::tcp::{TcpListener, TcpStream},
     runtime::spawn_local,
     tls::{ClientTlsStream, ServerTlsStream, TlsAcceptor, TlsConnector},
@@ -77,6 +78,13 @@ fn configs(alpn: Option<&[u8]>) -> (Arc<rustls::ClientConfig>, Arc<rustls::Serve
 }
 
 async fn connected(alpn: Option<&[u8]>) -> (ClientTlsStream<TcpStream>, ServerTlsStream<TcpStream>) {
+    connected_with(alpn, |socket| socket).await
+}
+
+async fn connected_with<I: AsyncRead + AsyncWrite>(
+    alpn: Option<&[u8]>,
+    wrap: impl FnOnce(TcpStream) -> I,
+) -> (ClientTlsStream<I>, ServerTlsStream<TcpStream>) {
     let (client, server) = configs(alpn);
     let listener = TcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
     let address = listener.local_addr().unwrap();
@@ -86,10 +94,61 @@ async fn connected(alpn: Option<&[u8]>) -> (ClientTlsStream<TcpStream>, ServerTl
     });
     let socket = TcpStream::connect(address).await.unwrap();
     let client = TlsConnector::new(client)
-        .connect("localhost".try_into().unwrap(), socket)
+        .connect("localhost".try_into().unwrap(), wrap(socket))
         .await
         .unwrap();
     (client, accept.await.unwrap())
+}
+
+// Send the client's TLS close notification and TCP FIN, but retain the socket
+// until the server finishes its reciprocal shutdown. Closing it earlier can
+// reset the server's final TLS write on Windows. This synchronization belongs
+// to tests that require both peers to report a clean close, not HTTP policy.
+struct HoldClose<I> {
+    inner: I,
+    peer_closed: Gate,
+}
+
+impl<I: AsyncRead> AsyncRead for HoldClose<I> {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> BufResult<usize, B> {
+        self.inner.read(buffer).await
+    }
+}
+
+impl<I: AsyncWrite> AsyncWrite for HoldClose<I> {
+    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
+        self.inner.write(buffer).await
+    }
+
+    async fn write_vectored<B: IoVectoredBuf>(&mut self, buffers: B) -> BufResult<usize, B> {
+        self.inner.write_vectored(buffers).await
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush().await
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown().await?;
+        self.peer_closed.wait().await;
+        Ok(())
+    }
+}
+
+impl<I: IntoOwnedSplit> IntoOwnedSplit for HoldClose<I> {
+    type ReadHalf = I::ReadHalf;
+    type WriteHalf = HoldClose<I::WriteHalf>;
+
+    fn into_split(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        let (reader, writer) = self.inner.into_split();
+        (
+            reader,
+            HoldClose {
+                inner: writer,
+                peer_closed: self.peer_closed,
+            },
+        )
+    }
 }
 
 async fn pair<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
@@ -133,11 +192,41 @@ fn metadata(info: &TlsInfo, alpn: Option<&[u8]>, server: bool) {
     assert_eq!(info.server_name(), server.then_some("localhost"));
 }
 
+fn assert_closed<R, W>(result: Result<ConnectionOutcome<R, W>, vakya::Error>, role: &str, alpn: Option<&[u8]>) {
+    match result {
+        Ok(ConnectionOutcome::Closed) => {}
+        Ok(ConnectionOutcome::Upgraded(_)) => panic!("{role}, ALPN {alpn:?}: unexpected upgrade"),
+        Err(error) => {
+            // Public error formatting deliberately hides external source details.
+            // Include them explicitly here to diagnose platform-specific failures.
+            let mut details = format!("{role}, ALPN {alpn:?}: {error:?}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(error) = source {
+                details.push_str(&format!("\ncaused by: {error:?}"));
+                if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    details.push_str(&format!(
+                        " (kind: {:?}, OS code: {:?})",
+                        error.kind(),
+                        error.raw_os_error()
+                    ));
+                }
+                source = error.source();
+            }
+            panic!("{details}");
+        }
+    }
+}
+
 #[test]
 fn supplied_tls_reuses_http_and_attaches_metadata_to_every_head() {
     karmaio::Runtime::new().unwrap().block_on(async {
         for alpn in [None, Some(HTTP_11_ALPN)] {
-            let (client, server) = connected(alpn).await;
+            let peer_closed = Gate::default();
+            let (client, server) = connected_with(alpn, |inner| HoldClose {
+                inner,
+                peer_closed: peer_closed.clone(),
+            })
+            .await;
             let service = service_fn(
                 async move |(request, mut context): (Request<Incoming>, RequestContext)| {
                     metadata(request.extensions().get::<TlsInfo>().unwrap(), alpn, true);
@@ -164,8 +253,10 @@ fn supplied_tls_reuses_http_and_attaches_metadata_to_every_head() {
             }
             control.graceful_shutdown();
             drop(sender);
-            assert!(matches!(driving.await.unwrap().unwrap(), ConnectionOutcome::Closed));
-            assert!(matches!(serving.await.unwrap().unwrap(), ConnectionOutcome::Closed));
+            let server_result = serving.await.unwrap();
+            peer_closed.open();
+            assert_closed(driving.await.unwrap(), "client", alpn);
+            assert_closed(server_result, "server", alpn);
         }
     });
 }
@@ -220,7 +311,12 @@ impl Body for Delayed {
 #[test]
 fn encrypted_echo_keeps_upload_alive_after_early_final_head() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let (client, server) = connected(Some(HTTP_11_ALPN)).await;
+        let peer_closed = Gate::default();
+        let (client, server) = connected_with(Some(HTTP_11_ALPN), |inner| HoldClose {
+            inner,
+            peer_closed: peer_closed.clone(),
+        })
+        .await;
         let calls = Cell::new(0);
         let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
             calls.set(calls.get() + 1);
@@ -246,9 +342,14 @@ fn encrypted_echo_keeps_upload_alive_after_early_final_head() {
             control.graceful_shutdown();
             drop(sender);
         };
-        let ((client, server), ()) = pair(pair(client.run(), server.run()), app).await;
-        client.unwrap();
-        server.unwrap();
+        let serving = async {
+            let result = server.run().await;
+            peer_closed.open();
+            result
+        };
+        let ((client, server), ()) = pair(pair(client.run(), serving), app).await;
+        assert_closed(client, "client", Some(HTTP_11_ALPN));
+        assert_closed(server, "server", Some(HTTP_11_ALPN));
         assert_eq!(recycled.get(), 1);
         assert_eq!(calls.get(), 1);
     });
@@ -351,5 +452,130 @@ fn tls_protocol_failure_retains_the_original_rustls_source() {
                 .unwrap();
             assert!(source.get_ref().unwrap().is::<rustls::Error>());
         }
+    });
+}
+
+#[test]
+fn connect_tunnel_supports_tls_and_a_nested_http_connection() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()).unwrap();
+        let (client, accepted) = pair(TcpStream::connect(listener.local_addr().unwrap()), listener.accept()).await;
+        let server = Server::new().serve_connection(
+            accepted.unwrap().0,
+            service_fn(async |_: (Request<Incoming>, RequestContext)| Ok::<_, Infallible>(Response::new(Empty::new()))),
+        );
+        let (sender, client) = Client::new().handshake(client.unwrap());
+        let pending = sender
+            .start_request(
+                Request::builder()
+                    .method("CONNECT")
+                    .uri("localhost:443")
+                    .header("host", "localhost:443")
+                    .body(Empty::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ((server, client), response) = pair(pair(server.run(), client.run()), pending.response()).await;
+        assert_eq!(response.unwrap().status(), 200);
+        let ConnectionOutcome::Upgraded(server) = server.unwrap() else {
+            panic!("missing server tunnel")
+        };
+        let ConnectionOutcome::Upgraded(client) = client.unwrap() else {
+            panic!("missing client tunnel")
+        };
+        let (client_config, server_config) = configs(Some(HTTP_11_ALPN));
+        let connector = TlsConnector::new(client_config);
+        let acceptor = TlsAcceptor::new(server_config);
+        let peer_closed = Gate::default();
+        let (client, server) = pair(
+            connector.connect(
+                "localhost".try_into().unwrap(),
+                HoldClose {
+                    inner: client,
+                    peer_closed: peer_closed.clone(),
+                },
+            ),
+            acceptor.accept(server),
+        )
+        .await;
+        let server = Server::new()
+            .serve_tls(
+                server.unwrap(),
+                service_fn(async |(request, context): (Request<Incoming>, RequestContext)| {
+                    assert_eq!(request.uri(), "/nested");
+                    assert!(request.extensions().get::<TlsInfo>().is_some());
+                    context.close_connection();
+                    Ok::<_, Infallible>(Response::new(vakya::Full::new(Bytes::from_static(
+                        b"through the tunnel",
+                    ))))
+                }),
+            )
+            .unwrap();
+        let serving = spawn_local(async move {
+            let result = server.run().await;
+            peer_closed.open();
+            result
+        });
+        let (sender, client) = Client::new().handshake_tls::<_, Empty>(client.unwrap()).unwrap();
+        let (result, body) = pair(client.run(), async {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri("/nested")
+                        .header("host", "localhost")
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.extensions().get::<TlsInfo>().is_some());
+            response.into_body().collect(64).await.unwrap()
+        })
+        .await;
+        assert_eq!(body.as_ref(), b"through the tunnel");
+        assert!(matches!(result.unwrap(), ConnectionOutcome::Closed));
+        assert!(matches!(serving.await.unwrap().unwrap(), ConnectionOutcome::Closed));
+    });
+}
+
+#[test]
+fn graceful_server_completion_sends_tls_close_notification() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let (mut client, server) = connected(Some(HTTP_11_ALPN)).await;
+        let slot = Rc::new(std::cell::RefCell::new(None::<vakya::connection::ConnectionControl>));
+        let service_slot = slot.clone();
+        let server = Server::new()
+            .serve_tls(
+                server,
+                service_fn(async move |_: (Request<Incoming>, RequestContext)| {
+                    service_slot.borrow().as_ref().unwrap().graceful_shutdown();
+                    Ok::<_, Infallible>(Response::new(Empty::new()))
+                }),
+            )
+            .unwrap();
+        *slot.borrow_mut() = Some(server.control());
+        let (result, received) = pair(server.run(), async {
+            client
+                .write_all(Bytes::from_static(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n"))
+                .await
+                .0
+                .unwrap();
+            let mut received = Vec::new();
+            loop {
+                let (result, bytes) = client.read(Vec::with_capacity(1024)).await.into_parts();
+                // Rustls reports unclean TCP EOF as an error; Ok(0) proves close_notify.
+                let count = result.unwrap();
+                if count == 0 {
+                    break;
+                }
+                received.extend_from_slice(&bytes[..count]);
+            }
+            received
+        })
+        .await;
+        assert!(matches!(result.unwrap(), ConnectionOutcome::Closed));
+        assert!(received.starts_with(b"HTTP/1.1 200"));
+        assert!(received.ends_with(b"\r\n\r\n"));
     });
 }

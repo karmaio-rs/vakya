@@ -37,7 +37,6 @@ pub(crate) enum Race<A, B> {
 /// Submitted I/O must remain pinned and be driven to completion after a control
 /// event wins. A cancellation request alone does not recover its owned buffers.
 #[cfg(feature = "http1")]
-#[allow(dead_code)] // Used by scoped connection driving in subsequent phases.
 pub(crate) async fn race<A: std::future::Future, B: std::future::Future>(
     mut first: std::pin::Pin<&mut A>,
     mut second: std::pin::Pin<&mut B>,
@@ -54,7 +53,6 @@ pub(crate) async fn race<A: std::future::Future, B: std::future::Future>(
 /// Cancels a drop-safe control wait. Never use this helper for submitted I/O:
 /// unlike `race`, it owns the losing future and drops it on cancellation.
 #[cfg(feature = "http1")]
-#[allow(dead_code)] // Admission and body-demand waits are integrated later.
 pub(crate) async fn cancellable_wait<F: std::future::Future>(
     future: F,
     token: Option<karmaio::runtime::CancellationToken>,

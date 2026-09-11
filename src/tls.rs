@@ -4,6 +4,34 @@
 //! and ALPN, then perform the TLS handshake through Karmaio. Vakya's HTTP/1
 //! TLS constructors accept absent ALPN or `http/1.1` and use portable decrypted
 //! reads. This feature does not select a crypto provider or trust store.
+//!
+//! A typed CONNECT handoff can be passed directly through Karmaio TLS and back
+//! into Vakya. The application supplies the configured connector and drives
+//! the resulting connection alongside its requests (requires `client,tls`).
+//!
+//! ```no_run
+//! # #[cfg(feature = "client")]
+//! async fn request_through_tunnel<R, W>(
+//!     tunnel: vakya::upgrade::Upgraded<R, W>,
+//!     connector: &karmaio::tls::TlsConnector,
+//! ) -> Result<(), Box<dyn std::error::Error>>
+//! where
+//!     R: karmaio::io::AsyncRead + 'static,
+//!     W: karmaio::io::AsyncWrite + 'static,
+//! {
+//!     use vakya::{BodyExt, Empty, Request, client::conn::http1::Builder};
+//!     let tls = connector.connect("example.com".try_into()?, tunnel).await?;
+//!     let (sender, connection) = Builder::new().handshake_tls::<_, Empty>(tls)?;
+//!     let driver = karmaio::runtime::spawn_local(connection.run());
+//!     let response = sender.send_request(Request::builder()
+//!         .uri("/").header("host", "example.com").body(Empty::new())?).await?;
+//!     let body = response.into_body().collect(1024 * 1024).await?;
+//!     drop(body);
+//!     drop(sender);
+//!     driver.await??;
+//!     Ok(())
+//! }
+//! ```
 
 pub use karmaio::tls::rustls;
 

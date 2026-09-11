@@ -1,4 +1,4 @@
-// Built before the connection drivers that consume these private helpers.
+// HTTP/1 can be selected without a client or server driver.
 #[allow(dead_code)]
 pub(crate) mod recv;
 #[allow(dead_code)]

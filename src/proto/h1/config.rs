@@ -1,6 +1,6 @@
 use super::{decode::DecodeLimits, encode::EncodeLimits, head::HeadLimits};
 
-/// Protocol budgets shared by the eventual client and server drivers.
+/// Protocol budgets shared by the client and server drivers.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Config {
     pub(crate) head: HeadLimits,

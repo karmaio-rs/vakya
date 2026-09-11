@@ -592,3 +592,125 @@ fn abort_and_deadline_settle_shutdown_and_preserve_original_failure() {
         }
     });
 }
+
+#[test]
+fn both_roles_flush_heads_and_streamed_data_before_production_finishes() {
+    struct Buffered {
+        staged: Vec<u8>,
+        visible: Rc<RefCell<Vec<u8>>>,
+    }
+    impl AsyncWrite for Buffered {
+        async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
+            self.staged.extend_from_slice(buffer.as_init());
+            BufResult(Ok(buffer.as_init().len()), buffer)
+        }
+        async fn write_vectored<B: IoVectoredBuf>(&mut self, buffers: B) -> BufResult<usize, B> {
+            let mut count = 0;
+            for bytes in buffers.iter_slice() {
+                self.staged.extend_from_slice(bytes);
+                count += bytes.len();
+            }
+            BufResult(Ok(count), buffers)
+        }
+        async fn flush(&mut self) -> io::Result<()> {
+            self.visible.borrow_mut().extend(std::mem::take(&mut self.staged));
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> io::Result<()> {
+            self.flush().await
+        }
+    }
+    struct Waiting {
+        produce: Gate,
+        sent: bool,
+    }
+    impl vakya::Body for Waiting {
+        type Data = Bytes;
+        type Error = Infallible;
+        async fn next_frame(&mut self) -> Result<Option<vakya::Frame<Bytes>>, Infallible> {
+            if self.sent {
+                return std::future::pending().await;
+            }
+            self.produce.wait().await;
+            self.sent = true;
+            Ok(Some(vakya::Frame::data(Bytes::from_static(b"payload"))))
+        }
+        fn size_hint(&self) -> vakya::SizeHint {
+            vakya::SizeHint::with_exact(if self.sent { 0 } else { 7 })
+        }
+        fn trailer_hint(&self) -> vakya::TrailerHint {
+            vakya::TrailerHint::None
+        }
+    }
+    async fn observe<F>(
+        run: F,
+        control: vakya::connection::ConnectionControl,
+        visible: Rc<RefCell<Vec<u8>>>,
+        produce: Gate,
+    ) where
+        F: Future<Output = Result<ConnectionOutcome<Reader, Buffered>, vakya::Error>>,
+    {
+        let mut run = pin!(run);
+        assert!(poll(run.as_mut()).is_pending());
+        let head = visible.borrow().clone();
+        assert!(head.ends_with(b"\r\n\r\n"));
+        assert!(
+            String::from_utf8(head.clone())
+                .unwrap()
+                .contains("content-length: 7\r\n")
+        );
+        produce.open();
+        assert!(poll(run.as_mut()).is_pending());
+        assert_eq!(&visible.borrow()[head.len()..], b"payload");
+        control.abort();
+        assert_eq!(run.await.unwrap_err().kind(), ErrorKind::Canceled);
+    }
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let visible = Rc::new(RefCell::new(Vec::new()));
+        let produce = Gate::default();
+        let (sender, connection) = Client::new().handshake((
+            reader(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"),
+            Buffered {
+                staged: Vec::new(),
+                visible: visible.clone(),
+            },
+        ));
+        let pending = sender
+            .start_request(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "example")
+                    .body(Waiting {
+                        produce: produce.clone(),
+                        sent: false,
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let control = connection.control();
+        observe(connection.run(), control, visible, produce).await;
+        drop(pending);
+
+        let visible = Rc::new(RefCell::new(Vec::new()));
+        let produce = Gate::default();
+        let service = service_fn(async |_: (Request<Incoming>, RequestContext)| {
+            Ok::<_, Infallible>(Response::new(Waiting {
+                produce: produce.clone(),
+                sent: false,
+            }))
+        });
+        let connection = Server::new().serve_connection(
+            (
+                reader(b"GET / HTTP/1.1\r\nhost: example\r\n\r\n"),
+                Buffered {
+                    staged: Vec::new(),
+                    visible: visible.clone(),
+                },
+            ),
+            service,
+        );
+        let control = connection.control();
+        observe(connection.run(), control, visible, produce.clone()).await;
+    });
+}

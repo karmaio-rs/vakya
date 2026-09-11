@@ -194,6 +194,7 @@ impl Builder {
     /// Rejects negotiated ALPN other than absent or `http/1.1`, before HTTP I/O.
     /// Rejection drops the supplied stream without an HTTP exchange.
     #[cfg(feature = "tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
     #[allow(clippy::type_complexity)] // Preserve concrete TLS halves and the unboxed driver.
     pub fn serve_tls<I, S, B>(
         &self,

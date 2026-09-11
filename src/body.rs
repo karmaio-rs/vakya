@@ -4,7 +4,7 @@ mod boxed;
 mod collect;
 mod combinator;
 mod frame;
-#[allow(dead_code)] // Connection constructors are introduced in subsequent phases.
+#[allow(dead_code)] // Bodies are available without a connection role.
 pub(crate) mod incoming;
 mod simple;
 mod size_hint;
@@ -228,6 +228,6 @@ pub enum TrailerHint {
     MayHave,
 }
 
-// The incoming-body bridge is integrated in this phase.
+// Connection endpoints remain private; body-only builds do not drive them.
 #[allow(dead_code)]
 pub(crate) mod pipe;
