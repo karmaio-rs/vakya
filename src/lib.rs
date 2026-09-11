@@ -43,3 +43,6 @@ pub mod client;
 pub mod connection;
 #[cfg(feature = "http1")]
 pub mod upgrade;
+
+#[cfg(feature = "tls")]
+pub mod tls;

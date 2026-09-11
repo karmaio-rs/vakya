@@ -16,6 +16,8 @@ use std::future::Future;
 #[derive(Clone, Debug)]
 pub struct Builder {
     pub(crate) protocol: Config,
+    #[cfg(feature = "tls")]
+    pub(crate) tls_info: Option<crate::tls::TlsInfo>,
     pub(crate) head_timeout: Option<std::time::Duration>,
     pub(crate) body_progress_timeout: Option<std::time::Duration>,
     pub(crate) write_progress_timeout: Option<std::time::Duration>,
@@ -28,6 +30,8 @@ impl Default for Builder {
     fn default() -> Self {
         Self {
             protocol: Config::default(),
+            #[cfg(feature = "tls")]
+            tls_info: None,
             head_timeout: None,
             body_progress_timeout: None,
             write_progress_timeout: None,
@@ -168,6 +172,53 @@ impl Builder {
                 control,
             },
         )
+    }
+
+    /// Create an HTTP/1 driver over an already-handshaken Karmaio TLS stream.
+    /// This performs no TLS handshake. Decrypted input uses portable reads and
+    /// responses carry [`crate::tls::TlsInfo`] in their extensions. Handoff
+    /// returns the concrete encrypted TLS halves. The underlying transport's
+    /// `'static` bound comes from Karmaio splitting; outgoing bodies may borrow.
+    ///
+    /// # Errors
+    /// Rejects negotiated ALPN other than absent or `http/1.1`, before HTTP I/O.
+    /// Rejection drops the supplied stream without an HTTP exchange.
+    #[cfg(feature = "tls")]
+    #[allow(clippy::type_complexity)] // Preserve concrete TLS halves and the unboxed driver.
+    pub fn handshake_tls<I, B>(
+        &self,
+        io: karmaio::tls::ClientTlsStream<I>,
+    ) -> Result<
+        (
+            SendRequest<B>,
+            Connection<
+                impl Future<
+                    Output = Result<
+                        ConnectionOutcome<karmaio::tls::ClientTlsReadHalf<I>, karmaio::tls::ClientTlsWriteHalf<I>>,
+                        Error,
+                    >,
+                > + use<I, B>,
+            >,
+        ),
+        Error,
+    >
+    where
+        I: IntoOwnedSplit + 'static,
+        B: Body,
+        B::Error: std::error::Error + 'static,
+    {
+        crate::tls::validate_alpn(io.alpn_protocol())?;
+
+        let mut config = self.clone();
+        config.tls_info = Some(crate::tls::TlsInfo::new(
+            io.alpn_protocol(),
+            io.protocol_version(),
+            io.negotiated_cipher_suite(),
+            io.handshake_kind(),
+            None,
+        ));
+
+        Ok(config.handshake(io))
     }
 
     /// Create a sender and driver using the explicit TCP receive strategy.

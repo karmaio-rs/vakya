@@ -18,6 +18,8 @@ use std::future::Future;
 #[derive(Clone, Debug)]
 pub struct Builder {
     pub(crate) protocol: Config,
+    #[cfg(feature = "tls")]
+    pub(crate) tls_info: Option<crate::tls::TlsInfo>,
     pub(crate) head_timeout: Option<std::time::Duration>,
     pub(crate) body_progress_timeout: Option<std::time::Duration>,
     pub(crate) write_progress_timeout: Option<std::time::Duration>,
@@ -30,6 +32,8 @@ impl Default for Builder {
     fn default() -> Self {
         Self {
             protocol: Config::default(),
+            #[cfg(feature = "tls")]
+            tls_info: None,
             head_timeout: Some(std::time::Duration::from_secs(30)),
             body_progress_timeout: None,
             write_progress_timeout: None,
@@ -178,6 +182,53 @@ impl Builder {
             future: server::run(io, service, Portable, self.clone(), control.clone()),
             control,
         }
+    }
+
+    /// Create an HTTP/1 driver over an already-handshaken Karmaio TLS stream.
+    /// This performs no TLS handshake. Decrypted input uses portable reads and
+    /// requests carry [`crate::tls::TlsInfo`] in their extensions. Handoff
+    /// returns the concrete encrypted TLS halves. The underlying transport's
+    /// `'static` bound comes from Karmaio splitting; services and bodies may borrow.
+    ///
+    /// # Errors
+    /// Rejects negotiated ALPN other than absent or `http/1.1`, before HTTP I/O.
+    /// Rejection drops the supplied stream without an HTTP exchange.
+    #[cfg(feature = "tls")]
+    #[allow(clippy::type_complexity)] // Preserve concrete TLS halves and the unboxed driver.
+    pub fn serve_tls<I, S, B>(
+        &self,
+        io: karmaio::tls::ServerTlsStream<I>,
+        service: S,
+    ) -> Result<
+        Connection<
+            impl Future<
+                Output = Result<
+                    ConnectionOutcome<karmaio::tls::ServerTlsReadHalf<I>, karmaio::tls::ServerTlsWriteHalf<I>>,
+                    Error,
+                >,
+            > + use<I, S, B>,
+        >,
+        Error,
+    >
+    where
+        I: IntoOwnedSplit + 'static,
+        S: Service<(Request<Incoming>, RequestContext), Response = Response<B>>,
+        S::Error: std::error::Error + 'static,
+        B: Body,
+        B::Error: std::error::Error + 'static,
+    {
+        crate::tls::validate_alpn(io.alpn_protocol())?;
+
+        let mut config = self.clone();
+        config.tls_info = Some(crate::tls::TlsInfo::new(
+            io.alpn_protocol(),
+            io.protocol_version(),
+            io.negotiated_cipher_suite(),
+            io.handshake_kind(),
+            io.server_name(),
+        ));
+
+        Ok(config.serve_connection(io, service))
     }
 
     /// Create a connection from established TCP using the explicit TCP receive strategy.

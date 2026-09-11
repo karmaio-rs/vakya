@@ -54,3 +54,14 @@ required-features = ["server"]
 [[example]]
 name = "upgrade"
 required-features = ["server"]
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+
+[[example]]
+name = "https_client"
+required-features = ["client", "tls"]
+
+[[example]]
+name = "https_server"
+required-features = ["server", "tls"]

@@ -374,6 +374,10 @@ async fn receive<R, T: Receive<R>>(
                         }
 
                         let mut message = Response::new(());
+                        #[cfg(feature = "tls")]
+                        if let Some(info) = &config.tls_info {
+                            message.extensions_mut().insert(info.clone());
+                        }
                         *message.status_mut() = head.head.status;
                         *message.version_mut() = head.head.version;
                         *message.headers_mut() = head.head.headers;
@@ -417,6 +421,10 @@ async fn receive<R, T: Receive<R>>(
     let (producer, incoming) = incoming(head.body);
 
     let mut message = Response::new(incoming);
+    #[cfg(feature = "tls")]
+    if let Some(info) = &config.tls_info {
+        message.extensions_mut().insert(info.clone());
+    }
     *message.status_mut() = head.head.status;
     *message.version_mut() = head.head.version;
     *message.headers_mut() = head.head.headers;

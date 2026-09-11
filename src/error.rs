@@ -123,6 +123,16 @@ impl Error {
     }
 
     pub(crate) fn from_io(source: io::Error) -> Self {
+        // Karmaio retains Rustls protocol failures inside the originating I/O
+        // error. Preserve that source while keeping socket failures distinct.
+        #[cfg(feature = "tls")]
+        if source
+            .get_ref()
+            .is_some_and(|error| error.is::<karmaio::tls::rustls::Error>())
+        {
+            return Self::with_source(ErrorKind::Tls, "TLS protocol operation failed", source);
+        }
+
         let kind = if karmaio::runtime::is_operation_canceled(&source) {
             ErrorKind::Canceled
         } else if source.kind() == io::ErrorKind::TimedOut {
@@ -130,6 +140,7 @@ impl Error {
         } else {
             ErrorKind::Io
         };
+
         Self::with_source(kind, "HTTP I/O operation failed", source)
     }
 

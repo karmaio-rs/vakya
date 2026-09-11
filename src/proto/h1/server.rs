@@ -206,6 +206,10 @@ where
     let close = informationals.close_flag();
     let (producer, body) = incoming(head.body);
     let mut request = Request::new(body);
+    #[cfg(feature = "tls")]
+    if let Some(info) = &config.tls_info {
+        request.extensions_mut().insert(info.clone());
+    }
     *request.method_mut() = head.head.method;
     *request.uri_mut() = head.head.target;
     *request.version_mut() = version;
