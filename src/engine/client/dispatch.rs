@@ -1,7 +1,4 @@
-use super::{
-    PendingResponse, ResponseEvent,
-    response::{self, Control},
-};
+use super::response::{self, Control, PendingResponse, ResponseEvent};
 use crate::{Error, ErrorKind, Incoming, Request, Response, body::pipe::Producer};
 use std::{
     cell::RefCell,

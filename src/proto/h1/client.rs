@@ -9,13 +9,14 @@ use super::{
 use crate::{
     Body, Error, ErrorKind, Response,
     body::pipe::Producer,
-    client::{
-        ResponseEvent,
-        conn::http1::Builder,
-        dispatch::{Job, Receiver},
-        response::Control,
-    },
     connection::ConnectionOutcome,
+    engine::{
+        client::{
+            dispatch::{Job, Receiver},
+            response::{Control, ResponseEvent},
+        },
+        config::ClientConfig,
+    },
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -34,7 +35,7 @@ pub(crate) async fn run<I, B, T>(
     io: I,
     requests: Receiver<B>,
     strategy: T,
-    config: Builder,
+    config: ClientConfig,
     connection: crate::connection::ConnectionControl,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
@@ -57,7 +58,7 @@ async fn run_inner<I, B, T>(
     io: I,
     mut requests: Receiver<B>,
     mut strategy: T,
-    config: Builder,
+    config: ClientConfig,
     connection: &crate::connection::ConnectionControl,
     shutdown: &karmaio::runtime::CancellationSource,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
@@ -128,7 +129,7 @@ async fn exchange<R, W, B, T>(
     parser: &mut HeadParser<ResponseRole>,
     buffer: RecvBuffer,
     job: Job<B>,
-    config: &Builder,
+    config: &ClientConfig,
     shutdown: &karmaio::runtime::CancellationSource,
 ) -> Result<(RecvBuffer, Outcome), Error>
 where
@@ -193,7 +194,7 @@ async fn exchange_inner<R, W, B, T>(
     request: http::Request<B>,
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
-    config: &Builder,
+    config: &ClientConfig,
 ) -> Result<(RecvBuffer, Outcome), Error>
 where
     W: AsyncWrite,
@@ -349,7 +350,7 @@ async fn receive<R, T: Receive<R>>(
     mut state: Exchange,
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
-    config: &Builder,
+    config: &ClientConfig,
 ) -> Result<(ReceiveEnd, RecvBuffer, Exchange), Error> {
     let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
     let head = loop {

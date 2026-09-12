@@ -9,16 +9,15 @@ use super::{
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
     connection::ConnectionOutcome,
+    engine::{
+        config::ServerConfig,
+        server::{self as context, Command, InformationalReceiver, RequestContext},
+    },
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
         send::write_all,
         transport::Receive,
-    },
-    server::{
-        RequestContext,
-        conn::http1::Builder,
-        context::{self, Command, InformationalReceiver},
     },
     upgrade::Upgraded,
 };
@@ -42,7 +41,7 @@ pub(crate) async fn run<I, S, B, T>(
     io: I,
     service: S,
     strategy: T,
-    config: Builder,
+    config: ServerConfig,
     connection: crate::connection::ConnectionControl,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
@@ -67,7 +66,7 @@ async fn run_inner<I, S, B, T>(
     io: I,
     service: S,
     mut strategy: T,
-    config: Builder,
+    config: ServerConfig,
     connection: &crate::connection::ConnectionControl,
     shutdown: &karmaio::runtime::CancellationSource,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
@@ -187,7 +186,7 @@ async fn exchange<R, W, S, B, T>(
     buffer: RecvBuffer,
     head: ValidatedRequestHead,
     service: &S,
-    config: &Builder,
+    config: &ServerConfig,
     date: &mut DateCache,
     source: &CancellationSource,
 ) -> (Result<Outcome, Error>, RecvBuffer)
@@ -361,7 +360,7 @@ async fn call_service<W, S, B>(
     context: RequestContext,
     informationals: &InformationalReceiver,
     version: Version,
-    config: &Builder,
+    config: &ServerConfig,
     source: &CancellationSource,
 ) -> Result<Response<B>, Error>
 where
@@ -401,7 +400,7 @@ async fn write_informationals<W: AsyncWrite>(
     writer: &mut W,
     receiver: &InformationalReceiver,
     version: Version,
-    config: &Builder,
+    config: &ServerConfig,
     source: &CancellationSource,
 ) -> Result<(), Error> {
     use karmaio::runtime::FutureExt;
@@ -486,7 +485,7 @@ async fn write_response<W: AsyncWrite, B: Body>(
     request_version: Version,
     close: &Cell<bool>,
     date: &mut DateCache,
-    config: &Builder,
+    config: &ServerConfig,
     source: &CancellationSource,
     state: &mut Exchange,
 ) -> Result<Persistence, Error>

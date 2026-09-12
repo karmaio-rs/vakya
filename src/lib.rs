@@ -34,6 +34,9 @@ pub mod service;
 
 mod future;
 
+#[cfg(any(feature = "client", feature = "server"))]
+mod engine;
+
 #[cfg(feature = "http1")]
 mod trace;
 

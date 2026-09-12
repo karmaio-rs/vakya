@@ -2,9 +2,10 @@ use super::Connection;
 use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
     Body, Error, ErrorKind,
-    client::{SendRequest, dispatch},
+    client::SendRequest,
+    engine::client::dispatch,
     io::transport::{Portable, Tcp},
-    proto::h1::{client, config::Config},
+    proto::h1::client,
 };
 use karmaio::{io::IntoOwnedSplit, net::tcp::TcpStream};
 use std::future::Future;
@@ -13,33 +14,9 @@ use std::future::Future;
 ///
 /// Defaults bound heads to 64 KiB/100 fields, retained input to 128 KiB with
 /// 16 KiB reads, chunk lines to 8 KiB, and trailers to 16 KiB/32 fields.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Builder {
-    pub(crate) protocol: Config,
-    #[cfg(feature = "tls")]
-    pub(crate) tls_info: Option<crate::tls::TlsInfo>,
-    pub(crate) head_timeout: Option<std::time::Duration>,
-    pub(crate) body_progress_timeout: Option<std::time::Duration>,
-    pub(crate) write_progress_timeout: Option<std::time::Duration>,
-    pub(crate) preferred_read: usize,
-    pub(crate) max_retained: usize,
-    pub(crate) continue_wait: Option<std::time::Duration>,
-}
-
-impl Default for Builder {
-    fn default() -> Self {
-        Self {
-            protocol: Config::default(),
-            #[cfg(feature = "tls")]
-            tls_info: None,
-            head_timeout: None,
-            body_progress_timeout: None,
-            write_progress_timeout: None,
-            preferred_read: 16 * 1024,
-            max_retained: 128 * 1024,
-            continue_wait: None,
-        }
-    }
+    config: crate::engine::config::ClientConfig,
 }
 
 impl Builder {
@@ -53,14 +30,14 @@ impl Builder {
     /// # Errors
     /// Returns an error for zero limits. Encoded request heads share the byte limit.
     pub fn head_limits(&mut self, bytes: usize, fields: usize) -> Result<&mut Self, Error> {
-        self.protocol.head_limits(bytes, fields)?;
+        self.config.protocol.head_limits(bytes, fields)?;
         Ok(self)
     }
 
     /// Set the maximum informational heads per exchange, including automatic
     /// 100 Continue. Defaults to 16; zero disables informational responses.
     pub fn max_informational(&mut self, count: usize) -> &mut Self {
-        self.protocol.max_informational = count;
+        self.config.protocol.max_informational = count;
         self
     }
 
@@ -73,7 +50,7 @@ impl Builder {
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn head_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
         crate::io::deadline::configured_after(timeout)?;
-        self.head_timeout = timeout;
+        self.config.head_timeout = timeout;
         Ok(self)
     }
 
@@ -85,7 +62,7 @@ impl Builder {
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn body_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
         crate::io::deadline::configured_after(timeout)?;
-        self.body_progress_timeout = timeout;
+        self.config.body_progress_timeout = timeout;
         Ok(self)
     }
 
@@ -98,7 +75,7 @@ impl Builder {
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn write_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
         crate::io::deadline::configured_after(timeout)?;
-        self.write_progress_timeout = timeout;
+        self.config.write_progress_timeout = timeout;
         Ok(self)
     }
 
@@ -112,7 +89,9 @@ impl Builder {
         trailer_bytes: usize,
         trailer_fields: usize,
     ) -> Result<&mut Self, Error> {
-        self.protocol.body_limits(chunk_line, trailer_bytes, trailer_fields)?;
+        self.config
+            .protocol
+            .body_limits(chunk_line, trailer_bytes, trailer_fields)?;
         Ok(self)
     }
 
@@ -129,8 +108,8 @@ impl Builder {
                 "receive limits must be nonzero and ordered",
             ));
         }
-        self.preferred_read = preferred;
-        self.max_retained = retained;
+        self.config.preferred_read = preferred;
+        self.config.max_retained = retained;
         Ok(self)
     }
 
@@ -143,7 +122,7 @@ impl Builder {
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn continue_wait(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
         crate::io::deadline::configured_after(timeout)?;
-        self.continue_wait = timeout;
+        self.config.continue_wait = timeout;
         Ok(self)
     }
 
@@ -168,7 +147,7 @@ impl Builder {
         (
             sender,
             Connection {
-                future: client::run(io, receiver, Portable, self.clone(), control.clone()),
+                future: client::run(io, receiver, Portable, self.config.clone(), control.clone()),
                 control,
             },
         )
@@ -210,8 +189,8 @@ impl Builder {
     {
         crate::tls::validate_alpn(io.alpn_protocol())?;
 
-        let mut config = self.clone();
-        config.tls_info = Some(crate::tls::TlsInfo::new(
+        let mut builder = self.clone();
+        builder.config.tls_info = Some(crate::tls::TlsInfo::new(
             io.alpn_protocol(),
             io.protocol_version(),
             io.negotiated_cipher_suite(),
@@ -219,7 +198,7 @@ impl Builder {
             None,
         ));
 
-        Ok(config.handshake(io))
+        Ok(builder.handshake(io))
     }
 
     /// Create a sender and driver using the explicit TCP receive strategy.
@@ -253,7 +232,7 @@ impl Builder {
         (
             sender,
             Connection {
-                future: client::run(io, receiver, Tcp, self.clone(), control.clone()),
+                future: client::run(io, receiver, Tcp, self.config.clone(), control.clone()),
                 control,
             },
         )
@@ -270,15 +249,15 @@ mod timeout_tests {
         let mut builder = Builder::new();
         macro_rules! check {
             ($method:ident) => {{
-                let previous = builder.$method;
+                let previous = builder.config.$method;
                 assert_eq!(
                     builder.$method(Some(Duration::MAX)).unwrap_err().kind(),
                     ErrorKind::LocalMessage
                 );
-                assert_eq!(builder.$method, previous);
+                assert_eq!(builder.config.$method, previous);
                 for timeout in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
                     builder.$method(timeout).unwrap();
-                    assert_eq!(builder.$method, timeout);
+                    assert_eq!(builder.config.$method, timeout);
                 }
             }};
         }
