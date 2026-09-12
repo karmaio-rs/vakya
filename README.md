@@ -68,3 +68,5 @@ Applications choose providers, trust anchors, certificates, peer names, and TLS 
 Licensed under either the Apache License, Version 2.0 or the MIT License, at your option.
 
 With `tracing`, Vakya emits connection and exchange spans at trace level, with a connection ID, role, protocol, and exchange number. I/O events report operation and completed byte count; response events report status. Error categories are emitted at debug level. Applications install and configure their own subscriber. Headers, URIs, and payload contents are never recorded. Instrumentation is compiled out when the feature is disabled.
+
+HTTP/1 builders keep `head_limits` and `body_limits` as combined budget setters. Use `incoming_head_limits`, `incoming_body_limits`, `outgoing_head_limit`, and `outgoing_trailer_limit` for asymmetric budgets. Incoming means responses on a client and requests on a server; outgoing means the reverse. Each setter validates before mutation. Later combined setters replace the corresponding budgets in both directions.

@@ -790,3 +790,67 @@ fn configured_drain_wire_allowance_reaches_both_roles() {
         }
     });
 }
+
+#[test]
+fn asymmetric_head_limits_are_enforced_in_both_roles() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        // Permit a large outgoing head with a small incoming budget, then
+        // independently reject each direction without changing the other.
+        for (incoming, outgoing, peer_large, success) in [
+            (128, 1024, false, true),
+            (128, 1024, true, false),
+            (1024, 128, false, false),
+        ] {
+            let padding = "a".repeat(400);
+            let peer_header = if peer_large {
+                format!("x-peer: {padding}\r\n")
+            } else {
+                String::new()
+            };
+            let response = format!("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n{peer_header}\r\n");
+            let mut client = Client::new();
+            client
+                .incoming_head_limits(incoming, 10)
+                .unwrap()
+                .outgoing_head_limit(outgoing)
+                .unwrap();
+            let (sender, connection) =
+                client.handshake::<_, Empty>((Reader::new([ReadStep::Data(Bytes::from(response))]), Writer::new([])));
+            let app = sender.send_request(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "example")
+                    .header("x-local", &padding)
+                    .body(Empty::new())
+                    .unwrap(),
+            );
+            let (driver, response) = pair(connection.run(), app).await;
+            assert_eq!(driver.is_ok(), success);
+            assert_eq!(response.is_ok(), success);
+
+            let request = format!("GET / HTTP/1.1\r\nhost: example\r\nconnection: close\r\n{peer_header}\r\n");
+            let mut server = Server::new();
+            server
+                .incoming_head_limits(incoming, 10)
+                .unwrap()
+                .outgoing_head_limit(outgoing)
+                .unwrap();
+            let service = service_fn(async |_: (Request<Incoming>, RequestContext)| {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header("x-local", &padding)
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+            });
+            let result = server
+                .serve_connection(
+                    (Reader::new([ReadStep::Data(Bytes::from(request))]), Writer::new([])),
+                    service,
+                )
+                .run()
+                .await;
+            assert_eq!(result.is_ok(), success);
+        }
+    });
+}

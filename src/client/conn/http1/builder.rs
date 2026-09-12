@@ -34,6 +34,51 @@ impl Builder {
         Ok(self)
     }
 
+    /// Set incoming head bytes and field count without changing outgoing limits.
+    /// Later calls to `head_limits` set both directions again.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` for zero limits without changing configuration.
+    pub fn incoming_head_limits(&mut self, bytes: usize, fields: usize) -> Result<&mut Self, Error> {
+        self.config.protocol.incoming_head_limits(bytes, fields)?;
+        Ok(self)
+    }
+
+    /// Set encoded head bytes without changing incoming limits.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` for zero without changing configuration.
+    pub fn outgoing_head_limit(&mut self, bytes: usize) -> Result<&mut Self, Error> {
+        self.config.protocol.outgoing_head_limit(bytes)?;
+        Ok(self)
+    }
+
+    /// Set incoming chunk-line, trailer-byte, and trailer-field limits independently.
+    /// Later calls to `body_limits` set the trailer byte limit in both directions again.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` for zero limits without changing configuration.
+    pub fn incoming_body_limits(
+        &mut self,
+        chunk_line: usize,
+        trailer_bytes: usize,
+        trailer_fields: usize,
+    ) -> Result<&mut Self, Error> {
+        self.config
+            .protocol
+            .incoming_body_limits(chunk_line, trailer_bytes, trailer_fields)?;
+        Ok(self)
+    }
+
+    /// Set encoded trailer bytes without changing incoming limits.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` for zero without changing configuration.
+    pub fn outgoing_trailer_limit(&mut self, bytes: usize) -> Result<&mut Self, Error> {
+        self.config.protocol.outgoing_trailer_limit(bytes)?;
+        Ok(self)
+    }
+
     /// Set the maximum informational heads per exchange, including automatic
     /// 100 Continue. Defaults to 16; zero disables informational responses.
     pub fn max_informational(&mut self, count: usize) -> &mut Self {
