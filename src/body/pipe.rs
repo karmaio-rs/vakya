@@ -147,10 +147,10 @@ pub(crate) struct Consumer<T, E> {
 }
 
 impl<T, E> Consumer<T, E> {
-    pub(crate) fn drain_budget(&self, bytes: u64) {
+    pub(crate) fn drain_budget(&self, bytes: u64, wire_allowance: u64) {
         self.shared
             .drain_remaining
-            .set(Some((bytes.saturating_add(64 * 1024), bytes)));
+            .set(Some((bytes.saturating_add(wire_allowance), bytes)));
     }
 
     /// Waits for the next offered item or producer termination.

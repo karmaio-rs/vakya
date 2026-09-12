@@ -430,6 +430,7 @@ async fn receive<R, T: Receive<R>>(
     };
 
     let (producer, incoming) = incoming(head.body);
+    let incoming = incoming.with_drain_config(config.drain);
 
     let mut message = Response::new(incoming);
     #[cfg(feature = "tls")]

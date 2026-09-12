@@ -47,7 +47,7 @@ Bodies use owned buffers and native async methods. Vakya does not require applic
 
 Client admission permits one active exchange or unsubmitted permit, plus one waiting reservation. A rejected submission returns the original request. Once accepted, the request belongs to the driver and an error does not establish retry safety. Early final responses do not cancel uploads. Dropping `PendingResponse` before final delivery abandons the exchange; after delivery, `Incoming` controls receiving. `UploadControl::abort` explicitly stops an unfinished upload and retires the HTTP/1 connection.
 
-Dropping an unfinished incoming body abandons receiving. `Incoming::drain(limit)` opts into bounded discard when reuse is desired: an explicit payload limit, an additional 64 KiB framing allowance, and a five-second total deadline. Reuse still requires the other direction to settle successfully.
+Dropping an unfinished incoming body abandons receiving. `Incoming::drain(limit)` opts into bounded discard when reuse is desired: an explicit payload limit, an additional 64 KiB framing allowance, and a five-second total deadline by default. HTTP/1 builders expose `drain_wire_allowance` and fallible `drain_timeout` setters to tune these finite budgets. Reuse still requires the other direction to settle successfully.
 
 ## Shutdown, deadlines, and handoff
 

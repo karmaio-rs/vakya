@@ -217,6 +217,7 @@ where
     let (context, informationals) = context::channel(head.persistence == Persistence::Close);
     let close = informationals.close_flag();
     let (producer, body) = incoming(head.body);
+    let body = body.with_drain_config(config.drain);
     let mut request = Request::new(body);
     #[cfg(feature = "tls")]
     if let Some(info) = &config.tls_info {

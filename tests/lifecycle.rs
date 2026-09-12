@@ -430,7 +430,9 @@ fn drain_deadline_abandons_and_settles_a_stalled_tcp_body() {
         let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         peer.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n").unwrap();
-        let (sender, connection) = Client::new().handshake_tcp::<Empty>(stream);
+        let mut builder = Client::new();
+        builder.drain_timeout(std::time::Duration::from_millis(10)).unwrap();
+        let (sender, connection) = builder.handshake_tcp::<Empty>(stream);
         let pending = sender
             .start_request(
                 Request::builder()
@@ -712,5 +714,79 @@ fn both_roles_flush_heads_and_streamed_data_before_production_finishes() {
         );
         let control = connection.control();
         observe(connection.run(), control, visible, produce.clone()).await;
+    });
+}
+
+#[test]
+fn configured_drain_wire_allowance_reaches_both_roles() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        for allowance in [0, 64] {
+            let wire = b"1\r\nx\r\n0\r\n\r\n";
+            let input = [
+                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".as_slice(),
+                wire,
+            ]
+            .concat();
+            let mut client = Client::new();
+            client.drain_wire_allowance(allowance);
+            let (sender, connection) =
+                client.handshake::<_, Empty>((Reader::new([ReadStep::Data(Bytes::from(input))]), Writer::new([])));
+            let pending = sender
+                .start_request(
+                    Request::builder()
+                        .uri("/")
+                        .header("host", "example")
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let app = async {
+                let result = pending.response().await.unwrap().into_body().drain(1).await;
+                if allowance == 0 {
+                    assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
+                } else {
+                    result.unwrap();
+                }
+            };
+            let (result, ()) = pair(connection.run(), app).await;
+            if allowance != 0 {
+                result.unwrap();
+            }
+
+            let observed = Cell::new(false);
+            let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
+                observed.set(true);
+                let result = request.into_body().drain(1).await;
+                if allowance == 0 {
+                    assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
+                } else {
+                    result.unwrap();
+                }
+                observed.set(true);
+                Ok::<_, Infallible>(Response::new(Empty::new()))
+            });
+            let input = [
+                b"POST / HTTP/1.1\r\nhost: example\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    .as_slice(),
+                wire,
+            ]
+            .concat();
+            let mut server = Server::new();
+            server.drain_wire_allowance(allowance);
+            let result = server
+                .serve_connection(
+                    (Reader::new([ReadStep::Data(Bytes::from(input))]), Writer::new([])),
+                    service,
+                )
+                .run()
+                .await;
+            if allowance != 0 {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
+            }
+            assert!(observed.get());
+        }
     });
 }

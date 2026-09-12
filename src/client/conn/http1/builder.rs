@@ -54,6 +54,26 @@ impl Builder {
         Ok(self)
     }
 
+    /// Set the total budget for discarding an incoming body with `Incoming::drain`.
+    /// Defaults to five seconds. Progress does not reset this finite budget.
+    /// Zero permits only immediately ready completion.
+    ///
+    /// # Errors
+    /// Returns `LocalMessage` for an unrepresentable deadline without changing configuration.
+    pub fn drain_timeout(&mut self, timeout: std::time::Duration) -> Result<&mut Self, Error> {
+        crate::io::deadline::configured_after(Some(timeout))?;
+        self.config.drain.timeout = timeout;
+        Ok(self)
+    }
+
+    /// Set extra wire bytes allowed above the payload limit passed to `Incoming::drain`.
+    /// Defaults to 64 KiB. Zero is allowed; the combined wire budget saturates at `u64::MAX`.
+    /// This bounds framing overhead without changing ordinary body decoding limits.
+    pub fn drain_wire_allowance(&mut self, bytes: u64) -> &mut Self {
+        self.config.drain.wire_allowance = bytes;
+        self
+    }
+
     /// Set the maximum wait for each demanded body read to make peer progress.
     /// Disabled by default. Application pauses without demand are excluded.
     ///
@@ -261,6 +281,14 @@ mod timeout_tests {
                 }
             }};
         }
+        let previous = builder.config.drain.timeout;
+        assert_eq!(
+            builder.drain_timeout(Duration::MAX).unwrap_err().kind(),
+            ErrorKind::LocalMessage
+        );
+        assert_eq!(builder.config.drain.timeout, previous);
+        builder.drain_timeout(Duration::ZERO).unwrap();
+        assert_eq!(builder.config.drain.timeout, Duration::ZERO);
         check!(head_timeout);
         check!(body_progress_timeout);
         check!(write_progress_timeout);

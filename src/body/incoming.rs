@@ -13,6 +13,20 @@ use std::{fmt, marker::PhantomData, ops::RangeBounds, rc::Rc};
 
 pub(crate) type IncomingProducer = pipe::Producer<Frame<IncomingData>, Error>;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrainConfig {
+    pub(crate) timeout: std::time::Duration,
+    pub(crate) wire_allowance: u64,
+}
+impl Default for DrainConfig {
+    fn default() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(5),
+            wire_allowance: 64 * 1024,
+        }
+    }
+}
+
 /// A streaming body received from an HTTP connection.
 ///
 /// Vakya constructs this after validating a message head. The body owns a local
@@ -26,12 +40,14 @@ pub struct Incoming {
     size: SizeHint,
     trailers: TrailerHint,
     trailers_seen: bool,
+    drain: DrainConfig,
 }
 
 impl Incoming {
     /// Consume and discard the remaining body within an explicit payload limit.
-    /// Framing is additionally bounded to the payload limit plus 64 KiB, and a
-    /// five-second total deadline covers demand, transport, and framing work.
+    /// By default, wire bytes are bounded to the payload limit plus 64 KiB and
+    /// a five-second total deadline covers demand, transport, and framing work.
+    /// The originating HTTP/1 builder can configure these additional budgets.
     /// Successful draining permits connection reuse when the other direction
     /// also settles. Trailers are discarded. Keep driving the connection.
     ///
@@ -41,8 +57,11 @@ impl Incoming {
     /// pending reads. This operation itself does not wait for driver completion.
     pub async fn drain(mut self, max_payload_bytes: u64) -> Result<(), Error> {
         if let Some(consumer) = &self.consumer {
-            consumer.drain_budget(max_payload_bytes);
+            consumer.drain_budget(max_payload_bytes, self.drain.wire_allowance);
         }
+        let deadline = std::time::Instant::now()
+            .checked_add(self.drain.timeout)
+            .ok_or_else(|| Error::new(ErrorKind::LocalMessage, "invalid drain timeout duration"))?;
         let drain = async {
             let mut remaining = max_payload_bytes;
             let mut budget = crate::future::WorkBudget::new();
@@ -56,7 +75,7 @@ impl Incoming {
             }
             Ok(())
         };
-        karmaio::time::timeout(std::time::Duration::from_secs(5), drain)
+        karmaio::time::timeout_at(deadline, drain)
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "body drain deadline exceeded"))?
     }
@@ -68,6 +87,7 @@ impl Incoming {
             size: SizeHint::with_exact(0),
             trailers: TrailerHint::None,
             trailers_seen: false,
+            drain: DrainConfig::default(),
         }
     }
 
@@ -81,8 +101,15 @@ impl Incoming {
                 size,
                 trailers,
                 trailers_seen: false,
+                drain: DrainConfig::default(),
             },
         )
+    }
+
+    #[cfg(any(feature = "client", feature = "server"))]
+    pub(crate) fn with_drain_config(mut self, config: DrainConfig) -> Self {
+        self.drain = config;
+        self
     }
 
     fn finish(&mut self) {

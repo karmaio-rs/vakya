@@ -5,6 +5,7 @@ use crate::proto::h1::config::Config;
 #[derive(Clone, Debug)]
 pub(crate) struct ClientConfig {
     pub(crate) protocol: Config,
+    pub(crate) drain: crate::body::incoming::DrainConfig,
     #[cfg(feature = "tls")]
     pub(crate) tls_info: Option<crate::tls::TlsInfo>,
     pub(crate) head_timeout: Option<std::time::Duration>,
@@ -20,6 +21,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             protocol: Config::default(),
+            drain: crate::body::incoming::DrainConfig::default(),
             #[cfg(feature = "tls")]
             tls_info: None,
             head_timeout: None,
@@ -36,6 +38,7 @@ impl Default for ClientConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct ServerConfig {
     pub(crate) protocol: Config,
+    pub(crate) drain: crate::body::incoming::DrainConfig,
     #[cfg(feature = "tls")]
     pub(crate) tls_info: Option<crate::tls::TlsInfo>,
     pub(crate) head_timeout: Option<std::time::Duration>,
@@ -51,6 +54,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             protocol: Config::default(),
+            drain: crate::body::incoming::DrainConfig::default(),
             #[cfg(feature = "tls")]
             tls_info: None,
             head_timeout: Some(std::time::Duration::from_secs(30)),
