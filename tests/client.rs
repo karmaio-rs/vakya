@@ -101,6 +101,38 @@ fn request<B>(body: B) -> Request<B> {
 }
 
 #[test]
+fn unsolicited_read_ahead_never_becomes_a_later_response() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        for framing in [
+            "Content-Length: 0\r\n\r\n",
+            "Content-Length: 1\r\n\r\nx",
+            "Transfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        ] {
+            let wire = Bytes::from(format!(
+                "HTTP/1.1 200 OK\r\n{framing}HTTP/1.1 201 Created\r\nContent-Length: 6\r\n\r\nPOISON"
+            ));
+            let (writer, output) = ObservedWriter::new();
+            let (sender, driver) = Builder::new().handshake((Reader::new([ReadStep::Data(wire)]), writer));
+            let app = async {
+                let response = sender.send_request(request(Empty::new())).await.unwrap();
+                assert_eq!(response.status(), 200);
+                response.into_body().collect(1).await.unwrap();
+                assert!(sender.send_request(request(Empty::new())).await.is_err());
+            };
+            let (result, ()) = pair(driver.run(), app).await;
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidMessage);
+            assert_eq!(
+                String::from_utf8(output.borrow().clone())
+                    .unwrap()
+                    .matches("POST /upload")
+                    .count(),
+                1
+            );
+        }
+    });
+}
+
+#[test]
 fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let (sender, driver) = Builder::new().handshake::<_, Full<Bytes>>((reader(b""), Writer::limited(8)));
@@ -195,18 +227,37 @@ impl Body for Delayed<'_> {
 #[test]
 fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        for status in [200,400] {
+        for status in [200, 400] {
             let gate = Gate::default();
             let produced = Cell::new(false);
             let recycled = Cell::new(0);
-            let wire = Bytes::from(format!("HTTP/1.1 {status} Response\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+            let wire = Bytes::from(format!("HTTP/1.1 {status} Response\r\nContent-Length: 2\r\n\r\nok"));
+            let next_response = Gate::default();
             let (writer, bytes) = ObservedWriter::new();
-            let (sender, driver) = Builder::new().handshake((Reader::new([ReadStep::Data(wire)]), writer));
-            let pending = sender.start_request(request(Delayed {gate: gate.clone(), produced: &produced, recycled: &recycled})).await.unwrap();
+            let (sender, driver) = Builder::new().handshake((
+                Reader::new([
+                    ReadStep::Data(wire),
+                    ReadStep::Wait(next_response.clone()),
+                    ReadStep::Data(Bytes::from_static(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )),
+                ]),
+                writer,
+            ));
+            let pending = sender
+                .start_request(request(Delayed {
+                    gate: gate.clone(),
+                    produced: &produced,
+                    recycled: &recycled,
+                }))
+                .await
+                .unwrap();
             let mut driver = pin!(driver.run());
             let mut response = pin!(pending.response());
             assert!(poll(driver.as_mut()).is_pending());
-            let Poll::Ready(Ok(response)) = poll(response.as_mut()) else { panic!("early head missing") };
+            let Poll::Ready(Ok(response)) = poll(response.as_mut()) else {
+                panic!("early head missing")
+            };
             assert_eq!(response.status().as_u16(), status);
             assert!(!produced.get());
             let mut reserve = pin!(sender.reserve());
@@ -217,7 +268,10 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
             let mut collected = None;
             for _ in 0..10 {
                 assert!(poll(driver.as_mut()).is_pending());
-                if let Poll::Ready(result) = poll(collect.as_mut()) { collected = Some(result.unwrap()); break; }
+                if let Poll::Ready(result) = poll(collect.as_mut()) {
+                    collected = Some(result.unwrap());
+                    break;
+                }
             }
             assert_eq!(collected.expect("body completed").bytes().as_ref(), b"ok");
             assert!(poll(driver.as_mut()).is_pending());
@@ -227,9 +281,18 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
             assert!(produced.get());
             assert_eq!(recycled.get(), 1);
             let permit = reserve.await.unwrap();
-            let pending = permit.send(request(Delayed { gate, produced: &produced, recycled: &recycled })).unwrap();
+            let pending = permit
+                .send(request(Delayed {
+                    gate,
+                    produced: &produced,
+                    recycled: &recycled,
+                }))
+                .unwrap();
+            assert!(poll(driver.as_mut()).is_pending());
+            next_response.open();
             let (result, response) = pair(driver, pending.response()).await;
-            result.unwrap(); response.unwrap();
+            result.unwrap();
+            response.unwrap();
             assert!(output(&bytes).contains("\r\n\r\nupload"));
         }
     });

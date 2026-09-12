@@ -112,7 +112,16 @@ where
                 )));
             }
             Outcome::Close => break,
-            Outcome::Reusable => {}
+            Outcome::Reusable => {
+                // No other request has been sent: read-ahead cannot belong to
+                // a later response. Only handoff may transfer this prefix.
+                if !buffer.bytes().is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidMessage,
+                        "unsolicited data after completed HTTP response",
+                    ));
+                }
+            }
             Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled client exchange")),
         }
 
