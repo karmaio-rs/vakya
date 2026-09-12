@@ -96,6 +96,7 @@ pub(super) struct EncodedHead {
     pub(super) persistence: super::Persistence,
 }
 
+#[cfg(test)]
 pub(super) fn encode_request_head(
     method: Method,
     target: Uri,

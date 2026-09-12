@@ -1,9 +1,9 @@
 use super::{
-    Expectation, Persistence, UpgradeKind,
+    Persistence, UpgradeKind,
     head::{ResponseHead, ValidatedRequestHead, ValidatedResponseHead},
     upgrade_protocols_match,
 };
-use http::{HeaderValue, Method, StatusCode, header::UPGRADE};
+use http::{HeaderValue, Method, header::UPGRADE};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Direction {
@@ -65,7 +65,6 @@ pub(super) struct Exchange {
     offered_protocols: Vec<HeaderValue>,
     informational: usize,
     max_informational: usize,
-    waiting_continue: bool,
 }
 
 impl Exchange {
@@ -85,12 +84,11 @@ impl Exchange {
             },
             informational: 0,
             max_informational,
-            waiting_continue: request.expectation == Expectation::Continue,
         }
     }
 
     /// Validate a peer response in the context of its request. A final response
-    /// permits an Expect-gated upload to proceed; it does not cancel that upload.
+    /// does not settle or cancel the upload. Drivers own Expect permission.
     pub(super) fn receive_head(
         &mut self,
         head: ResponseHead,
@@ -121,7 +119,6 @@ impl Exchange {
                 ));
             }
             self.phase = ResponsePhase::Upgrade(upgrade);
-            self.waiting_continue = false;
             return Ok((head, HeadAction::Upgrade(upgrade)));
         }
         if head.head.status.is_informational() {
@@ -132,13 +129,9 @@ impl Exchange {
                 ));
             }
             self.informational += 1;
-            if head.head.status == StatusCode::CONTINUE {
-                self.waiting_continue = false;
-            }
             return Ok((head, HeadAction::Informational));
         }
         self.phase = ResponsePhase::Final;
-        self.waiting_continue = false;
         if head.persistence == Persistence::Close {
             self.persistence = Persistence::Close;
         }
@@ -177,21 +170,11 @@ impl Exchange {
             }
 
             self.phase = ResponsePhase::Upgrade(upgrade);
-            self.waiting_continue = false;
 
             Ok(())
         } else {
             self.sent_final(head.persistence)
         }
-    }
-
-    /// Release an Expect wait after a driver's explicit timeout/proceed decision.
-    pub(super) fn allow_request_body(&mut self) {
-        self.waiting_continue = false;
-    }
-
-    pub(super) fn request_body_allowed(&self) -> bool {
-        self.request == Progress::Active && !self.waiting_continue
     }
 
     /// Prevent reuse without pretending that outstanding work has completed.
@@ -280,14 +263,13 @@ mod tests {
                 let mut state = exchange(
                     b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n",
                 );
-                assert!(!state.request_body_allowed());
                 let (_, action) = state
                     .receive_head(response(
                         format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
                     ))
                     .unwrap();
                 assert_eq!(action, HeadAction::Final);
-                assert!(state.request_body_allowed());
+                assert_eq!(state.request, Progress::Active);
                 state.settle(first, true).unwrap();
                 assert_eq!(state.outcome(), Outcome::Active);
                 let second = if first == Direction::Request {
@@ -305,8 +287,9 @@ mod tests {
     fn abort_does_not_claim_completion_or_allow_reuse() {
         let mut state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
         state.abort();
+        assert_eq!(state.request, Progress::Stopping);
+        assert_eq!(state.response, Progress::Stopping);
         assert_eq!(state.outcome(), Outcome::Active);
-        assert!(!state.request_body_allowed());
         state.settle(Direction::Request, false).unwrap();
         assert_eq!(state.outcome(), Outcome::Active);
         state.settle(Direction::Response, false).unwrap();
@@ -322,9 +305,7 @@ mod tests {
             state.receive_head(response(early)).unwrap().1,
             HeadAction::Informational
         );
-        assert!(!state.request_body_allowed());
         state.receive_head(response(b"HTTP/1.1 100 Continue\r\n\r\n")).unwrap();
-        assert!(state.request_body_allowed());
         for _ in 2..16 {
             state.receive_head(response(early)).unwrap();
         }
@@ -332,7 +313,6 @@ mod tests {
             state.receive_head(response(early)).unwrap_err().kind(),
             crate::ErrorKind::Limit
         );
-        assert!(!state.request_body_allowed());
 
         let mut state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
         state
