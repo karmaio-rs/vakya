@@ -155,6 +155,9 @@ fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
         let mut waiting = pin!(sender.reserve());
         assert!(poll(waiting.as_mut()).is_pending());
         drop(permit);
+        // Releasing admission wakes and reserves priority for the registered
+        // waiter, even before that future is polled again.
+        assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Limit);
         let permit = waiting.await.unwrap();
         drop(driver);
         let error = permit

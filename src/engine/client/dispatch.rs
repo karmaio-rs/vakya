@@ -8,15 +8,72 @@ use std::{
     task::{Poll, Waker},
 };
 
+// This state is allocated once per connection. Keeping the queued request
+// inline preserves admission's allocation-free success path.
+#[allow(clippy::large_enum_variant)]
+enum Admission<B> {
+    Ready,
+    Reserved {
+        waiter: Option<Waker>,
+    },
+    Queued {
+        job: Job<B>,
+        waiter: Option<Waker>,
+    },
+    Active {
+        waiter: Option<Waker>,
+    },
+    /// The active owner released admission and woke the registered waiter, but
+    /// that waiter has not yet claimed its permit. New reservations must not
+    /// overtake it.
+    ReadyForWaiter,
+    Closed,
+}
+
+impl<B> Admission<B> {
+    fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed)
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::Reserved { .. } | Self::Queued { .. } | Self::Active { .. })
+    }
+
+    fn waiter_mut(&mut self) -> Option<&mut Option<Waker>> {
+        match self {
+            Self::Reserved { waiter } | Self::Queued { waiter, .. } | Self::Active { waiter } => Some(waiter),
+            Self::Ready | Self::ReadyForWaiter | Self::Closed => None,
+        }
+    }
+
+    fn take_job(&mut self) -> Option<Job<B>> {
+        let current = std::mem::replace(self, Self::Closed);
+        match current {
+            Self::Queued { job, waiter } => {
+                *self = Self::Active { waiter };
+                Some(job)
+            }
+            current => {
+                *self = current;
+                None
+            }
+        }
+    }
+
+    fn close(&mut self) -> (Option<Waker>, Option<Job<B>>) {
+        match std::mem::replace(self, Self::Closed) {
+            Self::Reserved { waiter } | Self::Active { waiter } => (waiter, None),
+            Self::Queued { job, waiter } => (waiter, Some(job)),
+            Self::Ready | Self::ReadyForWaiter | Self::Closed => (None, None),
+        }
+    }
+}
+
 struct State<B> {
-    closed: bool,
     control: crate::connection::ConnectionControl,
-    busy: bool,
+    admission: Admission<B>,
     senders: usize,
-    waiting: bool,
-    waiter: Option<Waker>,
     driver: Option<Waker>,
-    queued: Option<Job<B>>,
 }
 
 pub(crate) struct Job<B> {
@@ -69,28 +126,42 @@ impl<B> SendRequest<B> {
 
         poll_fn(|cx| {
             let mut state = wait.shared.borrow_mut();
-            if state.closed || state.control.stopping() {
+            if state.admission.is_closed() || state.control.stopping() {
                 return Poll::Ready(Err(closed()));
             }
-            if !wait.registered && state.waiting {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::Limit,
-                    "request reservation already occupied",
-                )));
-            }
-            if !state.busy {
-                state.busy = true;
-                state.waiting = false;
-                state.waiter = None;
+
+            if wait.registered && matches!(state.admission, Admission::ReadyForWaiter) {
+                state.admission = Admission::Reserved { waiter: None };
                 wait.registered = false;
                 return Poll::Ready(Ok(RequestPermit {
                     shared: self.shared.clone(),
                     active: true,
                 }));
             }
+
+            if matches!(state.admission, Admission::Ready) {
+                debug_assert!(!wait.registered, "registered waiter lost its admission priority");
+                state.admission = Admission::Reserved { waiter: None };
+                return Poll::Ready(Ok(RequestPermit {
+                    shared: self.shared.clone(),
+                    active: true,
+                }));
+            }
+
+            let occupied = state.admission.waiter_mut().is_none_or(|waiter| waiter.is_some());
+            if !wait.registered && occupied {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::Limit,
+                    "request reservation already occupied",
+                )));
+            }
+
             state.control.admission_waker(cx.waker());
-            state.waiting = true;
-            state.waiter = Some(cx.waker().clone());
+            state
+                .admission
+                .waiter_mut()
+                .expect("only busy admission accepts a waiter")
+                .replace(cx.waker().clone());
             wait.registered = true;
             Poll::Pending
         })
@@ -142,8 +213,11 @@ impl<B> Drop for Reservation<'_, B> {
     fn drop(&mut self) {
         if self.registered {
             let mut state = self.shared.borrow_mut();
-            state.waiting = false;
-            state.waiter = None;
+            if matches!(state.admission, Admission::ReadyForWaiter) {
+                state.admission = Admission::Ready;
+            } else if let Some(waiter) = state.admission.waiter_mut() {
+                waiter.take();
+            }
         }
     }
 }
@@ -167,7 +241,7 @@ impl<B> RequestPermit<B> {
     pub fn send(mut self, request: Request<B>) -> Result<PendingResponse, SubmitError<B>> {
         let mut state = self.shared.borrow_mut();
 
-        if state.closed || state.control.stopping() {
+        if state.admission.is_closed() || state.control.stopping() {
             return Err(SubmitError {
                 request: Box::new(request),
                 error: closed(),
@@ -175,12 +249,19 @@ impl<B> RequestPermit<B> {
         }
 
         let (response, pending, control) = response::channel();
-
-        state.queued = Some(Job {
+        let job = Job {
             request,
             response,
             control,
-        });
+        };
+        let previous = std::mem::replace(&mut state.admission, Admission::Closed);
+        state.admission = match previous {
+            Admission::Reserved { waiter } => Admission::Queued { job, waiter },
+            previous => {
+                state.admission = previous;
+                unreachable!("request permit does not own admission")
+            }
+        };
 
         self.active = false;
 
@@ -283,14 +364,10 @@ pub(crate) struct Receiver<B> {
 
 pub(crate) fn channel<B>(control: crate::connection::ConnectionControl) -> (SendRequest<B>, Receiver<B>) {
     let shared = Rc::new(RefCell::new(State {
-        closed: false,
         control,
-        busy: false,
+        admission: Admission::Ready,
         senders: 1,
-        waiting: false,
-        waiter: None,
         driver: None,
-        queued: None,
     }));
 
     (SendRequest { shared: shared.clone() }, Receiver { shared })
@@ -300,11 +377,14 @@ impl<B> Receiver<B> {
     pub(crate) async fn next(&mut self) -> Option<Job<B>> {
         poll_fn(|cx| {
             let mut state = self.shared.borrow_mut();
-            if let Some(job) = state.queued.take() {
+            if let Some(job) = state.admission.take_job() {
                 return Poll::Ready(Some(job));
             }
 
-            if state.closed || state.control.stopping() || (state.senders == 0 && !state.busy) {
+            if state.admission.is_closed()
+                || state.control.stopping()
+                || (state.senders == 0 && !state.admission.is_busy())
+            {
                 return Poll::Ready(None);
             }
 
@@ -325,9 +405,8 @@ impl<B> Drop for Receiver<B> {
     fn drop(&mut self) {
         let (wake, queued) = {
             let mut state = self.shared.borrow_mut();
-            state.closed = true;
             state.driver = None;
-            (state.waiter.take(), state.queued.take())
+            state.admission.close()
         };
         drop(queued);
         wake_one(wake);
@@ -337,8 +416,20 @@ impl<B> Drop for Receiver<B> {
 fn release<B>(shared: &RefCell<State<B>>) {
     let (waiter, driver) = {
         let mut state = shared.borrow_mut();
-        state.busy = false;
-        (state.waiter.take(), state.driver.take())
+        let previous = std::mem::replace(&mut state.admission, Admission::Closed);
+        let (admission, waiter) = match previous {
+            Admission::Reserved { waiter } | Admission::Active { waiter } => match waiter {
+                Some(waiter) => (Admission::ReadyForWaiter, Some(waiter)),
+                None => (Admission::Ready, None),
+            },
+            Admission::Closed => (Admission::Closed, None),
+            previous => {
+                state.admission = previous;
+                unreachable!("only an admission owner may release it")
+            }
+        };
+        state.admission = admission;
+        (waiter, state.driver.take())
     };
     wake_one(waiter);
     wake_one(driver);
