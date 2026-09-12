@@ -55,10 +55,10 @@ where
     let shutdown = karmaio::runtime::CancellationSource::new();
 
     connection
-        .drive(
+        .instrument(connection.drive(
             &shutdown,
             pin!(run_inner(io, service, strategy, config, &connection, &shutdown)),
-        )
+        ))
         .await
 }
 
@@ -90,6 +90,7 @@ where
     // Graceful idle-read cancellation must leave transport shutdown usable.
     let idle_read = CancellationSource::new();
 
+    let mut exchanges = crate::trace::Exchanges::default();
     'connection: loop {
         budget.step().await;
 
@@ -145,19 +146,31 @@ where
                 }
             }
         };
-        let (result, returned) = exchange(
-            &mut reader,
-            &mut writer,
-            &mut strategy,
-            buffer,
-            head,
-            &service,
-            &config,
-            &mut date,
-            shutdown,
-        )
-        .await;
+        let span = exchanges.next();
+        let (result, returned) = span
+            .instrument(exchange(
+                &mut reader,
+                &mut writer,
+                &mut strategy,
+                buffer,
+                head,
+                &service,
+                &config,
+                &mut date,
+                shutdown,
+            ))
+            .await;
         buffer = returned;
+        if let Ok(outcome) = &result {
+            span.outcome(match outcome {
+                Outcome::Handoff(_) => "handoff",
+                Outcome::Close => "close",
+                Outcome::Reusable => "reusable",
+                Outcome::Active => "active",
+            });
+        } else if let Err(error) = &result {
+            span.failure(error.kind());
+        }
         match result? {
             Outcome::Handoff(kind) => {
                 return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
@@ -529,6 +542,7 @@ where
         ));
     }
     state.sent_response(&validated)?;
+    crate::trace::response_head(validated.head.status.as_u16());
     drop(validated); // The encoded bytes and exchange decisions now own what is needed.
     let mut encoder = BodyEncoder::new(head.mode, metadata, config.protocol.encode)?;
     let (result, _) = write_all(writer, head.bytes, Some(source.token())).await.into_parts();

@@ -63,7 +63,10 @@ async fn write_scalar<W: AsyncWrite, B: IoBuf>(
         let (result, view) = writer.write(view).await.into_parts();
         buffer = view.into_inner();
         match checked_progress(result, length - written) {
-            Ok(count) => written += count,
+            Ok(count) => {
+                crate::trace::progress("write", count);
+                written += count;
+            }
             Err(error) => return BufResult(Err(error), buffer),
         }
     }
@@ -95,7 +98,10 @@ async fn write_vectors<W: AsyncWrite, V: IoVectoredBuf>(
         let (result, view) = writer.write_vectored(view).await.into_parts();
         buffers = view.into_inner();
         match checked_progress(result, length - written) {
-            Ok(count) => written += count,
+            Ok(count) => {
+                crate::trace::progress("write_vectored", count);
+                written += count;
+            }
             Err(error) => return BufResult(Err(error), buffers),
         }
     }

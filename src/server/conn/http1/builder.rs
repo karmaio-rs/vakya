@@ -155,7 +155,7 @@ impl Builder {
         B: Body,
         B::Error: std::error::Error + 'static,
     {
-        let control = ConnectionControl::new();
+        let control = ConnectionControl::new("server");
         Connection {
             future: server::run(io, service, Portable, self.config.clone(), control.clone()),
             control,
@@ -233,7 +233,7 @@ impl Builder {
         B: Body,
         B::Error: std::error::Error + 'static,
     {
-        let control = ConnectionControl::new();
+        let control = ConnectionControl::new("server");
         Connection {
             future: server::run(io, service, Tcp, self.config.clone(), control.clone()),
             control,

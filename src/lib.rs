@@ -38,6 +38,7 @@ mod future;
 mod engine;
 
 #[cfg(feature = "http1")]
+#[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 mod trace;
 
 pub use body::{

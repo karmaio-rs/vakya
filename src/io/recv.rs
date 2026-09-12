@@ -210,7 +210,10 @@ impl RecvBuffer {
                 "reader reported an inconsistent initialized length",
             )),
             Ok(0) => Ok(ReadStatus::Eof),
-            Ok(count) => Ok(ReadStatus::Data(count)),
+            Ok(count) => {
+                crate::trace::progress("read", count);
+                Ok(ReadStatus::Data(count))
+            }
             Err(error) => Err(Error::from(error)),
         };
 
@@ -242,6 +245,7 @@ impl RecvBuffer {
         match super::managed::read(reader, target, cancellation).await {
             Ok(Some(buffer)) => {
                 let count = buffer.len();
+                crate::trace::progress("read_managed", count);
                 self.managed_permit
                     .get_or_insert_with(|| Rc::new(ManagedLeasePermit::new()));
                 self.storage = ReceiveStorage::Managed {

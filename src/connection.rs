@@ -33,6 +33,7 @@ pub struct ConnectionControl {
 
 #[derive(Debug, Default)]
 struct ControlState {
+    trace: crate::trace::Scope,
     stopping: std::cell::Cell<bool>,
     abort: std::cell::Cell<bool>,
     deadline: std::cell::Cell<Option<std::time::Instant>>,
@@ -43,9 +44,12 @@ struct ControlState {
 
 #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 impl ConnectionControl {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(role: &'static str) -> Self {
         Self {
-            shared: std::rc::Rc::new(ControlState::default()),
+            shared: std::rc::Rc::new(ControlState {
+                trace: crate::trace::Scope::connection(role),
+                ..ControlState::default()
+            }),
         }
     }
 
@@ -56,7 +60,7 @@ impl ConnectionControl {
     /// or guarantee that the peer's driver also returns success. Transport errors
     /// observed while closing are still reported by `run()`.
     pub fn graceful_shutdown(&self) {
-        crate::trace::lifecycle("graceful shutdown requested");
+        self.shared.trace.lifecycle("graceful shutdown requested");
         self.shared.stopping.set(true);
         self.wake();
     }
@@ -64,7 +68,7 @@ impl ConnectionControl {
     /// Request immediate cancellation and settlement of the connection.
     /// `run()` reports `Canceled` unless an originating failure is retained.
     pub fn abort(&self) {
-        crate::trace::lifecycle("abort requested");
+        self.shared.trace.lifecycle("abort requested");
         self.shared.abort.set(true);
         self.graceful_shutdown();
     }
@@ -146,6 +150,13 @@ impl ConnectionControl {
         }
     }
 
+    pub(crate) fn instrument<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + use<F> {
+        self.shared.trace.instrument(future)
+    }
+
     pub(crate) async fn drive<F, T>(
         &self,
         source: &karmaio::runtime::CancellationSource,
@@ -161,20 +172,20 @@ impl ConnectionControl {
             fn drop(&mut self) {
                 self.0.shared.stopping.set(true);
                 self.0.wake();
-                crate::trace::lifecycle("driver released");
+                self.0.shared.trace.lifecycle("driver released");
             }
         }
 
         let _guard = Guard(self);
 
-        crate::trace::lifecycle("driver started");
+        self.shared.trace.lifecycle("driver started");
         let mut future = std::pin::pin!(future);
         let mut abort = std::pin::pin!(self.abort_requested());
 
         let result = match race(abort.as_mut(), future.as_mut()).await {
             Race::Second(result) => result,
             Race::First(kind) => {
-                crate::trace::lifecycle("canceling retained operations");
+                self.shared.trace.lifecycle("canceling retained operations");
                 source.cancel();
                 let result = future.await;
                 match result {
@@ -185,9 +196,9 @@ impl ConnectionControl {
         };
 
         if let Err(error) = &result {
-            crate::trace::failure(error.kind());
+            self.shared.trace.failure(error.kind());
         } else {
-            crate::trace::lifecycle("driver settled");
+            self.shared.trace.lifecycle("driver settled");
         }
 
         result

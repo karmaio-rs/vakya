@@ -47,10 +47,10 @@ where
     let shutdown = karmaio::runtime::CancellationSource::new();
 
     connection
-        .drive(
+        .instrument(connection.drive(
             &shutdown,
             pin!(run_inner(io, requests, strategy, config, &connection, &shutdown)),
-        )
+        ))
         .await
 }
 
@@ -77,19 +77,28 @@ where
     let mut budget = WorkBudget::new();
     let mut parser = HeadParser::<ResponseRole>::response(config.protocol.head);
 
+    let mut exchanges = crate::trace::Exchanges::default();
     while let Some(job) = requests.next().await {
         budget.step().await;
-        let (next, persistence) = exchange(
-            &mut reader,
-            &mut writer,
-            &mut strategy,
-            &mut parser,
-            buffer,
-            job,
-            &config,
-            shutdown,
-        )
-        .await?;
+        let span = exchanges.next();
+        let (next, persistence) = span
+            .instrument(exchange(
+                &mut reader,
+                &mut writer,
+                &mut strategy,
+                &mut parser,
+                buffer,
+                job,
+                &config,
+                shutdown,
+            ))
+            .await?;
+        span.outcome(match persistence {
+            Outcome::Handoff(_) => "handoff",
+            Outcome::Close => "close",
+            Outcome::Reusable => "reusable",
+            Outcome::Active => "active",
+        });
         buffer = next;
 
         match persistence {
@@ -364,6 +373,7 @@ async fn receive<R, T: Receive<R>>(
 
                 let (head, action) = state.receive_head(head)?;
 
+                crate::trace::response_head(head.head.status.as_u16());
                 match action {
                     HeadAction::Final => {
                         control.allow_continue();

@@ -22,7 +22,7 @@ No Vakya features are enabled by default. Bodies, body utilities, common HTTP ty
 | `client` | HTTP/1 client connection API; implies `http1` |
 | `server` | HTTP/1 server connection API; implies `http1` |
 | `tls` | Integration with established Karmaio Rustls streams; no role or crypto provider selected |
-| `tracing` | Connection lifecycle and error-category instrumentation |
+| `tracing` | Connection/exchange spans, lifecycle, status, I/O progress, and error categories |
 | `full` | `client`, `server`, `tls`, and `tracing` |
 
 The examples are complete programs:
@@ -66,3 +66,5 @@ Applications choose providers, trust anchors, certificates, peer names, and TLS 
 ## License
 
 Licensed under either the Apache License, Version 2.0 or the MIT License, at your option.
+
+With `tracing`, Vakya emits connection and exchange spans at trace level, with a connection ID, role, protocol, and exchange number. I/O events report operation and completed byte count; response events report status. Error categories are emitted at debug level. Applications install and configure their own subscriber. Headers, URIs, and payload contents are never recorded. Instrumentation is compiled out when the feature is disabled.

@@ -142,7 +142,7 @@ impl Builder {
         B: Body,
         B::Error: std::error::Error + 'static,
     {
-        let control = ConnectionControl::new();
+        let control = ConnectionControl::new("client");
         let (sender, receiver) = dispatch::channel(control.clone());
         (
             sender,
@@ -227,7 +227,7 @@ impl Builder {
         B: Body,
         B::Error: std::error::Error + 'static,
     {
-        let control = ConnectionControl::new();
+        let control = ConnectionControl::new("client");
         let (sender, receiver) = dispatch::channel(control.clone());
         (
             sender,
