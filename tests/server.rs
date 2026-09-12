@@ -95,6 +95,38 @@ async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Outpu
 }
 
 #[test]
+fn http10_expectation_and_upgrade_reach_service_without_informational_or_handoff() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        for fields in [
+            "Expect: 100-continue\r\n",
+            "Connection: upgrade\r\nUpgrade: websocket\r\n",
+            "Expect: 100-continue\r\nConnection: upgrade\r\nUpgrade: websocket\r\n",
+        ] {
+            let called = Cell::new(false);
+            let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
+                called.set(true);
+                assert_eq!(request.version(), vakya::Version::HTTP_10);
+                assert_eq!(request.into_body().collect(1).await.unwrap().bytes().as_ref(), b"x");
+                Ok::<_, Infallible>(Response::new(Empty::new()))
+            });
+            let wire = Bytes::from(format!("POST / HTTP/1.0\r\nContent-Length: 1\r\n{fields}\r\nx"));
+            let (writer, bytes) = ObservedWriter::new();
+            let result = Builder::new()
+                .auto_date(false)
+                .serve_connection((Reader::new([ReadStep::Data(wire)]), writer), service)
+                .run()
+                .await
+                .unwrap();
+            assert!(matches!(result, vakya::connection::ConnectionOutcome::Closed));
+            assert!(called.get());
+            let wire = output(&bytes);
+            assert!(wire.starts_with("HTTP/1.0 200 OK\r\n"));
+            assert_eq!(wire.matches("HTTP/").count(), 1);
+        }
+    });
+}
+
+#[test]
 fn keep_alive_preserves_buffered_requests_and_borrowed_local_service() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let calls = Cell::new(0);

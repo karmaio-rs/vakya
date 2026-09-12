@@ -269,7 +269,17 @@ impl HeadParser<ResponseRole> {
 }
 
 impl RequestHead {
-    pub(super) fn validate(mut self) -> Result<ValidatedRequestHead, HeadError> {
+    pub(super) fn validate(self) -> Result<ValidatedRequestHead, HeadError> {
+        self.validate_for(false)
+    }
+
+    /// Apply recipient semantics without weakening locally generated requests.
+    #[cfg(any(feature = "server", test))]
+    pub(super) fn validate_received(self) -> Result<ValidatedRequestHead, HeadError> {
+        self.validate_for(true)
+    }
+
+    fn validate_for(mut self, received: bool) -> Result<ValidatedRequestHead, HeadError> {
         let target_form = validate_request_target(&self.method, &self.target)?;
         validate_host(&self.headers, self.version)?;
         if target_form == TargetForm::Absolute {
@@ -287,8 +297,14 @@ impl RequestHead {
 
         let connection = connection_options(&self.headers)?;
         let persistence = persistence(self.version, connection);
-        let expectation = expectation(&self.headers, self.version)?;
-        let upgrade = upgrade_intent(&self.headers, connection, target_form)?;
+        let expectation = expectation(&self.headers, self.version, received)?;
+        // HTTP/1.0 recipients ignore Upgrade, including a Connection option
+        // naming it. CONNECT tunneling is independent of protocol upgrade.
+        let upgrade = if received && self.version == Version::HTTP_10 && target_form != TargetForm::Authority {
+            None
+        } else {
+            upgrade_intent(&self.headers, connection, target_form)?
+        };
         if upgrade == Some(UpgradeKind::Protocol) && self.version != Version::HTTP_11 {
             return Err(HeadError::InvalidUpgrade);
         }
@@ -691,7 +707,7 @@ fn persistence(version: Version, options: ConnectionOptions) -> Persistence {
     }
 }
 
-fn expectation(headers: &HeaderMap, version: Version) -> Result<Expectation, HeadError> {
+fn expectation(headers: &HeaderMap, version: Version, received: bool) -> Result<Expectation, HeadError> {
     let mut continue_count = 0_usize;
     for value in headers.get_all(EXPECT) {
         for_each_list_member(value.as_bytes(), HeadError::InvalidExpectation, |member| {
@@ -706,6 +722,7 @@ fn expectation(headers: &HeaderMap, version: Version) -> Result<Expectation, Hea
     match (continue_count, version) {
         (0, _) => Ok(Expectation::None),
         (_, Version::HTTP_11) => Ok(Expectation::Continue),
+        (_, Version::HTTP_10) if received => Ok(Expectation::None),
         _ => Err(HeadError::InvalidExpectation),
     }
 }
@@ -1140,6 +1157,39 @@ mod tests {
         .unwrap();
         assert_eq!(tunnel.upgrade, Some(UpgradeKind::Tunnel));
         assert_eq!(tunnel.body, BodyMode::None);
+    }
+
+    #[test]
+    fn received_http10_fields_are_ignored_without_weakening_outgoing_validation() {
+        for (field, expected) in [
+            ("Expect: 100-continue\r\n", HeadError::InvalidExpectation),
+            (
+                "Connection: upgrade\r\nUpgrade: websocket\r\n",
+                HeadError::InvalidUpgrade,
+            ),
+            ("Upgrade: malformed value\r\n", HeadError::InvalidUpgrade),
+        ] {
+            let wire = format!("POST / HTTP/1.0\r\nContent-Length: 1\r\n{field}\r\n");
+            let head = request(wire.as_bytes());
+            assert_eq!(head.clone().validate().unwrap_err(), expected);
+            let headers = head.headers.clone();
+            let received = head.validate_received().unwrap();
+            assert_eq!(received.head.headers, headers);
+            assert_eq!(received.expectation, Expectation::None);
+            assert_eq!(received.upgrade, None);
+            assert_eq!(received.body, BodyMode::Fixed(1));
+            assert_eq!(received.persistence, Persistence::Close);
+        }
+        let tunnel = request(b"CONNECT example.test:443 HTTP/1.0\r\nUpgrade: ignored\r\n\r\n")
+            .validate_received()
+            .unwrap();
+        assert_eq!(tunnel.upgrade, Some(UpgradeKind::Tunnel));
+        assert_eq!(
+            request(b"POST / HTTP/1.0\r\nExpect: unsupported\r\n\r\n")
+                .validate_received()
+                .unwrap_err(),
+            HeadError::InvalidExpectation,
+        );
     }
 
     #[test]

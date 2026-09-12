@@ -108,7 +108,7 @@ where
             match parser.parse(buffer.bytes())? {
                 ParseOutcome::Complete { head, consumed } => {
                     buffer.consume(consumed)?;
-                    break head.validate()?;
+                    break head.validate_received()?;
                 }
                 ParseOutcome::NeedMore => {
                     let mut read = pin!(
