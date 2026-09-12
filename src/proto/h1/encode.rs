@@ -10,6 +10,7 @@ use http::{
     HeaderMap, HeaderValue, Method, StatusCode, Uri, Version,
     header::{CONTENT_LENGTH, TRANSFER_ENCODING},
 };
+use std::fmt::{self, Write as _};
 
 /// Snapshot taken before polling the producer. Payload bounds and trailer
 /// capability are independent of the selected wire framing.
@@ -132,7 +133,7 @@ pub(super) fn prepare_request_head(
     let mut writer = BoundedWriter::new(limits.max_head_bytes);
     writer.push(validated.head.method.as_str().as_bytes())?;
     writer.push(b" ")?;
-    writer.push(validated.head.target.to_string().as_bytes())?;
+    write!(&mut writer, "{}", validated.head.target).map_err(|_| EncodeError::Limit)?;
     writer.push(b" ")?;
     writer.push(version_bytes(version)?)?;
     writer.push(b"\r\n")?;
@@ -294,8 +295,7 @@ fn set_exact_length(headers: &mut HeaderMap, length: u64) -> Result<(), EncodeEr
             Err(EncodeError::LengthMismatch)
         };
     }
-    let value = HeaderValue::from_str(&length.to_string()).map_err(|_| EncodeError::InvalidFraming)?;
-    headers.insert(CONTENT_LENGTH, value);
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
     Ok(())
 }
 
@@ -372,6 +372,13 @@ impl BoundedWriter {
 
     fn finish(self) -> Bytes {
         Bytes::from(self.bytes)
+    }
+}
+
+impl fmt::Write for BoundedWriter {
+    #[inline]
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.push(value.as_bytes()).map_err(|_| fmt::Error)
     }
 }
 
