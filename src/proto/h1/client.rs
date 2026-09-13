@@ -4,7 +4,7 @@ use super::{
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_request_head},
     exchange::{Direction, Exchange, HeadAction, Outcome},
-    head::{HeadParser, ParseOutcome, ResponseRole},
+    head::{HeadParser, ResponseRole},
 };
 use crate::{
     Body, Error, ErrorKind, Response,
@@ -376,11 +376,10 @@ async fn receive<R, T: Receive<R>>(
             return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
         }
 
-        match parser.parse(buffer.bytes())? {
-            ParseOutcome::Complete { head, consumed } => {
-                buffer.consume(consumed)?;
-
-                let (head, action) = state.receive_head(head)?;
+        match parser.head_len(buffer.bytes())? {
+            Some(consumed) => {
+                let input = buffer.take_shared_prefix(consumed)?;
+                let (head, action) = state.receive_head(parser.parse_shared(input)?)?;
 
                 crate::trace::response_head(head.head.status.as_u16());
                 match action {
@@ -418,7 +417,7 @@ async fn receive<R, T: Receive<R>>(
                     }
                 }
             }
-            ParseOutcome::NeedMore => {
+            None => {
                 let (result, returned) = strategy
                     .read_until(reader, buffer, Some(control.exchange.token()), deadline)
                     .await;

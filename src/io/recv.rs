@@ -112,6 +112,37 @@ impl RecvBuffer {
         Ok(())
     }
 
+    /// Transfers a parsed prefix into shared storage while preserving later
+    /// bytes. Portable storage keeps the original allocation; managed storage
+    /// is copied once because pooled buffers cannot back `http` values.
+    pub(crate) fn take_shared_prefix(&mut self, count: usize) -> Result<Bytes, Error> {
+        if count > self.len() {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "receive buffer split beyond initialized bytes",
+            ));
+        }
+
+        let storage = mem::replace(&mut self.storage, ReceiveStorage::Portable(BytesMut::new()));
+        let prefix = match storage {
+            ReceiveStorage::Portable(mut bytes) => {
+                let prefix = bytes.split_to(count).freeze();
+                self.storage = ReceiveStorage::Portable(bytes);
+                prefix
+            }
+            #[cfg(target_os = "linux")]
+            ReceiveStorage::Managed { buffer, mut range } => {
+                let split = range.start + count;
+                let prefix = Bytes::copy_from_slice(&buffer[range.start..split]);
+                range.start = split;
+                self.storage = ReceiveStorage::Managed { buffer, range };
+                prefix
+            }
+        };
+        self.compact_if_empty();
+        Ok(prefix)
+    }
+
     /// Transfers a decoded payload range while discarding framing it consumed.
     pub(crate) fn take_payload(&mut self, payload: Range<usize>, consumed: usize) -> Result<IncomingData, Error> {
         if payload.start > payload.end || payload.end > consumed || consumed > self.len() {
@@ -368,6 +399,18 @@ mod tests {
             assert_eq!(read_ahead, "NEXTlater");
             assert_eq!(read_ahead.as_ptr(), pointer);
         });
+    }
+
+    #[test]
+    fn shared_prefix_reuses_portable_storage_and_preserves_read_ahead() {
+        let mut buffer = RecvBuffer::new(32, 32).unwrap();
+        buffer.portable_mut().extend_from_slice(b"HEADread-ahead");
+        let pointer = buffer.bytes().as_ptr();
+        let prefix = buffer.take_shared_prefix(4).unwrap();
+
+        assert_eq!(prefix, b"HEAD"[..]);
+        assert_eq!(prefix.as_ptr(), pointer);
+        assert_eq!(buffer.bytes(), b"read-ahead");
     }
 
     #[test]

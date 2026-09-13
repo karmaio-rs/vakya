@@ -553,7 +553,7 @@ mod tests {
     use super::*;
     use crate::proto::h1::{
         decode::{BodyDecoder, DecodeOutcome},
-        head::{HeadLimits, HeadParser, ParseOutcome, RequestRole, ResponseRole},
+        head::{HeadLimits, HeadParser, RequestRole, ResponseRole},
     };
     use http::{
         HeaderValue,
@@ -578,9 +578,13 @@ mod tests {
         .unwrap();
         assert_eq!(request.mode, BodyMode::Fixed(4));
         let mut parser = HeadParser::<RequestRole>::request(HeadLimits::new(4096, 16));
-        let ParseOutcome::Complete { head, .. } = parser.parse(&request.bytes).unwrap() else {
-            panic!("incomplete request")
-        };
+        let consumed = parser
+            .head_len(&request.bytes)
+            .unwrap()
+            .expect("complete encoded request");
+        let head = parser
+            .parse_shared(Bytes::copy_from_slice(&request.bytes[..consumed]))
+            .unwrap();
         assert_eq!(head.validate().unwrap().body, BodyMode::Fixed(4));
 
         let response = encode_response_head(
@@ -594,9 +598,13 @@ mod tests {
         .unwrap();
         assert_eq!(response.mode, BodyMode::Chunked);
         let mut parser = HeadParser::<ResponseRole>::response(HeadLimits::new(4096, 16));
-        let ParseOutcome::Complete { head, .. } = parser.parse(&response.bytes).unwrap() else {
-            panic!("incomplete response")
-        };
+        let consumed = parser
+            .head_len(&response.bytes)
+            .unwrap()
+            .expect("complete encoded response");
+        let head = parser
+            .parse_shared(Bytes::copy_from_slice(&response.bytes[..consumed]))
+            .unwrap();
         assert_eq!(head.validate(&Method::GET).unwrap().body, BodyMode::Chunked);
     }
 

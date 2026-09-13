@@ -4,7 +4,7 @@ use super::{
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, encode_response_head, prepare_response_head},
     exchange::{Direction, Exchange, Outcome},
-    head::{HeadParser, ParseOutcome, RequestRole, ValidatedRequestHead},
+    head::{HeadParser, RequestRole, ValidatedRequestHead},
 };
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
@@ -105,12 +105,12 @@ where
                 return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
             }
 
-            match parser.parse(buffer.bytes())? {
-                ParseOutcome::Complete { head, consumed } => {
-                    buffer.consume(consumed)?;
-                    break head.validate_received()?;
+            match parser.head_len(buffer.bytes())? {
+                Some(consumed) => {
+                    let input = buffer.take_shared_prefix(consumed)?;
+                    break parser.parse_shared(input)?.validate_received()?;
                 }
-                ParseOutcome::NeedMore => {
+                None => {
                     let mut read = pin!(
                         strategy
                             .read_until(&mut reader, buffer, Some(idle_read.token()), deadline)

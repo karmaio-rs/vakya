@@ -236,24 +236,22 @@ mod tests {
     use super::*;
     use crate::proto::h1::{
         config::Config,
-        head::{HeadParser, ParseOutcome, RequestRole, ResponseRole},
+        head::{HeadParser, RequestRole, ResponseRole},
     };
+    use bytes::Bytes;
 
     fn exchange(wire: &[u8]) -> Exchange {
         let config = Config::default();
         let mut parser = HeadParser::<RequestRole>::request(config.head);
-        let ParseOutcome::Complete { head, .. } = parser.parse(wire).unwrap() else {
-            panic!("incomplete request")
-        };
+        let consumed = parser.head_len(wire).unwrap().expect("complete request fixture");
+        let head = parser.parse_shared(Bytes::copy_from_slice(&wire[..consumed])).unwrap();
         Exchange::new(&head.validate().unwrap(), config.max_informational)
     }
 
     fn response(wire: &[u8]) -> ResponseHead {
         let mut parser = HeadParser::<ResponseRole>::response(Config::default().head);
-        let ParseOutcome::Complete { head, .. } = parser.parse(wire).unwrap() else {
-            panic!("incomplete response")
-        };
-        head
+        let consumed = parser.head_len(wire).unwrap().expect("complete response fixture");
+        parser.parse_shared(Bytes::copy_from_slice(&wire[..consumed])).unwrap()
     }
 
     #[test]

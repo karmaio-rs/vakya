@@ -1,5 +1,6 @@
 use super::syntax::{is_tchar, quoted_string_len, trim_ows};
 use super::{BodyMode, Expectation, Persistence, TargetForm, UpgradeKind};
+use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version,
     header::{CONNECTION, CONTENT_LENGTH, EXPECT, HOST, TRANSFER_ENCODING, UPGRADE},
@@ -68,12 +69,6 @@ impl From<HeadError> for crate::Error {
     }
 }
 
-#[derive(Debug)]
-pub(super) enum ParseOutcome<T> {
-    NeedMore,
-    Complete { head: T, consumed: usize },
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RequestHead {
     pub(super) method: Method,
@@ -113,24 +108,31 @@ pub(super) enum RequestRole {}
 #[derive(Debug)]
 pub(super) enum ResponseRole {}
 
-/// Incremental parser over a retained input prefix. After `NeedMore`, the next
-/// call must retain the same bytes and append new input. On completion or error
-/// the scan resets and the workspace can parse a different head. Returned heads
-/// own their fields; `consumed` leaves body or upgraded-protocol bytes untouched.
+/// Incremental parser over a retained input prefix. After an incomplete scan,
+/// the next call must retain the same bytes and append new input. Once
+/// `head_len` returns a prefix length, the caller transfers exactly that prefix
+/// to `parse_shared`, leaving body or upgraded-protocol bytes untouched.
 #[derive(Debug)]
 pub(super) struct HeadParser<R> {
     limits: HeadLimits,
     workspace: HeaderWorkspace,
     role: PhantomData<fn() -> R>,
-    partial: Option<HeadScan>,
-    #[cfg(test)]
-    parse_calls: usize,
+    scan: HeadScan,
 }
 
-#[derive(Debug, Default)]
-struct HeadScan {
-    scanned: usize,
-    line: ScanLine,
+#[derive(Debug)]
+enum HeadScan {
+    Scanning { scanned: usize, line: ScanLine },
+    Complete { length: usize },
+}
+
+impl Default for HeadScan {
+    fn default() -> Self {
+        Self::Scanning {
+            scanned: 0,
+            line: ScanLine::Leading,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -144,21 +146,34 @@ enum ScanLine {
 
 impl HeadScan {
     /// Finds only the head terminator; httparse remains the syntax authority.
-    fn complete(&mut self, input: &[u8]) -> bool {
-        if input.len() < self.scanned {
+    fn complete(&mut self, input: &[u8]) -> Option<usize> {
+        let reset = match self {
+            Self::Scanning { scanned, .. } => input.len() < *scanned,
+            Self::Complete { length } if input.len() >= *length => return Some(*length),
+            Self::Complete { .. } => true,
+        };
+        if reset {
             *self = Self::default();
         }
-        for &byte in &input[self.scanned..] {
-            self.scanned += 1;
-            self.line = match (&self.line, byte) {
+
+        let Self::Scanning { scanned, line } = self else {
+            unreachable!("complete scan returned above")
+        };
+        for &byte in &input[*scanned..] {
+            *scanned += 1;
+            if matches!((&*line, byte), (ScanLine::End | ScanLine::EndCr, b'\n')) {
+                let length = *scanned;
+                *self = Self::Complete { length };
+                return Some(length);
+            }
+            *line = match (&*line, byte) {
                 (ScanLine::Leading, b'\r' | b'\n') => ScanLine::Leading,
-                (ScanLine::End | ScanLine::EndCr, b'\n') => return true,
                 (ScanLine::End, b'\r') => ScanLine::EndCr,
                 (_, b'\n') => ScanLine::End,
                 _ => ScanLine::Content,
             };
         }
-        false
+        None
     }
 }
 
@@ -168,9 +183,7 @@ impl<R> HeadParser<R> {
             limits,
             workspace: HeaderWorkspace::new(limits.max_headers),
             role: PhantomData,
-            partial: None,
-            #[cfg(test)]
-            parse_calls: 0,
+            scan: HeadScan::default(),
         }
     }
 
@@ -178,30 +191,19 @@ impl<R> HeadParser<R> {
         input.len().min(self.limits.max_bytes)
     }
 
-    fn ready_to_parse(&mut self, input: &[u8]) -> bool {
-        let bounded = &input[..self.parse_input_len(input)];
-        self.partial.as_mut().is_none_or(|scan| scan.complete(bounded)) || input.len() >= self.limits.max_bytes
-    }
-
-    fn parsed<T>(&mut self, input: &[u8], result: &Result<ParseOutcome<T>, HeadError>) {
-        #[cfg(test)]
-        {
-            self.parse_calls += 1;
-        }
-        if matches!(result, Ok(ParseOutcome::NeedMore)) {
-            let mut scan = HeadScan::default();
-            scan.complete(input);
-            self.partial = Some(scan);
-        } else {
-            self.partial = None;
-        }
-    }
-
-    fn incomplete<T>(&self, input_len: usize) -> Result<ParseOutcome<T>, HeadError> {
-        if input_len > self.limits.max_bytes {
+    /// Find a complete retained head before transferring its backing storage.
+    /// Repeated calls return the same length until the caller passes that exact
+    /// prefix to the role's `parse_shared`.
+    pub(super) fn head_len(&mut self, input: &[u8]) -> Result<Option<usize>, HeadError> {
+        let parse_len = self.parse_input_len(input);
+        let complete = self.scan.complete(&input[..parse_len]);
+        if complete.is_some() {
+            Ok(complete)
+        } else if input.len() > self.limits.max_bytes {
+            self.scan = HeadScan::default();
             Err(HeadError::Limit(HeadLimit::Bytes))
         } else {
-            Ok(ParseOutcome::NeedMore)
+            Ok(None)
         }
     }
 }
@@ -211,28 +213,27 @@ impl HeadParser<RequestRole> {
         Self::with_limits(limits)
     }
 
-    pub(super) fn parse(&mut self, input: &[u8]) -> Result<ParseOutcome<RequestHead>, HeadError> {
-        if !self.ready_to_parse(input) {
-            return self.incomplete(input.len());
+    pub(super) fn parse_shared(&mut self, input: Bytes) -> Result<RequestHead, HeadError> {
+        if input.len() > self.limits.max_bytes {
+            self.scan = HeadScan::default();
+            return Err(HeadError::Limit(HeadLimit::Bytes));
         }
-        let parse_len = self.parse_input_len(input);
         let parsed = {
             let mut request = httparse::Request::new(&mut []);
             let workspace = self.workspace.for_input();
-            let status = httparse::ParserConfig::default()
-                .parse_request_with_uninit_headers(&mut request, &input[..parse_len], workspace)
-                .map_err(map_request_error);
-
-            match status {
-                Ok(httparse::Status::Complete(consumed)) => {
-                    build_request_head(request).map(|head| ParseOutcome::Complete { head, consumed })
+            match httparse::ParserConfig::default()
+                .parse_request_with_uninit_headers(&mut request, &input, workspace)
+                .map_err(map_request_error)
+            {
+                Ok(httparse::Status::Complete(consumed)) if consumed == input.len() => {
+                    build_shared_request_head(request, &input)
                 }
-                Ok(httparse::Status::Partial) => self.incomplete(input.len()),
+                Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial) => Err(HeadError::InvalidStartLine),
                 Err(error) => Err(error),
             }
         };
         self.workspace.clear();
-        self.parsed(input, &parsed);
+        self.scan = HeadScan::default();
         parsed
     }
 }
@@ -242,28 +243,27 @@ impl HeadParser<ResponseRole> {
         Self::with_limits(limits)
     }
 
-    pub(super) fn parse(&mut self, input: &[u8]) -> Result<ParseOutcome<ResponseHead>, HeadError> {
-        if !self.ready_to_parse(input) {
-            return self.incomplete(input.len());
+    pub(super) fn parse_shared(&mut self, input: Bytes) -> Result<ResponseHead, HeadError> {
+        if input.len() > self.limits.max_bytes {
+            self.scan = HeadScan::default();
+            return Err(HeadError::Limit(HeadLimit::Bytes));
         }
-        let parse_len = self.parse_input_len(input);
         let parsed = {
             let mut response = httparse::Response::new(&mut []);
             let workspace = self.workspace.for_input();
-            let status = httparse::ParserConfig::default()
-                .parse_response_with_uninit_headers(&mut response, &input[..parse_len], workspace)
-                .map_err(map_response_error);
-
-            match status {
-                Ok(httparse::Status::Complete(consumed)) => {
-                    build_response_head(response).map(|head| ParseOutcome::Complete { head, consumed })
+            match httparse::ParserConfig::default()
+                .parse_response_with_uninit_headers(&mut response, &input, workspace)
+                .map_err(map_response_error)
+            {
+                Ok(httparse::Status::Complete(consumed)) if consumed == input.len() => {
+                    build_shared_response_head(response, &input)
                 }
-                Ok(httparse::Status::Partial) => self.incomplete(input.len()),
+                Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial) => Err(HeadError::InvalidStartLine),
                 Err(error) => Err(error),
             }
         };
         self.workspace.clear();
-        self.parsed(input, &parsed);
+        self.scan = HeadScan::default();
         parsed
     }
 }
@@ -426,16 +426,13 @@ impl HeaderWorkspace {
     }
 }
 
-fn build_request_head(request: httparse::Request<'_, '_>) -> Result<RequestHead, HeadError> {
+fn build_shared_request_head(request: httparse::Request<'_, '_>, input: &Bytes) -> Result<RequestHead, HeadError> {
     let method = Method::from_bytes(request.method.ok_or(HeadError::InvalidStartLine)?.as_bytes())
         .map_err(|_| HeadError::InvalidMethod)?;
-    let target = request
-        .path
-        .ok_or(HeadError::InvalidStartLine)?
-        .parse::<Uri>()
-        .map_err(|_| HeadError::InvalidTarget)?;
+    let target = request.path.ok_or(HeadError::InvalidStartLine)?;
+    let target = Uri::from_maybe_shared(input.slice_ref(target.as_bytes())).map_err(|_| HeadError::InvalidTarget)?;
     let version = version(request.version.ok_or(HeadError::InvalidStartLine)?)?;
-    let headers = own_headers(request.headers)?;
+    let headers = shared_headers(request.headers, input)?;
 
     Ok(RequestHead {
         method,
@@ -445,14 +442,14 @@ fn build_request_head(request: httparse::Request<'_, '_>) -> Result<RequestHead,
     })
 }
 
-fn build_response_head(response: httparse::Response<'_, '_>) -> Result<ResponseHead, HeadError> {
+fn build_shared_response_head(response: httparse::Response<'_, '_>, input: &Bytes) -> Result<ResponseHead, HeadError> {
     let version = version(response.version.ok_or(HeadError::InvalidStartLine)?)?;
     let code = response.code.ok_or(HeadError::InvalidStartLine)?;
     if code > 599 {
         return Err(HeadError::InvalidStatus);
     }
     let status = StatusCode::from_u16(code).map_err(|_| HeadError::InvalidStatus)?;
-    let headers = own_headers(response.headers)?;
+    let headers = shared_headers(response.headers, input)?;
 
     Ok(ResponseHead {
         version,
@@ -466,6 +463,17 @@ pub(super) fn own_headers(headers: &[httparse::Header<'_>]) -> Result<HeaderMap,
     for header in headers {
         let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| HeadError::InvalidHeader)?;
         let value = HeaderValue::from_bytes(header.value).map_err(|_| HeadError::InvalidHeader)?;
+        owned.append(name, value);
+    }
+    Ok(owned)
+}
+
+fn shared_headers(headers: &[httparse::Header<'_>], input: &Bytes) -> Result<HeaderMap, HeadError> {
+    let mut owned = HeaderMap::try_with_capacity(headers.len()).map_err(|_| HeadError::Limit(HeadLimit::HeaderMap))?;
+    for header in headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| HeadError::InvalidHeader)?;
+        let value =
+            HeaderValue::from_maybe_shared(input.slice_ref(header.value)).map_err(|_| HeadError::InvalidHeader)?;
         owned.append(name, value);
     }
     Ok(owned)
@@ -807,11 +815,9 @@ fn is_token(value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HeadError, HeadLimit, HeadLimits, HeadParser, ParseOutcome, RequestHead, RequestRole, ResponseHead,
-        ResponseRole,
-    };
+    use super::{HeadError, HeadLimit, HeadLimits, HeadParser, RequestHead, RequestRole, ResponseHead, ResponseRole};
     use crate::proto::h1::{BodyMode, Expectation, Persistence, TargetForm, UpgradeKind};
+    use bytes::Bytes;
     use http::{Method, StatusCode, Version, header::HOST};
 
     const LIMITS: HeadLimits = HeadLimits::new(1024, 8);
@@ -822,13 +828,12 @@ mod tests {
 
         for split in 0..input.len() - 4 {
             let mut parser = HeadParser::<RequestRole>::request(LIMITS);
-            assert!(matches!(parser.parse(&input[..split]).unwrap(), ParseOutcome::NeedMore));
+            assert_eq!(parser.head_len(&input[..split]).unwrap(), None);
         }
 
         let mut parser = HeadParser::<RequestRole>::request(LIMITS);
-        let ParseOutcome::Complete { head, consumed } = parser.parse(input).unwrap() else {
-            panic!("complete request was not parsed");
-        };
+        let consumed = parser.head_len(input).unwrap().expect("complete request head");
+        let head = parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).unwrap();
         assert_eq!(head.method, Method::GET);
         assert_eq!(head.target, "/items?q=rust");
         assert_eq!(head.version, Version::HTTP_11);
@@ -842,13 +847,12 @@ mod tests {
 
         for split in 0..input.len() - 4 {
             let mut parser = HeadParser::<ResponseRole>::response(LIMITS);
-            assert!(matches!(parser.parse(&input[..split]).unwrap(), ParseOutcome::NeedMore));
+            assert_eq!(parser.head_len(&input[..split]).unwrap(), None);
         }
 
         let mut parser = HeadParser::<ResponseRole>::response(LIMITS);
-        let ParseOutcome::Complete { head, consumed } = parser.parse(input).unwrap() else {
-            panic!("complete response was not parsed");
-        };
+        let consumed = parser.head_len(input).unwrap().expect("complete response head");
+        let head = parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).unwrap();
         assert_eq!(head.status, StatusCode::NO_CONTENT);
         assert_eq!(head.version, Version::HTTP_10);
         assert_eq!(&input[consumed..], b"next");
@@ -859,10 +863,8 @@ mod tests {
         let mut parser = HeadParser::<RequestRole>::request(LIMITS);
         let head = {
             let input = b"POST /owned HTTP/1.1\r\nHost: owned.test\r\n\r\n".to_vec();
-            let ParseOutcome::Complete { head, .. } = parser.parse(&input).unwrap() else {
-                panic!("complete request was not parsed");
-            };
-            head
+            let consumed = parser.head_len(&input).unwrap().expect("complete request head");
+            parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).unwrap()
         };
 
         assert_eq!(head.target, "/owned");
@@ -870,24 +872,66 @@ mod tests {
     }
 
     #[test]
+    fn shared_heads_reuse_input_for_targets_and_values() {
+        let request = Bytes::copy_from_slice(
+            b"GET /shared/resource?q=rust HTTP/1.1\r\nHost: shared.example\r\nX-Test: shared-value\r\n\r\nbody",
+        );
+        let request_head_len = request.windows(4).position(|window| window == b"\r\n\r\n").unwrap() + 4;
+        let target_offset = request
+            .windows(16)
+            .position(|window| window == b"/shared/resource")
+            .unwrap();
+        let host_offset = request
+            .windows(14)
+            .position(|window| window == b"shared.example")
+            .unwrap();
+        let target_pointer = request[target_offset..].as_ptr();
+        let host_pointer = request[host_offset..].as_ptr();
+
+        let mut parser = HeadParser::<RequestRole>::request(LIMITS);
+        assert_eq!(parser.head_len(&request).unwrap(), Some(request_head_len));
+        assert_eq!(parser.head_len(&request).unwrap(), Some(request_head_len));
+        let head = parser.parse_shared(request.slice(..request_head_len)).unwrap();
+        assert_eq!(head.target.path().as_ptr(), target_pointer);
+        assert_eq!(head.headers[HOST].as_bytes().as_ptr(), host_pointer);
+
+        let response = Bytes::copy_from_slice(b"HTTP/1.1 200 OK\r\nX-Test: shared-response\r\n\r\nnext");
+        let response_head_len = response.windows(4).position(|window| window == b"\r\n\r\n").unwrap() + 4;
+        let value_offset = response
+            .windows(15)
+            .position(|window| window == b"shared-response")
+            .unwrap();
+        let value_pointer = response[value_offset..].as_ptr();
+
+        let mut parser = HeadParser::<ResponseRole>::response(LIMITS);
+        assert_eq!(parser.head_len(&response).unwrap(), Some(response_head_len));
+        assert_eq!(parser.head_len(&response).unwrap(), Some(response_head_len));
+        let head = parser.parse_shared(response.slice(..response_head_len)).unwrap();
+        assert_eq!(head.headers["x-test"].as_bytes().as_ptr(), value_pointer);
+    }
+
+    #[test]
     fn head_and_header_count_limits_are_enforced_at_boundaries() {
         let input = b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\n\r\n";
         let mut one_header = HeadParser::<RequestRole>::request(HeadLimits::new(1024, 1));
+        let consumed = one_header.head_len(input).unwrap().expect("complete request head");
         assert_eq!(
-            one_header.parse(input).unwrap_err(),
+            one_header
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
+                .unwrap_err(),
             HeadError::Limit(HeadLimit::Headers)
         );
 
         let exact = b"GET / HTTP/1.1\r\n\r\n";
         let mut exact_parser = HeadParser::<RequestRole>::request(HeadLimits::new(exact.len(), 1));
-        assert!(matches!(
-            exact_parser.parse(exact).unwrap(),
-            ParseOutcome::Complete { .. }
-        ));
+        let consumed = exact_parser.head_len(exact).unwrap().expect("complete request head");
+        exact_parser
+            .parse_shared(Bytes::copy_from_slice(&exact[..consumed]))
+            .unwrap();
 
         let mut short_parser = HeadParser::<RequestRole>::request(HeadLimits::new(exact.len() - 1, 1));
         assert_eq!(
-            short_parser.parse(exact).unwrap_err(),
+            short_parser.head_len(exact).unwrap_err(),
             HeadError::Limit(HeadLimit::Bytes)
         );
     }
@@ -895,18 +939,30 @@ mod tests {
     #[test]
     fn unsupported_versions_and_malformed_start_lines_are_typed() {
         let mut request = HeadParser::<RequestRole>::request(LIMITS);
+        let input = b"GET / HTTP/2.0\r\n\r\n";
+        let consumed = request.head_len(input).unwrap().expect("complete request head");
         assert_eq!(
-            request.parse(b"GET / HTTP/2.0\r\n\r\n").unwrap_err(),
+            request
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
+                .unwrap_err(),
             HeadError::UnsupportedVersion
         );
+        let input = b"GET  HTTP/1.1\r\n\r\n";
+        let consumed = request.head_len(input).unwrap().expect("complete request head");
         assert_eq!(
-            request.parse(b"GET  HTTP/1.1\r\n\r\n").unwrap_err(),
+            request
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
+                .unwrap_err(),
             HeadError::InvalidStartLine
         );
 
         let mut response = HeadParser::<ResponseRole>::response(LIMITS);
+        let input = b"HTTP/1.1 xyz Bad\r\n\r\n";
+        let consumed = response.head_len(input).unwrap().expect("complete response head");
         assert_eq!(
-            response.parse(b"HTTP/1.1 xyz Bad\r\n\r\n").unwrap_err(),
+            response
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
+                .unwrap_err(),
             HeadError::InvalidStartLine
         );
     }
@@ -920,35 +976,38 @@ mod tests {
             );
             let mut parser = HeadParser::<RequestRole>::request(HeadLimits::new(8192, 8));
             for end in 1..wire.len() {
-                assert!(matches!(
-                    parser.parse(&wire.as_bytes()[..end]).unwrap(),
-                    ParseOutcome::NeedMore
-                ));
+                assert_eq!(parser.head_len(&wire.as_bytes()[..end]).unwrap(), None);
             }
-            assert!(matches!(
-                parser.parse(wire.as_bytes()).unwrap(),
-                ParseOutcome::Complete { .. }
-            ));
-            assert_eq!(parser.parse_calls, 2);
+            let consumed = parser
+                .head_len(wire.as_bytes())
+                .unwrap()
+                .expect("complete request head");
+            parser
+                .parse_shared(Bytes::copy_from_slice(&wire.as_bytes()[..consumed]))
+                .unwrap();
             // A completed parser can immediately read the next head.
-            assert!(matches!(
-                parser.parse(wire.as_bytes()).unwrap(),
-                ParseOutcome::Complete { .. }
-            ));
+            let consumed = parser
+                .head_len(wire.as_bytes())
+                .unwrap()
+                .expect("complete request head");
+            parser
+                .parse_shared(Bytes::copy_from_slice(&wire.as_bytes()[..consumed]))
+                .unwrap();
         }
     }
 
     #[test]
     fn parser_workspace_can_be_reused_after_partial_and_error() {
         let mut parser = HeadParser::<RequestRole>::request(LIMITS);
-        assert!(matches!(
-            parser.parse(b"GET / HTTP/1.1\r\n").unwrap(),
-            ParseOutcome::NeedMore
-        ));
-        assert!(parser.parse(b"bad start\r\n\r\n").is_err());
+        assert_eq!(parser.head_len(b"GET / HTTP/1.1\r\n").unwrap(), None);
 
-        let result = parser.parse(b"GET /ok HTTP/1.1\r\nHost: example.test\r\n\r\n");
-        assert!(matches!(result.unwrap(), ParseOutcome::Complete { .. }));
+        let input = b"bad start\r\n\r\n";
+        let consumed = parser.head_len(input).unwrap().expect("complete malformed head");
+        assert!(parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).is_err());
+
+        let input = b"GET /ok HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let consumed = parser.head_len(input).unwrap().expect("complete request head");
+        parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).unwrap();
     }
 
     #[test]
@@ -1251,8 +1310,12 @@ mod tests {
     #[test]
     fn response_status_is_limited_to_registered_three_digit_range() {
         let mut parser = HeadParser::<ResponseRole>::response(LIMITS);
+        let input = b"HTTP/1.1 600 Future\r\n\r\n";
+        let consumed = parser.head_len(input).unwrap().expect("complete response head");
         assert_eq!(
-            parser.parse(b"HTTP/1.1 600 Future\r\n\r\n").unwrap_err(),
+            parser
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
+                .unwrap_err(),
             HeadError::InvalidStatus
         );
         let parsed = response(b"HTTP/1.1 599 Edge\r\nContent-Length: 0\r\n\r\n");
@@ -1262,15 +1325,19 @@ mod tests {
     #[test]
     fn obsolete_folding_and_whitespace_before_colon_are_rejected() {
         let mut parser = HeadParser::<RequestRole>::request(LIMITS);
+        let input = b"GET / HTTP/1.1\r\nHost : example.test\r\n\r\n";
+        let consumed = parser.head_len(input).unwrap().expect("complete request head");
         assert_eq!(
             parser
-                .parse(b"GET / HTTP/1.1\r\nHost : example.test\r\n\r\n")
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
                 .unwrap_err(),
             HeadError::InvalidHeader
         );
+        let input = b"GET / HTTP/1.1\r\nHost: example.test\r\n folded\r\n\r\n";
+        let consumed = parser.head_len(input).unwrap().expect("complete request head");
         assert_eq!(
             parser
-                .parse(b"GET / HTTP/1.1\r\nHost: example.test\r\n folded\r\n\r\n")
+                .parse_shared(Bytes::copy_from_slice(&input[..consumed]))
                 .unwrap_err(),
             HeadError::InvalidHeader
         );
@@ -1278,17 +1345,13 @@ mod tests {
 
     fn request(input: &[u8]) -> RequestHead {
         let mut parser = HeadParser::<RequestRole>::request(HeadLimits::new(4096, 16));
-        let ParseOutcome::Complete { head, .. } = parser.parse(input).unwrap() else {
-            panic!("request fixture was incomplete");
-        };
-        head
+        let consumed = parser.head_len(input).unwrap().expect("complete request fixture");
+        parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).unwrap()
     }
 
     fn response(input: &[u8]) -> ResponseHead {
         let mut parser = HeadParser::<ResponseRole>::response(HeadLimits::new(4096, 16));
-        let ParseOutcome::Complete { head, .. } = parser.parse(input).unwrap() else {
-            panic!("response fixture was incomplete");
-        };
-        head
+        let consumed = parser.head_len(input).unwrap().expect("complete response fixture");
+        parser.parse_shared(Bytes::copy_from_slice(&input[..consumed])).unwrap()
     }
 }
