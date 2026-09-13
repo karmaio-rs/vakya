@@ -3,6 +3,7 @@ use super::{
     BodyMode,
     head::{HeadError, HeaderWorkspace, own_headers},
 };
+use crate::error::{Error, ErrorKind};
 use http::{
     HeaderMap,
     header::{
@@ -66,11 +67,11 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-impl From<DecodeError> for crate::Error {
+impl From<DecodeError> for Error {
     fn from(error: DecodeError) -> Self {
         let kind = match error {
-            DecodeError::Limit(_) => crate::ErrorKind::Limit,
-            _ => crate::ErrorKind::InvalidMessage,
+            DecodeError::Limit(_) => ErrorKind::Limit,
+            _ => ErrorKind::InvalidMessage,
         };
         Self::with_source(kind, "received body framing failed", error)
     }

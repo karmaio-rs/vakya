@@ -4,8 +4,8 @@ use super::{
     encode::{BodyEncoder, EncodeError},
 };
 use crate::{
-    Body, Error, ErrorKind, Frame, Incoming, SizeHint, TrailerHint,
-    body::{incoming::IncomingProducer, pipe::OfferError},
+    body::{Body, Frame, Incoming, SizeHint, TrailerHint, incoming::IncomingProducer, pipe::OfferError},
+    error::{Error, ErrorKind},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -348,10 +348,11 @@ pub(super) enum SendBodyError<E> {
 mod tests {
     use super::*;
     use crate::{
-        BodyExt, Full, Service,
         body::collect,
+        body::{BodyExt, Full},
         io::transport::Portable,
         proto::h1::encode::{BodyMetadata, EncodeLimits},
+        service::Service,
         test_transport::{Gate, ReadStep, Reader, WriteStep, Writer},
     };
     use bytes::Bytes;
@@ -613,7 +614,7 @@ mod tests {
                 );
                 let ((end, _), result) = pair(driver, collect(&mut body, 16)).await;
                 assert!(matches!(end, ReceiveEnd::Failed(ref error) if error.kind() == ErrorKind::InvalidMessage));
-                let crate::CollectError::Body(error) = result.unwrap_err() else {
+                let crate::body::CollectError::Body(error) = result.unwrap_err() else {
                     panic!("wrong failure")
                 };
                 assert!(
@@ -631,7 +632,7 @@ mod tests {
         karmaio::Runtime::new().unwrap().block_on(async {
             let mode = BodyMode::Chunked;
             let (producer, body) = incoming(mode);
-            let service = crate::service_fn(async |body: Incoming| -> Result<_, std::convert::Infallible> {
+            let service = crate::service::service_fn(async |body: Incoming| -> Result<_, std::convert::Infallible> {
                 Ok(http::Response::new(body))
             });
             let mut body = service.call(body).await.unwrap().into_body();

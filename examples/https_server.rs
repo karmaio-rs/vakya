@@ -3,9 +3,11 @@
 use bytes::Bytes;
 use std::sync::Arc;
 use vakya::{
-    Full, Incoming, Request, Response,
+    Request, Response,
+    body::{Full, Incoming},
+    error::Error,
     server::{RequestContext, conn::http1::Builder},
-    service_fn,
+    service::service_fn,
     tls::{HTTP_11_ALPN, rustls},
 };
 
@@ -29,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls = karmaio::tls::TlsAcceptor::new(Arc::new(config)).accept(socket).await?;
         let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
             request.into_body().drain(64 * 1024).await?;
-            Ok::<_, vakya::Error>(Response::new(Full::new(Bytes::from_static(b"Hello over TLS\n"))))
+            Ok::<_, Error>(Response::new(Full::new(Bytes::from_static(b"Hello over TLS\n"))))
         });
         Builder::new().serve_tls(tls, service)?.run().await?;
         Ok(())

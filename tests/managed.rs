@@ -1,7 +1,12 @@
 #![cfg(all(target_os = "linux", feature = "client"))]
 use karmaio::{RuntimeBuilder, net::tcp::TcpStream, runtime::spawn_local};
 use std::io::{Read, Write};
-use vakya::{Body, Empty, Request, client::conn::http1::Builder, connection::ConnectionOutcome};
+use vakya::{
+    Request,
+    body::{Body, Empty},
+    client::conn::http1::Builder,
+    connection::ConnectionOutcome,
+};
 
 #[test]
 fn retained_response_views_survive_reuse_closure_and_runtime_teardown() {

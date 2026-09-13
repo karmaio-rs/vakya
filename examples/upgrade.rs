@@ -2,10 +2,11 @@
 use bytes::Bytes;
 use karmaio::io::{AsyncWrite, AsyncWriteExt};
 use vakya::{
-    Empty, Incoming, Request, Response,
+    Request, Response,
+    body::{Empty, Incoming},
     connection::ConnectionOutcome,
     server::{RequestContext, conn::http1::Builder},
-    service_fn,
+    service::service_fn,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -16,9 +16,11 @@ use std::{
 };
 use support::transport::{ReadStep, Reader, Writer};
 use vakya::{
-    Body, BodyExt, Empty, Error, ErrorKind, Frame, Full, Incoming, Request, Response, SizeHint, TrailerHint,
+    Request, Response,
+    body::{Body, BodyExt, Empty, Frame, Full, Incoming, SizeHint, TrailerHint},
+    error::{Error, ErrorKind},
     server::{RequestContext, conn::http1::Builder},
-    service_fn,
+    service::service_fn,
 };
 
 struct ObservedWriter {

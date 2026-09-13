@@ -5,6 +5,7 @@ use super::{
     head::{HeadError, RequestHead, ResponseHead, parse_content_length, parse_transfer_encoding},
 };
 use crate::body::{SizeHint, TrailerHint};
+use crate::error::{Error, ErrorKind};
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderValue, Method, StatusCode, Uri, Version,
@@ -76,12 +77,12 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-impl From<EncodeError> for crate::Error {
+impl From<EncodeError> for Error {
     fn from(error: EncodeError) -> Self {
         let kind = match error {
-            EncodeError::Limit => crate::ErrorKind::Limit,
-            EncodeError::Unsupported => crate::ErrorKind::Unsupported,
-            _ => crate::ErrorKind::LocalMessage,
+            EncodeError::Limit => ErrorKind::Limit,
+            EncodeError::Unsupported => ErrorKind::Unsupported,
+            _ => ErrorKind::LocalMessage,
         };
         Self::with_source(kind, "outgoing HTTP message cannot be encoded safely", error)
     }
@@ -705,8 +706,8 @@ mod tests {
 
     #[test]
     fn public_error_preserves_encoding_category_and_source() {
-        let error: crate::Error = EncodeError::Unsupported.into();
-        assert_eq!(error.kind(), crate::ErrorKind::Unsupported);
+        let error: Error = EncodeError::Unsupported.into();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert!(std::error::Error::source(&error).is_some_and(|source| source.is::<EncodeError>()));
     }
 

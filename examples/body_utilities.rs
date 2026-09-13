@@ -1,7 +1,10 @@
 //! Native composition, Karmaio streams, and optional local body erasure.
 use karmaio::io::Stream;
 use std::{cell::Cell, collections::VecDeque, convert::Infallible};
-use vakya::{BodyExt, BoxBody, Frame, Full, HeaderMap, HeaderValue, Response, StreamBody};
+use vakya::{
+    HeaderMap, HeaderValue, Response,
+    body::{BodyExt, BoxBody, Frame, Full, StreamBody},
+};
 
 struct Chunks(VecDeque<Vec<u8>>);
 

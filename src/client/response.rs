@@ -1,7 +1,11 @@
 //! Response observation and upload control for accepted client requests.
 use crate::{
-    Error, ErrorKind, Incoming, Response,
-    body::pipe::{self, Consumer, Producer, TakeError},
+    Response,
+    body::{
+        Incoming,
+        pipe::{self, Consumer, Producer, TakeError},
+    },
+    error::{Error, ErrorKind},
 };
 use karmaio::runtime::CancellationSource;
 use std::{

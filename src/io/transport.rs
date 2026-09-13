@@ -1,5 +1,5 @@
 use super::recv::{ReadStatus, RecvBuffer};
-use crate::Error;
+use crate::error::{Error, ErrorKind};
 use karmaio::{
     io::AsyncRead,
     net::{split::OwnedReadHalf, tcp::TcpStream},
@@ -21,7 +21,7 @@ pub(crate) trait Receive<R> {
         let ((result, buffer), elapsed) =
             super::deadline::settle(deadline, std::pin::pin!(self.read(reader, buffer, cancellation))).await;
         let result = if elapsed && (result.is_ok() || result.as_ref().is_err_and(Error::is_canceled)) {
-            Err(Error::new(crate::ErrorKind::Timeout, "HTTP receive deadline exceeded"))
+            Err(Error::new(ErrorKind::Timeout, "HTTP receive deadline exceeded"))
         } else {
             result
         };
@@ -158,7 +158,7 @@ mod tests {
             assert!(read.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
             source.cancel();
             let (result, buffer) = read.await;
-            assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::Canceled);
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::Canceled);
             assert_eq!(buffer.bytes(), b"prefix");
         });
     }

@@ -19,7 +19,7 @@
 //!     R: karmaio::io::AsyncRead + 'static,
 //!     W: karmaio::io::AsyncWrite + 'static,
 //! {
-//!     use vakya::{BodyExt, Empty, Request, client::conn::http1::Builder};
+//!     use vakya::{Request, body::{BodyExt, Empty}, client::conn::http1::Builder};
 //!     let tls = connector.connect("example.com".try_into()?, tunnel).await?;
 //!     let (sender, connection) = Builder::new().handshake_tls::<_, Empty>(tls)?;
 //!     let driver = karmaio::runtime::spawn_local(connection.run());
@@ -33,6 +33,8 @@
 //! }
 //! ```
 
+#[cfg(any(feature = "client", feature = "server"))]
+use crate::error::{Error, ErrorKind};
 pub use karmaio::tls::rustls;
 
 /// The ALPN identifier used for HTTP/1.1 connections.
@@ -108,11 +110,11 @@ impl TlsInfo {
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub(crate) fn validate_alpn(protocol: Option<&[u8]>) -> Result<(), crate::Error> {
+pub(crate) fn validate_alpn(protocol: Option<&[u8]>) -> Result<(), Error> {
     match protocol {
         None | Some(HTTP_11_ALPN) => Ok(()),
-        Some(_) => Err(crate::Error::new(
-            crate::ErrorKind::Unsupported,
+        Some(_) => Err(Error::new(
+            ErrorKind::Unsupported,
             "negotiated TLS protocol is not HTTP/1.1",
         )),
     }

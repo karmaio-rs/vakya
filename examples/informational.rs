@@ -1,9 +1,11 @@
 //! An application-owned server sends Early Hints before its final response.
 use bytes::Bytes;
 use vakya::{
-    Full, Incoming, Request, Response,
+    Request, Response,
+    body::{Full, Incoming},
+    error::Error,
     server::{RequestContext, conn::http1::Builder},
-    service_fn,
+    service::service_fn,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .body(())
                 .expect("valid Early Hints");
             context.send_informational(hints).await?;
-            Ok::<_, vakya::Error>(Response::new(Full::new(Bytes::from_static(
+            Ok::<_, Error>(Response::new(Full::new(Bytes::from_static(
                 b"Hello after Early Hints\n",
             ))))
         });

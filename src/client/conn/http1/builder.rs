@@ -1,8 +1,9 @@
 use super::{Connection, config::Config};
 use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
-    Body, Error, ErrorKind,
+    body::Body,
     client::{SendRequest, admission},
+    error::{Error, ErrorKind},
     io::transport::{Portable, Tcp},
     proto::h1::client,
 };

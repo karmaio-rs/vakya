@@ -16,11 +16,13 @@ use std::{
 };
 use support::transport::{Gate, ReadStep, Reader, Writer};
 use vakya::{
-    Empty, ErrorKind, Incoming, Request, Response,
+    Request, Response,
+    body::{Body, Empty, Frame, Incoming, SizeHint, TrailerHint},
     client::conn::http1::Builder as Client,
     connection::ConnectionOutcome,
+    error::{Error, ErrorKind},
     server::{RequestContext, conn::http1::Builder as Server},
-    service_fn,
+    service::service_fn,
 };
 struct ObservedWriter {
     writer: Writer,
@@ -174,10 +176,10 @@ fn graceful_deadline_escalates_while_service_waits() {
 #[test]
 fn write_progress_timeout_excludes_waiting_for_application_frames() {
     struct Waiting;
-    impl vakya::Body for Waiting {
+    impl Body for Waiting {
         type Data = Bytes;
         type Error = Infallible;
-        async fn next_frame(&mut self) -> Result<Option<vakya::Frame<Bytes>>, Infallible> {
+        async fn next_frame(&mut self) -> Result<Option<Frame<Bytes>>, Infallible> {
             std::future::pending().await
         }
     }
@@ -237,7 +239,7 @@ fn tcp_head_and_demanded_body_timeouts_cancel_real_reads() {
                         assert!(body);
                         // No demand means no peer-progress clock is running.
                         karmaio::time::sleep(Duration::from_millis(6)).await;
-                        let error = vakya::Body::next_frame(response.body_mut()).await.unwrap_err();
+                        let error = Body::next_frame(response.body_mut()).await.unwrap_err();
                         assert_eq!(error.kind(), ErrorKind::Timeout);
                     }
                     Err(error) => {
@@ -305,17 +307,17 @@ fn write_timeout_recovers_payload_before_recycling() {
         data: Option<Bytes>,
         recycled: Rc<Cell<usize>>,
     }
-    impl vakya::Body for One {
+    impl Body for One {
         type Data = Bytes;
         type Error = Infallible;
-        async fn next_frame(&mut self) -> Result<Option<vakya::Frame<Bytes>>, Infallible> {
-            Ok(self.data.take().map(vakya::Frame::data))
+        async fn next_frame(&mut self) -> Result<Option<Frame<Bytes>>, Infallible> {
+            Ok(self.data.take().map(Frame::data))
         }
-        fn size_hint(&self) -> vakya::SizeHint {
-            vakya::SizeHint::with_exact(1)
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(1)
         }
-        fn trailer_hint(&self) -> vakya::TrailerHint {
-            vakya::TrailerHint::None
+        fn trailer_hint(&self) -> TrailerHint {
+            TrailerHint::None
         }
         fn recycle(&mut self, _: Bytes) {
             self.recycled.set(self.recycled.get() + 1);
@@ -626,22 +628,22 @@ fn both_roles_flush_heads_and_streamed_data_before_production_finishes() {
         produce: Gate,
         sent: bool,
     }
-    impl vakya::Body for Waiting {
+    impl Body for Waiting {
         type Data = Bytes;
         type Error = Infallible;
-        async fn next_frame(&mut self) -> Result<Option<vakya::Frame<Bytes>>, Infallible> {
+        async fn next_frame(&mut self) -> Result<Option<Frame<Bytes>>, Infallible> {
             if self.sent {
                 return std::future::pending().await;
             }
             self.produce.wait().await;
             self.sent = true;
-            Ok(Some(vakya::Frame::data(Bytes::from_static(b"payload"))))
+            Ok(Some(Frame::data(Bytes::from_static(b"payload"))))
         }
-        fn size_hint(&self) -> vakya::SizeHint {
-            vakya::SizeHint::with_exact(if self.sent { 0 } else { 7 })
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(if self.sent { 0 } else { 7 })
         }
-        fn trailer_hint(&self) -> vakya::TrailerHint {
-            vakya::TrailerHint::None
+        fn trailer_hint(&self) -> TrailerHint {
+            TrailerHint::None
         }
     }
     async fn observe<F>(
@@ -650,7 +652,7 @@ fn both_roles_flush_heads_and_streamed_data_before_production_finishes() {
         visible: Rc<RefCell<Vec<u8>>>,
         produce: Gate,
     ) where
-        F: Future<Output = Result<ConnectionOutcome<Reader, Buffered>, vakya::Error>>,
+        F: Future<Output = Result<ConnectionOutcome<Reader, Buffered>, Error>>,
     {
         let mut run = pin!(run);
         assert!(poll(run.as_mut()).is_pending());

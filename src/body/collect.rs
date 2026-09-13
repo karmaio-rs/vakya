@@ -28,7 +28,7 @@ use std::{collections::TryReserveError, error::Error as StdError, fmt};
 /// without losing data. No yielded frame is held across an await.
 ///
 /// ```
-/// use vakya::{Full, collect};
+/// use vakya::body::{Full, collect};
 ///
 /// async fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     let mut body = Full::new(b"hello".to_vec());
@@ -225,7 +225,7 @@ impl<E> From<AggregateError> for CollectError<E> {
 #[cfg(test)]
 mod tests {
     use super::{AggregateError, CollectError, checked_total, collect, reserve_for_append};
-    use crate::{Body, Frame, SizeHint, TrailerHint};
+    use crate::body::{Body, Frame, SizeHint, TrailerHint};
     use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
     use karmaio::buf::IoBuf;
     use std::{cell::Cell, collections::VecDeque, rc::Rc};

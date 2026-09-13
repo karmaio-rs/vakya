@@ -1,4 +1,5 @@
 use super::{decode::DecodeLimits, encode::EncodeLimits, head::HeadLimits};
+use crate::error::{Error, ErrorKind};
 
 /// Protocol budgets shared by the client and server drivers.
 #[derive(Clone, Copy, Debug)]
@@ -21,18 +22,15 @@ impl Default for Config {
 }
 
 impl Config {
-    pub(crate) fn head_limits(&mut self, bytes: usize, headers: usize) -> Result<(), crate::Error> {
+    pub(crate) fn head_limits(&mut self, bytes: usize, headers: usize) -> Result<(), Error> {
         self.incoming_head_limits(bytes, headers)?;
         self.encode.max_head_bytes = bytes;
         Ok(())
     }
 
-    pub(crate) fn incoming_head_limits(&mut self, bytes: usize, headers: usize) -> Result<(), crate::Error> {
+    pub(crate) fn incoming_head_limits(&mut self, bytes: usize, headers: usize) -> Result<(), Error> {
         if bytes == 0 || headers == 0 {
-            return Err(crate::Error::new(
-                crate::ErrorKind::LocalMessage,
-                "head limits must be nonzero",
-            ));
+            return Err(Error::new(ErrorKind::LocalMessage, "head limits must be nonzero"));
         }
         self.head = HeadLimits::new(bytes, headers);
         Ok(())
@@ -43,7 +41,7 @@ impl Config {
         chunk_line: usize,
         trailer_bytes: usize,
         trailers: usize,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<(), Error> {
         self.incoming_body_limits(chunk_line, trailer_bytes, trailers)?;
         self.encode.max_trailer_bytes = trailer_bytes;
         Ok(())
@@ -54,35 +52,32 @@ impl Config {
         chunk_line: usize,
         trailer_bytes: usize,
         trailers: usize,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<(), Error> {
         if chunk_line == 0 || trailer_bytes == 0 || trailers == 0 {
-            return Err(crate::Error::new(
-                crate::ErrorKind::LocalMessage,
+            return Err(Error::new(
+                ErrorKind::LocalMessage,
                 "body framing limits must be nonzero",
             ));
         }
         self.decode = DecodeLimits::new(chunk_line, trailer_bytes, trailers);
         Ok(())
     }
-    pub(crate) fn outgoing_head_limit(&mut self, bytes: usize) -> Result<(), crate::Error> {
+    pub(crate) fn outgoing_head_limit(&mut self, bytes: usize) -> Result<(), Error> {
         nonzero(bytes)?;
         self.encode.max_head_bytes = bytes;
         Ok(())
     }
 
-    pub(crate) fn outgoing_trailer_limit(&mut self, bytes: usize) -> Result<(), crate::Error> {
+    pub(crate) fn outgoing_trailer_limit(&mut self, bytes: usize) -> Result<(), Error> {
         nonzero(bytes)?;
         self.encode.max_trailer_bytes = bytes;
         Ok(())
     }
 }
 
-fn nonzero(bytes: usize) -> Result<(), crate::Error> {
+fn nonzero(bytes: usize) -> Result<(), Error> {
     if bytes == 0 {
-        return Err(crate::Error::new(
-            crate::ErrorKind::LocalMessage,
-            "output limit must be nonzero",
-        ));
+        return Err(Error::new(ErrorKind::LocalMessage, "output limit must be nonzero"));
     }
     Ok(())
 }

@@ -1,5 +1,8 @@
 //! Request-local coordination between a service and its connection driver.
-use crate::{Error, ErrorKind, Response};
+use crate::{
+    Response,
+    error::{Error, ErrorKind},
+};
 use std::{
     cell::{Cell, RefCell},
     future::poll_fn,

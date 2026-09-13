@@ -1,5 +1,5 @@
 use super::{Body, Frame, SizeHint, TrailerHint, frame::Kind, pipe};
-use crate::{Error, ErrorKind};
+use crate::error::{Error, ErrorKind};
 use bytes::Bytes;
 use karmaio::buf::IoBuf;
 #[cfg(target_os = "linux")]
@@ -202,7 +202,7 @@ impl fmt::Debug for Incoming {
 ///
 /// The private storage may be backed by ordinary [`Bytes`] or a Karmaio-managed receive buffer.
 /// Moving or dropping the value preserves or releases that storage correctly;
-/// callers do not return received data through [`crate::Body::recycle`].
+/// callers do not return received data through [`crate::body::Body::recycle`].
 /// Clones and slices share storage without copying.
 /// Data remains valid after its body, connection, or runtime is dropped.
 /// This type is local to the Karmaio execution context and is not `Send` or `Sync`.

@@ -31,7 +31,7 @@ pub trait Service<R> {
 ///
 /// ```
 /// use std::{cell::Cell, convert::Infallible, rc::Rc};
-/// use vakya::{Service, service_fn};
+/// use vakya::service::{Service, service_fn};
 ///
 /// async fn example() {
 ///     let calls = Cell::new(0);

@@ -7,7 +7,8 @@ use super::{
     head::{HeadParser, ResponseRole},
 };
 use crate::{
-    Body, Error, ErrorKind, Response,
+    Response,
+    body::Body,
     body::pipe::Producer,
     client::{
         admission::{Job, Receiver},
@@ -15,6 +16,7 @@ use crate::{
         response::{Control, ResponseEvent},
     },
     connection::ConnectionOutcome,
+    error::{Error, ErrorKind},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},

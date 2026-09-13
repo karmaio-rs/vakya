@@ -1,8 +1,9 @@
 //! Forward the owned request body after the service call has finished.
 use vakya::{
-    Incoming, Request, Response,
+    Request, Response,
+    body::Incoming,
     server::{RequestContext, conn::http1::Builder},
-    service_fn,
+    service::service_fn,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

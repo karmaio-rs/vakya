@@ -17,10 +17,12 @@ use std::{
 };
 use support::transport::{Gate, ReadStep, Reader, Writer};
 use vakya::{
-    Body, BodyExt, Empty, ErrorKind, Frame, Full, Incoming, Request, Response, SizeHint, TrailerHint,
+    Request, Response,
+    body::{Body, BodyExt, Either, Empty, Frame, Full, Incoming, SizeHint, TrailerHint},
     client::{ResponseEvent, conn::http1::Builder as Client},
+    error::ErrorKind,
     server::{RequestContext, conn::http1::Builder as Server},
-    service_fn,
+    service::service_fn,
 };
 struct ObservedWriter {
     writer: Writer,
@@ -375,10 +377,10 @@ fn supplied_tcp_continue_supports_demand_before_and_after_service_return() {
                         if consume_first {
                             let body = request.body_mut().collect(16).await.unwrap();
                             assert_eq!(body.bytes().as_ref(), b"upload");
-                            Ok::<_, Infallible>(Response::new(vakya::Either::Left(Full::new(body.into_parts().0))))
+                            Ok::<_, Infallible>(Response::new(Either::Left(Full::new(body.into_parts().0))))
                         } else {
                             drop(context);
-                            Ok(Response::new(vakya::Either::Right(request.into_body())))
+                            Ok(Response::new(Either::Right(request.into_body())))
                         }
                     },
                 );

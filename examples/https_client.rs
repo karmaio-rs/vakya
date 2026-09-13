@@ -5,7 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vakya::{
-    BodyExt, Empty, Request,
+    Request,
+    body::{BodyExt, Empty},
     client::conn::http1::Builder,
     tls::{HTTP_11_ALPN, rustls},
 };

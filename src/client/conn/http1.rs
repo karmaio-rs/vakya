@@ -2,8 +2,8 @@
 mod builder;
 pub(crate) mod config;
 use crate::{
-    Error,
     connection::{ConnectionControl, ConnectionOutcome},
+    error::Error,
 };
 pub use builder::Builder;
 use std::future::Future;

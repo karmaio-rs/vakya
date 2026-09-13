@@ -1,4 +1,4 @@
-use crate::{Error, ErrorKind};
+use crate::error::{Error, ErrorKind};
 
 /// Bounds on the number of payload bytes still to be produced.
 ///

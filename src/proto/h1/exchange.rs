@@ -3,6 +3,7 @@ use super::{
     head::{ResponseHead, ValidatedRequestHead, ValidatedResponseHead},
     upgrade_protocols_match,
 };
+use crate::error::{Error, ErrorKind};
 use http::{HeaderValue, Method, header::UPGRADE};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,10 +90,7 @@ impl Exchange {
 
     /// Validate a peer response in the context of its request. A final response
     /// does not settle or cancel the upload. Drivers own Expect permission.
-    pub(super) fn receive_head(
-        &mut self,
-        head: ResponseHead,
-    ) -> Result<(ValidatedResponseHead, HeadAction), crate::Error> {
+    pub(super) fn receive_head(&mut self, head: ResponseHead) -> Result<(ValidatedResponseHead, HeadAction), Error> {
         let result = self.accept_head(head);
         if result.is_err() {
             self.abort();
@@ -100,10 +98,10 @@ impl Exchange {
         result
     }
 
-    fn accept_head(&mut self, head: ResponseHead) -> Result<(ValidatedResponseHead, HeadAction), crate::Error> {
+    fn accept_head(&mut self, head: ResponseHead) -> Result<(ValidatedResponseHead, HeadAction), Error> {
         if self.failed || self.phase != ResponsePhase::AwaitingHead {
-            return Err(crate::Error::new(
-                crate::ErrorKind::InvalidMessage,
+            return Err(Error::new(
+                ErrorKind::InvalidMessage,
                 "response head after final response",
             ));
         }
@@ -113,8 +111,8 @@ impl Exchange {
                 || (upgrade == UpgradeKind::Protocol
                     && !upgrade_protocols_match(&self.offered_protocols, &head.head.headers))
             {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::Upgrade,
+                return Err(Error::new(
+                    ErrorKind::Upgrade,
                     "response did not match the requested upgrade",
                 ));
             }
@@ -123,10 +121,7 @@ impl Exchange {
         }
         if head.head.status.is_informational() {
             if self.informational == self.max_informational {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::Limit,
-                    "too many informational responses",
-                ));
+                return Err(Error::new(ErrorKind::Limit, "too many informational responses"));
             }
             self.informational += 1;
             return Ok((head, HeadAction::Informational));
@@ -140,12 +135,9 @@ impl Exchange {
 
     /// Record a validated final head committed by the server writer. Upload
     /// completion remains independent and is acknowledged through `settle`.
-    pub(super) fn sent_final(&mut self, persistence: Persistence) -> Result<(), crate::Error> {
+    pub(super) fn sent_final(&mut self, persistence: Persistence) -> Result<(), Error> {
         if self.failed || self.phase != ResponsePhase::AwaitingHead {
-            return Err(crate::Error::new(
-                crate::ErrorKind::Internal,
-                "invalid final response transition",
-            ));
+            return Err(Error::new(ErrorKind::Internal, "invalid final response transition"));
         }
         self.phase = ResponsePhase::Final;
         if persistence == Persistence::Close {
@@ -155,7 +147,7 @@ impl Exchange {
     }
 
     /// Validate the server's chosen transition before committing any bytes.
-    pub(super) fn sent_response(&mut self, head: &ValidatedResponseHead) -> Result<(), crate::Error> {
+    pub(super) fn sent_response(&mut self, head: &ValidatedResponseHead) -> Result<(), Error> {
         if let Some(upgrade) = head.upgrade {
             if self.failed
                 || self.phase != ResponsePhase::AwaitingHead
@@ -163,8 +155,8 @@ impl Exchange {
                 || (upgrade == UpgradeKind::Protocol
                     && !upgrade_protocols_match(&self.offered_protocols, &head.head.headers))
             {
-                return Err(crate::Error::new(
-                    crate::ErrorKind::Upgrade,
+                return Err(Error::new(
+                    ErrorKind::Upgrade,
                     "response did not match the requested upgrade",
                 ));
             }
@@ -193,7 +185,7 @@ impl Exchange {
 
     /// Acknowledge actual direction completion, including any pending operation.
     /// `clean` requires a complete body and successful terminal producer checks.
-    pub(super) fn settle(&mut self, direction: Direction, clean: bool) -> Result<(), crate::Error> {
+    pub(super) fn settle(&mut self, direction: Direction, clean: bool) -> Result<(), Error> {
         let progress = match direction {
             Direction::Request => &mut self.request,
             Direction::Response => &mut self.response,
@@ -202,8 +194,8 @@ impl Exchange {
             || (direction == Direction::Response && clean && self.phase == ResponsePhase::AwaitingHead)
         {
             self.abort();
-            return Err(crate::Error::new(
-                crate::ErrorKind::Internal,
+            return Err(Error::new(
+                ErrorKind::Internal,
                 "invalid exchange completion transition",
             ));
         }
@@ -309,7 +301,7 @@ mod tests {
         }
         assert_eq!(
             state.receive_head(response(early)).unwrap_err().kind(),
-            crate::ErrorKind::Limit
+            ErrorKind::Limit
         );
 
         let mut state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
@@ -318,7 +310,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state.receive_head(response(early)).unwrap_err().kind(),
-            crate::ErrorKind::InvalidMessage
+            ErrorKind::InvalidMessage
         );
     }
 
@@ -358,7 +350,7 @@ mod tests {
                     ))
                     .unwrap_err()
                     .kind(),
-                crate::ErrorKind::Upgrade
+                ErrorKind::Upgrade
             );
         }
     }

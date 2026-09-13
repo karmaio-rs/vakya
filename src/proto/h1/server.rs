@@ -7,8 +7,9 @@ use super::{
     head::{HeadParser, RequestRole, ValidatedRequestHead},
 };
 use crate::{
-    Body, Error, ErrorKind, Incoming, Service,
+    body::{Body, Incoming, SizeHint, TrailerHint},
     connection::ConnectionOutcome,
+    error::{Error, ErrorKind},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -19,6 +20,7 @@ use crate::{
         conn::http1::config::Config as ServerConfig,
         context::{self, Command, InformationalReceiver, RequestContext},
     },
+    service::Service,
     upgrade::Upgraded,
 };
 use http::{
@@ -449,8 +451,8 @@ async fn write_informationals<W: AsyncWrite>(
                 parts.version,
                 parts.headers,
                 BodyMetadata {
-                    size: crate::SizeHint::with_exact(0),
-                    trailers: crate::TrailerHint::None,
+                    size: SizeHint::with_exact(0),
+                    trailers: TrailerHint::None,
                 },
                 &Method::GET,
                 config.protocol.encode,

@@ -1,4 +1,4 @@
-use crate::{Error, ErrorKind};
+use crate::error::{Error, ErrorKind};
 use karmaio::{
     buf::{IoBuf, PooledBuf},
     io::AsyncReadManaged,
@@ -38,7 +38,7 @@ fn map_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{map_error, read};
-    use crate::ErrorKind;
+    use crate::error::ErrorKind;
     use karmaio::{
         net::tcp::TcpListener,
         runtime::{CancellationSource, spawn_local},

@@ -1,5 +1,6 @@
 use super::syntax::{is_tchar, quoted_string_len, trim_ows};
 use super::{BodyMode, Expectation, Persistence, TargetForm, UpgradeKind};
+use crate::error::{Error, ErrorKind};
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version,
@@ -58,12 +59,12 @@ impl std::fmt::Display for HeadError {
 
 impl std::error::Error for HeadError {}
 
-impl From<HeadError> for crate::Error {
+impl From<HeadError> for Error {
     fn from(error: HeadError) -> Self {
         let kind = match error {
-            HeadError::Limit(_) => crate::ErrorKind::Limit,
-            HeadError::UnsupportedVersion | HeadError::UnsupportedTransferCoding => crate::ErrorKind::Unsupported,
-            _ => crate::ErrorKind::InvalidMessage,
+            HeadError::Limit(_) => ErrorKind::Limit,
+            HeadError::UnsupportedVersion | HeadError::UnsupportedTransferCoding => ErrorKind::Unsupported,
+            _ => ErrorKind::InvalidMessage,
         };
         Self::with_source(kind, "received HTTP head failed validation", error)
     }
@@ -816,6 +817,7 @@ fn is_token(value: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{HeadError, HeadLimit, HeadLimits, HeadParser, RequestHead, RequestRole, ResponseHead, ResponseRole};
+    use crate::error::{Error, ErrorKind};
     use crate::proto::h1::{BodyMode, Expectation, Persistence, TargetForm, UpgradeKind};
     use bytes::Bytes;
     use http::{Method, StatusCode, Version, header::HOST};
@@ -1012,8 +1014,8 @@ mod tests {
 
     #[test]
     fn public_error_preserves_head_category_and_source() {
-        let error: crate::Error = HeadError::Limit(HeadLimit::Headers).into();
-        assert_eq!(error.kind(), crate::ErrorKind::Limit);
+        let error: Error = HeadError::Limit(HeadLimit::Headers).into();
+        assert_eq!(error.kind(), ErrorKind::Limit);
         assert!(std::error::Error::source(&error).is_some_and(|source| source.is::<HeadError>()));
     }
 

@@ -1,4 +1,5 @@
 //! Controls and outcomes of a caller-driven HTTP connection.
+use crate::error::{Error, ErrorKind};
 use crate::upgrade::Upgraded;
 use std::fmt;
 
@@ -113,7 +114,7 @@ impl ConnectionControl {
         .await
     }
 
-    async fn abort_requested(&self) -> crate::ErrorKind {
+    async fn abort_requested(&self) -> ErrorKind {
         use std::{future::poll_fn, task::Poll};
         loop {
             let deadline = poll_fn(|cx| {
@@ -129,7 +130,7 @@ impl ConnectionControl {
             .await;
 
             let Some(deadline) = deadline else {
-                return crate::ErrorKind::Canceled;
+                return ErrorKind::Canceled;
             };
 
             let mut timer = std::pin::pin!(karmaio::time::sleep_until(deadline));
@@ -145,7 +146,7 @@ impl ConnectionControl {
             .await;
 
             if !changed {
-                return crate::ErrorKind::Timeout;
+                return ErrorKind::Timeout;
             }
         }
     }
@@ -161,9 +162,9 @@ impl ConnectionControl {
         &self,
         source: &karmaio::runtime::CancellationSource,
         future: std::pin::Pin<&mut F>,
-    ) -> Result<T, crate::Error>
+    ) -> Result<T, Error>
     where
-        F: std::future::Future<Output = Result<T, crate::Error>>,
+        F: std::future::Future<Output = Result<T, Error>>,
     {
         use crate::future::{Race, race};
         struct Guard<'a>(&'a ConnectionControl);
@@ -190,7 +191,7 @@ impl ConnectionControl {
                 let result = future.await;
                 match result {
                     Err(error) if !error.is_canceled() => Err(error),
-                    _ => Err(crate::Error::new(kind, "connection shutdown requested")),
+                    _ => Err(Error::new(kind, "connection shutdown requested")),
                 }
             }
         };

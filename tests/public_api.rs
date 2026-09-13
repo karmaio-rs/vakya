@@ -1,6 +1,9 @@
 use karmaio::io::Stream;
 use std::{cell::Cell, collections::VecDeque, rc::Rc};
-use vakya::{Body, BodyExt, Frame, Full, HeaderMap, HeaderValue, SizeHint, StreamBody, TrailerHint};
+use vakya::{
+    HeaderMap, HeaderValue,
+    body::{Body, BodyExt, CollectError, Frame, Full, SizeHint, StreamBody, TrailerHint},
+};
 
 struct Frames(VecDeque<Result<Frame<Vec<u8>>, &'static str>>);
 impl Stream for Frames {
@@ -87,7 +90,7 @@ fn attached_trailers_preserve_duplicate_values_in_a_single_frame() {
 #[test]
 fn pending_trailers_prevent_early_termination_and_do_not_hide_source_errors() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let mut body = vakya::Empty::new().with_trailers(HeaderMap::new());
+        let mut body = vakya::body::Empty::new().with_trailers(HeaderMap::new());
         assert_eq!(body.size_hint().exact(), Some(0));
         assert_eq!(body.trailer_hint(), TrailerHint::MayHave);
         assert!(!body.is_end_stream());
@@ -100,10 +103,7 @@ fn pending_trailers_prevent_early_termination_and_do_not_hide_source_errors() {
             VecDeque::from([Ok(Frame::trailers(HeaderMap::new())), Err("failed")]),
         ] {
             let body = StreamBody::new(Frames(frames)).with_trailers(HeaderMap::new());
-            assert!(matches!(
-                body.collect(0).await,
-                Err(vakya::CollectError::Body("failed"))
-            ));
+            assert!(matches!(body.collect(0).await, Err(CollectError::Body("failed"))));
         }
     });
 }

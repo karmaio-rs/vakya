@@ -16,7 +16,10 @@ use std::{
 };
 use support::transport::{Gate, ReadStep, Reader, Writer};
 use vakya::{
-    Body, BodyExt, Empty, ErrorKind, Frame, Full, Request, SizeHint, TrailerHint, client::conn::http1::Builder,
+    HeaderMap, Request, Response,
+    body::{Body, BodyExt, Empty, Frame, Full, SizeHint, TrailerHint},
+    client::conn::http1::Builder,
+    error::ErrorKind,
 };
 struct ObservedWriter {
     writer: Writer,
@@ -467,10 +470,10 @@ fn supplied_tcp_duplex_echo_keeps_upload_alive_after_final_response() {
             .await;
             let client = connected.unwrap();
             let (server, _) = accepted.unwrap();
-            let service = vakya::service_fn(
-                async |(request, context): (Request<vakya::Incoming>, vakya::server::RequestContext)| {
+            let service = vakya::service::service_fn(
+                async |(request, context): (Request<vakya::body::Incoming>, vakya::server::RequestContext)| {
                     drop(context);
-                    Ok::<_, Infallible>(vakya::Response::new(request.into_body()))
+                    Ok::<_, Infallible>(Response::new(request.into_body()))
                 },
             );
             let server = vakya::server::conn::http1::Builder::new().serve_tcp(server, service);
@@ -479,7 +482,7 @@ fn supplied_tcp_duplex_echo_keeps_upload_alive_after_final_response() {
             let recycled = Cell::new(0);
             let (sender, driver) = Builder::new().handshake_tcp(client);
             let application = async {
-                let mut trailers = vakya::HeaderMap::new();
+                let mut trailers = HeaderMap::new();
                 trailers.insert("x-upload", "complete".parse().unwrap());
                 let mut request = request(
                     Delayed {

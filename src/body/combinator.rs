@@ -393,6 +393,7 @@ impl<B: Body> Body for WithTrailers<B> {
 #[cfg(test)]
 mod tests {
     use super::{Body, Either, Frame, MapError, SizeHint};
+    use crate::body::{Empty, Full};
     use karmaio::buf::IoBuf;
     use std::{
         cell::Cell,
@@ -490,7 +491,7 @@ mod tests {
     #[test]
     fn either_supports_different_buffer_and_error_types() {
         let recycled = Rc::new(Cell::new(0));
-        let mut left: Either<TestBody, crate::Full<bytes::Bytes>> =
+        let mut left: Either<TestBody, Full<bytes::Bytes>> =
             Either::Left(TestBody::data(b"left", Rc::clone(&recycled)));
         let data = complete(left.next_frame())
             .unwrap()
@@ -500,8 +501,8 @@ mod tests {
         assert_eq!(data.as_init(), b"left");
         left.recycle(data);
         assert_eq!(recycled.get(), 1);
-        let mut right: Either<TestBody, crate::Full<bytes::Bytes>> =
-            Either::Right(crate::Full::new(bytes::Bytes::from_static(b"right")));
+        let mut right: Either<TestBody, Full<bytes::Bytes>> =
+            Either::Right(Full::new(bytes::Bytes::from_static(b"right")));
         let data = complete(right.next_frame())
             .unwrap()
             .expect("missing frame")
@@ -509,7 +510,7 @@ mod tests {
             .expect("missing data");
         assert_eq!(data.as_init(), b"right");
         right.recycle(data);
-        let mut failed: Either<TestBody, crate::Empty> = Either::Left(TestBody::error("failure"));
+        let mut failed: Either<TestBody, Empty> = Either::Left(TestBody::error("failure"));
         assert!(matches!(complete(failed.next_frame()), Err(Either::Left("failure"))));
     }
 
@@ -573,7 +574,7 @@ mod tests {
 
     #[test]
     fn composition_preserves_metadata_and_empty_data_is_not_end_of_stream() {
-        use crate::{Empty, Full, TrailerHint};
+        use crate::body::{Empty, Full, TrailerHint};
 
         let body: Either<Full<Vec<u8>>, Empty> = Either::Left(Full::new(Vec::new()));
         let mut mapped = MapError::new(body, |error| error);

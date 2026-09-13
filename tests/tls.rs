@@ -19,11 +19,13 @@ use std::{
 };
 use support::transport::Gate;
 use vakya::{
-    Body, BodyExt, Empty, ErrorKind, Frame, Incoming, Request, Response, SizeHint, TrailerHint,
+    Request, Response,
+    body::{Body, BodyExt, Empty, Frame, Incoming, SizeHint, TrailerHint},
     client::{ResponseEvent, conn::http1::Builder as Client},
     connection::ConnectionOutcome,
+    error::ErrorKind,
     server::{RequestContext, conn::http1::Builder as Server},
-    service_fn,
+    service::service_fn,
     tls::{HTTP_11_ALPN, TlsInfo, rustls},
 };
 
@@ -192,7 +194,7 @@ fn metadata(info: &TlsInfo, alpn: Option<&[u8]>, server: bool) {
     assert_eq!(info.server_name(), server.then_some("localhost"));
 }
 
-fn assert_closed<R, W>(result: Result<ConnectionOutcome<R, W>, vakya::Error>, role: &str, alpn: Option<&[u8]>) {
+fn assert_closed<R, W>(result: Result<ConnectionOutcome<R, W>, vakya::error::Error>, role: &str, alpn: Option<&[u8]>) {
     match result {
         Ok(ConnectionOutcome::Closed) => {}
         Ok(ConnectionOutcome::Upgraded(_)) => panic!("{role}, ALPN {alpn:?}: unexpected upgrade"),
@@ -506,7 +508,7 @@ fn connect_tunnel_supports_tls_and_a_nested_http_connection() {
                     assert_eq!(request.uri(), "/nested");
                     assert!(request.extensions().get::<TlsInfo>().is_some());
                     context.close_connection();
-                    Ok::<_, Infallible>(Response::new(vakya::Full::new(Bytes::from_static(
+                    Ok::<_, Infallible>(Response::new(vakya::body::Full::new(Bytes::from_static(
                         b"through the tunnel",
                     ))))
                 }),

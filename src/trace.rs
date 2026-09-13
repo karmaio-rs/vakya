@@ -1,4 +1,5 @@
 //! Optional structured observations. Never hold a span guard across an await.
+use crate::error::ErrorKind;
 use std::future::Future;
 
 #[derive(Clone, Debug)]
@@ -65,7 +66,7 @@ impl Scope {
     }
 
     #[inline]
-    pub(crate) fn failure(&self, kind: crate::ErrorKind) {
+    pub(crate) fn failure(&self, kind: ErrorKind) {
         #[cfg(feature = "tracing")]
         tracing::debug!(target: "vakya::connection", parent: &self.span, ?kind, "HTTP connection failed");
         #[cfg(not(feature = "tracing"))]
@@ -211,7 +212,7 @@ mod tests {
             second.open();
             assert!(b.as_mut().poll(&mut cx).is_ready());
             client.lifecycle("graceful shutdown requested");
-            server.failure(crate::ErrorKind::Io);
+            server.failure(ErrorKind::Io);
             assert!(log.lock().unwrap().active.is_empty());
         });
         let log = log.lock().unwrap();

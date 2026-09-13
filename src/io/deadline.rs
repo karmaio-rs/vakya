@@ -1,5 +1,8 @@
 //! Deadline scopes retain submitted operations until their buffers return.
-use crate::future::{Race, race};
+use crate::{
+    error::{Error, ErrorKind},
+    future::{Race, race},
+};
 use karmaio::{
     buf::{BufResult, IoBuf, IoVectoredBuf},
     io::AsyncWrite,
@@ -47,9 +50,8 @@ pub(crate) fn after(timeout: Option<Duration>) -> io::Result<Option<Instant>> {
 
 /// Validate local configuration without converting overflow into no deadline.
 #[allow(dead_code)]
-pub(crate) fn configured_after(timeout: Option<Duration>) -> Result<Option<Instant>, crate::Error> {
-    after(timeout)
-        .map_err(|error| crate::Error::with_source(crate::ErrorKind::LocalMessage, "invalid timeout duration", error))
+pub(crate) fn configured_after(timeout: Option<Duration>) -> Result<Option<Instant>, Error> {
+    after(timeout).map_err(|error| Error::with_source(ErrorKind::LocalMessage, "invalid timeout duration", error))
 }
 
 #[allow(dead_code)]
@@ -118,7 +120,7 @@ mod tests {
         );
         assert_eq!(
             configured_after(Some(Duration::MAX)).unwrap_err().kind(),
-            crate::ErrorKind::LocalMessage
+            ErrorKind::LocalMessage
         );
     }
 

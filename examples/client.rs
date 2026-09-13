@@ -1,6 +1,7 @@
 //! The application establishes transport and supervises its HTTP driver.
 use vakya::{
-    BodyExt, Empty, Request,
+    Request,
+    body::{BodyExt, Empty},
     client::{ResponseEvent, conn::http1::Builder},
 };
 

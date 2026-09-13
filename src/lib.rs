@@ -18,7 +18,7 @@
 //! spawn a driver, establish TLS, resolve names, pool connections, or retry
 //! accepted requests. See the `client` and `server` modules for role entry points.
 //!
-//! [`Body`] uses native async methods and Karmaio-owned buffers. [`Incoming`]
+//! [`body::Body`] uses native async methods and Karmaio-owned buffers. [`body::Incoming`]
 //! applies bounded demand; dropping it abandons unfinished receiving. Explicit
 //! shutdown and timeout paths settle retained I/O. Dropping a driver preserves
 //! runtime buffer safety without promising graceful flush or recycling callbacks.
@@ -38,13 +38,8 @@ mod future;
 #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 mod trace;
 
-pub use body::{
-    Body, BodyDataStream, BodyExt, BodyStream, BoxBody, CollectError, Collected, Either, Empty, Frame, Full, Incoming,
-    IncomingData, InspectFrame, MapError, MapFrame, SizeHint, StreamBody, TrailerHint, WithTrailers, collect,
-};
-pub use error::{Error, ErrorKind};
+#[doc(no_inline)]
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
-pub use service::{Service, service_fn};
 
 #[cfg(feature = "http1")]
 mod proto;

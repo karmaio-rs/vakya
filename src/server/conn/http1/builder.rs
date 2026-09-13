@@ -1,10 +1,12 @@
 use super::{Connection, config::Config};
 use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
-    Body, Error, ErrorKind, Incoming, Service,
+    body::{Body, Incoming},
+    error::{Error, ErrorKind},
     io::transport::{Portable, Tcp},
     proto::h1::server,
     server::RequestContext,
+    service::Service,
 };
 use http::{Request, Response};
 use karmaio::{io::IntoOwnedSplit, net::tcp::TcpStream};
@@ -193,7 +195,8 @@ impl Builder {
     ///
     /// ```
     /// use karmaio::io::IntoOwnedSplit;
-    /// use vakya::{Empty, Error, Incoming, Request, Response, service_fn};
+    /// use vakya::{Request, Response};
+    /// use vakya::{body::{Empty, Incoming}, error::Error, service::service_fn};
     /// use vakya::server::{RequestContext, conn::http1::Builder};
     ///
     /// async fn serve<I: IntoOwnedSplit>(io: I) -> Result<(), Error> {

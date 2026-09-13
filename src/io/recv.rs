@@ -1,6 +1,9 @@
 #[cfg(target_os = "linux")]
 use crate::body::incoming::ManagedLeasePermit;
-use crate::{Error, ErrorKind, IncomingData};
+use crate::{
+    body::IncomingData,
+    error::{Error, ErrorKind},
+};
 use bytes::{Buf, Bytes, BytesMut};
 use karmaio::{
     buf::IoBufExt,
