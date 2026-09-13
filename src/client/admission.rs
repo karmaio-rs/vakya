@@ -1,3 +1,4 @@
+//! Bounded request admission and ownership transfer to a client connection.
 use super::response::{self, Control, PendingResponse, ResponseEvent};
 use crate::{Error, ErrorKind, Incoming, Request, Response, body::pipe::Producer};
 use std::{

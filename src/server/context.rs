@@ -1,3 +1,4 @@
+//! Request-local coordination between a service and its connection driver.
 use crate::{Error, ErrorKind, Response};
 use std::{
     cell::{Cell, RefCell},

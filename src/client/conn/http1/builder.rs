@@ -1,9 +1,8 @@
-use super::Connection;
+use super::{Connection, config::Config};
 use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
     Body, Error, ErrorKind,
-    client::SendRequest,
-    engine::client::dispatch,
+    client::{SendRequest, admission},
     io::transport::{Portable, Tcp},
     proto::h1::client,
 };
@@ -16,7 +15,7 @@ use std::future::Future;
 /// 16 KiB reads, chunk lines to 8 KiB, and trailers to 16 KiB/32 fields.
 #[derive(Clone, Debug, Default)]
 pub struct Builder {
-    config: crate::engine::config::ClientConfig,
+    config: Config,
 }
 
 impl Builder {
@@ -208,7 +207,7 @@ impl Builder {
         B::Error: std::error::Error + 'static,
     {
         let control = ConnectionControl::new("client");
-        let (sender, receiver) = dispatch::channel(control.clone());
+        let (sender, receiver) = admission::channel(control.clone());
         (
             sender,
             Connection {
@@ -293,7 +292,7 @@ impl Builder {
         B::Error: std::error::Error + 'static,
     {
         let control = ConnectionControl::new("client");
-        let (sender, receiver) = dispatch::channel(control.clone());
+        let (sender, receiver) = admission::channel(control.clone());
         (
             sender,
             Connection {

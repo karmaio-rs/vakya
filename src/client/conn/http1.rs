@@ -1,5 +1,6 @@
 //! HTTP/1 connections over independently progressing Karmaio I/O halves.
 mod builder;
+pub(crate) mod config;
 use crate::{
     Error,
     connection::{ConnectionControl, ConnectionOutcome},

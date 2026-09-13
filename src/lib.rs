@@ -34,9 +34,6 @@ pub mod service;
 
 mod future;
 
-#[cfg(any(feature = "client", feature = "server"))]
-mod engine;
-
 #[cfg(feature = "http1")]
 #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 mod trace;

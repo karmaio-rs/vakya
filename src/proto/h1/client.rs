@@ -9,14 +9,12 @@ use super::{
 use crate::{
     Body, Error, ErrorKind, Response,
     body::pipe::Producer,
-    connection::ConnectionOutcome,
-    engine::{
-        client::{
-            dispatch::{Job, Receiver},
-            response::{Control, ResponseEvent},
-        },
-        config::ClientConfig,
+    client::{
+        admission::{Job, Receiver},
+        conn::http1::config::Config as ClientConfig,
+        response::{Control, ResponseEvent},
     },
+    connection::ConnectionOutcome,
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},

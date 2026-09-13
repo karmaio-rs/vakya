@@ -1,3 +1,4 @@
+//! Response observation and upload control for accepted client requests.
 use crate::{
     Error, ErrorKind, Incoming, Response,
     body::pipe::{self, Consumer, Producer, TakeError},

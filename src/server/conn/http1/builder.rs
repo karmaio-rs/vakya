@@ -1,4 +1,4 @@
-use super::Connection;
+use super::{Connection, config::Config};
 use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
@@ -17,7 +17,7 @@ use std::future::Future;
 /// Missing Date headers are inserted where HTTP requires them.
 #[derive(Clone, Debug, Default)]
 pub struct Builder {
-    config: crate::engine::config::ServerConfig,
+    config: Config,
 }
 
 impl Builder {

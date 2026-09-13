@@ -9,15 +9,15 @@ use super::{
 use crate::{
     Body, Error, ErrorKind, Incoming, Service,
     connection::ConnectionOutcome,
-    engine::{
-        config::ServerConfig,
-        server::{self as context, Command, InformationalReceiver, RequestContext},
-    },
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
         send::write_all,
         transport::Receive,
+    },
+    server::{
+        conn::http1::config::Config as ServerConfig,
+        context::{self, Command, InformationalReceiver, RequestContext},
     },
     upgrade::Upgraded,
 };
