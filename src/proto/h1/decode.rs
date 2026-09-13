@@ -86,10 +86,10 @@ pub(super) enum DecodeOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChunkState {
-    Size,
+    Size { scanned: usize },
     Data { remaining: u64 },
     DataCrlf,
-    Trailers,
+    Trailers { scanned: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +119,7 @@ impl BodyDecoder {
         let state = match mode {
             BodyMode::None => DecoderState::Empty,
             BodyMode::Fixed(remaining) => DecoderState::Fixed { remaining },
-            BodyMode::Chunked => DecoderState::Chunked(ChunkState::Size),
+            BodyMode::Chunked => DecoderState::Chunked(ChunkState::Size { scanned: 0 }),
             BodyMode::UntilEof => DecoderState::UntilEof,
         };
         Self {
@@ -187,8 +187,8 @@ impl BodyDecoder {
         loop {
             let before = (state, cursor);
             match state {
-                ChunkState::Size => {
-                    let parsed = match parse_chunk_line(&input[cursor..], self.limits.max_chunk_line_bytes) {
+                ChunkState::Size { scanned } => {
+                    let (parsed, scanned) = match self.parse_chunk_line(&input[cursor..], scanned) {
                         Ok(parsed) => parsed,
                         Err(error) => return self.fail(error),
                     };
@@ -196,12 +196,12 @@ impl BodyDecoder {
                         if eof {
                             return self.fail(DecodeError::UnexpectedEof);
                         }
-                        self.state = DecoderState::Chunked(state);
+                        self.state = DecoderState::Chunked(ChunkState::Size { scanned });
                         return Ok(DecodeOutcome::NeedMore { consumed: cursor });
                     };
                     cursor += consumed;
                     state = if size == 0 {
-                        ChunkState::Trailers
+                        ChunkState::Trailers { scanned: 0 }
                     } else {
                         ChunkState::Data { remaining: size }
                     };
@@ -245,28 +245,75 @@ impl BodyDecoder {
                         return self.fail(DecodeError::InvalidChunkTerminator);
                     }
                     cursor += 2;
-                    state = ChunkState::Size;
+                    state = ChunkState::Size { scanned: 0 };
                 }
-                ChunkState::Trailers => return self.decode_trailers(input, cursor, eof),
+                ChunkState::Trailers { scanned } => return self.decode_trailers(input, cursor, eof, scanned),
             }
             debug_assert!(state != before.0 || cursor > before.1, "chunk decoder made no progress");
         }
     }
 
-    fn decode_trailers(&mut self, input: &[u8], cursor: usize, eof: bool) -> Result<DecodeOutcome, DecodeError> {
+    fn parse_chunk_line(
+        &mut self,
+        input: &[u8],
+        mut scanned: usize,
+    ) -> Result<(Option<(u64, usize)>, usize), DecodeError> {
+        if input.len() < scanned {
+            scanned = 0;
+        }
+        for index in scanned..input.len() {
+            let byte = input[index];
+            if byte == b'\n' {
+                if index == 0 || input[index - 1] != b'\r' {
+                    return Err(DecodeError::InvalidChunkSize);
+                }
+                let consumed = index + 1;
+                if consumed > self.limits.max_chunk_line_bytes {
+                    return Err(DecodeError::Limit(DecodeLimit::ChunkLineBytes));
+                }
+                return parse_chunk_line(&input[..index - 1]).map(|size| (Some((size, consumed)), 0));
+            }
+            if index > 0 && input[index - 1] == b'\r' {
+                return Err(DecodeError::InvalidChunkSize);
+            }
+        }
+        if input.len() > self.limits.max_chunk_line_bytes {
+            Err(DecodeError::Limit(DecodeLimit::ChunkLineBytes))
+        } else {
+            Ok((None, input.len()))
+        }
+    }
+
+    fn decode_trailers(
+        &mut self,
+        input: &[u8],
+        cursor: usize,
+        eof: bool,
+        scanned: usize,
+    ) -> Result<DecodeOutcome, DecodeError> {
         let available = &input[cursor..];
-        let parse_len = available.len().min(self.limits.max_trailer_bytes);
+        let (trailer_bytes, scanned) = match self.trailer_end(available, scanned) {
+            Ok(result) => result,
+            Err(error) => return self.fail(error),
+        };
+        let Some(trailer_bytes) = trailer_bytes else {
+            if eof {
+                return self.fail(DecodeError::UnexpectedEof);
+            }
+            self.state = DecoderState::Chunked(ChunkState::Trailers { scanned });
+            return Ok(DecodeOutcome::NeedMore { consumed: cursor });
+        };
         let parsed = {
             let workspace = self
                 .trailer_workspace
                 .get_or_insert_with(|| HeaderWorkspace::new(self.limits.max_trailers));
-            match httparse::parse_headers(&available[..parse_len], workspace.for_headers()) {
+            match httparse::parse_headers(&available[..trailer_bytes], workspace.for_headers()) {
                 Ok(httparse::Status::Complete((consumed, headers))) => match own_headers(headers) {
                     Ok(trailers) => validate_trailers(&trailers).map(|()| Some((consumed, trailers))),
                     Err(HeadError::Limit(_)) => Err(DecodeError::Limit(DecodeLimit::TrailerMap)),
                     Err(_) => Err(DecodeError::InvalidTrailer),
                 },
-                Ok(httparse::Status::Partial) => Ok(None),
+                Ok(httparse::Status::Partial) => Err(DecodeError::InvalidTrailer),
                 Err(httparse::Error::TooManyHeaders) => Err(DecodeError::Limit(DecodeLimit::Trailers)),
                 Err(_) => Err(DecodeError::InvalidTrailer),
             }
@@ -283,15 +330,32 @@ impl BodyDecoder {
                     consumed: cursor + trailer_bytes,
                 })
             }
-            Ok(None) if available.len() > self.limits.max_trailer_bytes => {
-                self.fail(DecodeError::Limit(DecodeLimit::TrailerBytes))
-            }
-            Ok(None) if eof => self.fail(DecodeError::UnexpectedEof),
-            Ok(None) => {
-                self.state = DecoderState::Chunked(ChunkState::Trailers);
-                Ok(DecodeOutcome::NeedMore { consumed: cursor })
-            }
+            Ok(None) => unreachable!("a complete trailer block must parse completely"),
             Err(error) => self.fail(error),
+        }
+    }
+
+    fn trailer_end(&self, input: &[u8], mut scanned: usize) -> Result<(Option<usize>, usize), DecodeError> {
+        if input.len() < scanned {
+            scanned = 0;
+        }
+        let bounded = input.len().min(self.limits.max_trailer_bytes);
+        for index in scanned.min(bounded)..bounded {
+            if input[index] != b'\n' {
+                continue;
+            }
+            let empty_line = index == 0
+                || (index == 1 && input[0] == b'\r')
+                || input[index - 1] == b'\n'
+                || (index >= 2 && input[index - 2] == b'\n' && input[index - 1] == b'\r');
+            if empty_line {
+                return Ok((Some(index + 1), 0));
+            }
+        }
+        if input.len() > self.limits.max_trailer_bytes {
+            Err(DecodeError::Limit(DecodeLimit::TrailerBytes))
+        } else {
+            Ok((None, bounded))
         }
     }
 
@@ -301,29 +365,7 @@ impl BodyDecoder {
     }
 }
 
-fn parse_chunk_line(input: &[u8], limit: usize) -> Result<Option<(u64, usize)>, DecodeError> {
-    let Some(end) = input.windows(2).position(|window| window == b"\r\n") else {
-        if input
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| *byte == b'\n' || (*byte == b'\r' && index + 1 != input.len()))
-        {
-            return Err(DecodeError::InvalidChunkSize);
-        }
-        return if input.len() > limit {
-            Err(DecodeError::Limit(DecodeLimit::ChunkLineBytes))
-        } else {
-            Ok(None)
-        };
-    };
-    let consumed = end + 2;
-    if consumed > limit {
-        return Err(DecodeError::Limit(DecodeLimit::ChunkLineBytes));
-    }
-    if input[..end].contains(&b'\r') || input[..end].contains(&b'\n') {
-        return Err(DecodeError::InvalidChunkSize);
-    }
-    let line = &input[..end];
+fn parse_chunk_line(line: &[u8]) -> Result<u64, DecodeError> {
     let extension = line.iter().position(|byte| *byte == b';').unwrap_or(line.len());
     let size_text = trim_end(&line[..extension]);
     if size_text.is_empty() || !size_text.iter().all(u8::is_ascii_hexdigit) {
@@ -335,7 +377,7 @@ fn parse_chunk_line(input: &[u8], limit: usize) -> Result<Option<(u64, usize)>, 
             .ok_or(DecodeError::InvalidChunkSize)
     })?;
     validate_extensions(&line[extension..])?;
-    Ok(Some((size, consumed)))
+    Ok(size)
 }
 
 fn validate_extensions(mut input: &[u8]) -> Result<(), DecodeError> {
@@ -497,6 +539,64 @@ mod tests {
             assert!(decoded.trailers.is_empty());
             assert_eq!(decoded.remaining, b"after");
         }
+    }
+
+    #[test]
+    fn fragmented_chunk_metadata_advances_incremental_scans() {
+        let mut decoder = BodyDecoder::new(BodyMode::Chunked);
+        let mut line = b"1;name=".to_vec();
+        line.extend(std::iter::repeat_n(b'a', 256));
+        line.push(b'\r');
+
+        let mut pending = Vec::new();
+        for byte in line {
+            pending.push(byte);
+            assert_eq!(
+                decoder.decode(&pending, false).unwrap(),
+                DecodeOutcome::NeedMore { consumed: 0 }
+            );
+            assert!(matches!(
+                decoder.state,
+                super::DecoderState::Chunked(super::ChunkState::Size { scanned })
+                    if scanned == pending.len()
+            ));
+        }
+        pending.push(b'\n');
+        assert_eq!(
+            decoder.decode(&pending, false).unwrap(),
+            DecodeOutcome::NeedMore {
+                consumed: pending.len()
+            }
+        );
+
+        let mut decoder = BodyDecoder::new(BodyMode::Chunked);
+        assert_eq!(
+            decoder.decode(b"0\r\n", false).unwrap(),
+            DecodeOutcome::NeedMore { consumed: 3 }
+        );
+        let mut trailer = b"X-Long: ".to_vec();
+        trailer.extend(std::iter::repeat_n(b'a', 256));
+        trailer.extend_from_slice(b"\r\n\r");
+        pending.clear();
+        for byte in trailer {
+            pending.push(byte);
+            assert_eq!(
+                decoder.decode(&pending, false).unwrap(),
+                DecodeOutcome::NeedMore { consumed: 0 }
+            );
+            assert!(matches!(
+                decoder.state,
+                super::DecoderState::Chunked(super::ChunkState::Trailers { scanned })
+                    if scanned == pending.len()
+            ));
+            assert!(decoder.trailer_workspace.is_none());
+        }
+        pending.push(b'\n');
+        assert!(matches!(
+            decoder.decode(&pending, false).unwrap(),
+            DecodeOutcome::Trailers { consumed, .. } if consumed == pending.len()
+        ));
+        assert!(decoder.trailer_workspace.is_some());
     }
 
     #[test]
