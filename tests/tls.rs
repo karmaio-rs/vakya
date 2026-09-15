@@ -198,6 +198,9 @@ fn assert_closed<R, W>(result: Result<ConnectionOutcome<R, W>, vakya::error::Err
     match result {
         Ok(ConnectionOutcome::Closed) => {}
         Ok(ConnectionOutcome::Upgraded(_)) => panic!("{role}, ALPN {alpn:?}: unexpected upgrade"),
+        Ok(ConnectionOutcome::UpgradeClaimed(_)) => {
+            panic!("{role}, ALPN {alpn:?}: unexpected claimed upgrade")
+        }
         Err(error) => {
             // Public error formatting deliberately hides external source details.
             // Include them explicitly here to diagnose platform-specific failures.

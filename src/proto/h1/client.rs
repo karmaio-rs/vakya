@@ -80,6 +80,12 @@ where
     let mut exchanges = crate::trace::Exchanges::default();
     while let Some(job) = requests.next().await {
         budget.step().await;
+        let Job {
+            request,
+            response,
+            control,
+            upgrade,
+        } = job;
         let span = exchanges.next();
         let (next, persistence) = span
             .instrument(exchange(
@@ -88,7 +94,9 @@ where
                 &mut strategy,
                 &mut parser,
                 buffer,
-                job,
+                request,
+                response,
+                control,
                 &config,
                 shutdown,
             ))
@@ -104,12 +112,11 @@ where
         match persistence {
             Outcome::Handoff(kind) => {
                 drop(requests);
-                return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
-                    reader,
-                    writer.inner,
-                    buffer.take_all(),
-                    kind,
-                )));
+                let upgraded = Upgraded::new(reader, writer.inner, buffer.take_all(), kind);
+                return Ok(match upgrade.fulfill(upgraded) {
+                    Ok(kind) => ConnectionOutcome::UpgradeClaimed(kind),
+                    Err(upgraded) => ConnectionOutcome::Upgraded(upgraded),
+                });
             }
             Outcome::Close => break,
             Outcome::Reusable => {
@@ -146,7 +153,9 @@ async fn exchange<R, W, B, T>(
     strategy: &mut T,
     parser: &mut HeadParser<ResponseRole>,
     buffer: RecvBuffer,
-    job: Job<B>,
+    request: crate::Request<B>,
+    response: Producer<ResponseEvent, Error>,
+    control: std::rc::Rc<Control>,
     config: &ClientConfig,
     shutdown: &karmaio::runtime::CancellationSource,
 ) -> Result<(RecvBuffer, Outcome), Error>
@@ -156,12 +165,6 @@ where
     B::Error: std::error::Error + 'static,
     T: Receive<R>,
 {
-    let Job {
-        request,
-        response,
-        control,
-    } = job;
-
     let mut response = Some(response);
 
     let work = exchange_inner(

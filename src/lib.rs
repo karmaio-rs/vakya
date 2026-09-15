@@ -64,6 +64,7 @@ pub mod client;
 pub mod connection;
 #[cfg(feature = "http1")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
+#[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
 pub mod upgrade;
 
 #[cfg(feature = "tls")]

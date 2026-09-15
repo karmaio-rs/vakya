@@ -1,6 +1,6 @@
 //! Controls and outcomes of a caller-driven HTTP connection.
 use crate::error::{Error, ErrorKind};
-use crate::upgrade::Upgraded;
+use crate::upgrade::{UpgradeKind, Upgraded};
 use std::fmt;
 
 /// Ownership returned after all retained HTTP operations have settled.
@@ -10,6 +10,8 @@ pub enum ConnectionOutcome<R, W> {
     Closed,
     /// HTTP transferred the transport and preserved unread protocol bytes.
     Upgraded(Upgraded<R, W>),
+    /// HTTP transferred the transport to a claimed [`crate::upgrade::OnUpgrade`].
+    UpgradeClaimed(UpgradeKind),
 }
 
 impl<R, W> fmt::Debug for ConnectionOutcome<R, W> {
@@ -17,6 +19,7 @@ impl<R, W> fmt::Debug for ConnectionOutcome<R, W> {
         match self {
             Self::Closed => f.write_str("Closed"),
             Self::Upgraded(io) => f.debug_tuple("Upgraded").field(io).finish(),
+            Self::UpgradeClaimed(kind) => f.debug_tuple("UpgradeClaimed").field(kind).finish(),
         }
     }
 }

@@ -30,7 +30,8 @@ impl<R, W, F: Future<Output = Result<ConnectionOutcome<R, W>, Error>>> Connectio
     /// response reads, until closure or error.
     ///
     /// A validated 101 or successful CONNECT returns settled transport halves
-    /// in `ConnectionOutcome::Upgraded`; ordinary closure returns `Closed`.
+    /// in `ConnectionOutcome::Upgraded`, or `UpgradeClaimed` when a correlated
+    /// [`crate::upgrade::OnUpgrade`] owns them. Ordinary closure returns `Closed`.
     ///
     /// # Errors
     /// Explicit abort reports `Canceled`; expired deadlines report `Timeout`.

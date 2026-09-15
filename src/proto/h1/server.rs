@@ -21,7 +21,7 @@ use crate::{
         context::{self, Command, InformationalReceiver, RequestContext},
     },
     service::Service,
-    upgrade::Upgraded,
+    upgrade::{self, PendingUpgrade, Upgraded},
 };
 use http::{
     HeaderValue, Method, Request, Response, Version,
@@ -163,8 +163,8 @@ where
             ))
             .await;
         buffer = returned;
-        if let Ok(outcome) = &result {
-            span.outcome(match outcome {
+        if let Ok(result) = &result {
+            span.outcome(match result.outcome {
                 Outcome::Handoff(_) => "handoff",
                 Outcome::Close => "close",
                 Outcome::Reusable => "reusable",
@@ -173,14 +173,14 @@ where
         } else if let Err(error) = &result {
             span.failure(error.kind());
         }
-        match result? {
+        let ExchangeResult { outcome, upgrade } = result?;
+        match outcome {
             Outcome::Handoff(kind) => {
-                return Ok(ConnectionOutcome::Upgraded(Upgraded::new(
-                    reader,
-                    writer.inner,
-                    buffer.take_all(),
-                    kind,
-                )));
+                let upgraded = Upgraded::new(reader, writer.inner, buffer.take_all(), kind);
+                return Ok(match upgrade.fulfill(upgraded) {
+                    Ok(kind) => ConnectionOutcome::UpgradeClaimed(kind),
+                    Err(upgraded) => ConnectionOutcome::Upgraded(upgraded),
+                });
             }
             Outcome::Close => break,
             Outcome::Reusable => {}
@@ -193,6 +193,11 @@ where
 
 // The reader and writer are borrowed exclusively by their own retained futures.
 // Neither a final head nor a completed response implies request-body completion.
+struct ExchangeResult {
+    outcome: Outcome,
+    upgrade: PendingUpgrade,
+}
+
 #[allow(clippy::too_many_arguments)] // Explicit disjoint connection resources; no shared driver allocation.
 async fn exchange<R, W, S, B, T>(
     reader: &mut R,
@@ -204,7 +209,7 @@ async fn exchange<R, W, S, B, T>(
     config: &ServerConfig,
     date: &mut DateCache,
     source: &CancellationSource,
-) -> (Result<Outcome, Error>, RecvBuffer)
+) -> (Result<ExchangeResult, Error>, RecvBuffer)
 where
     W: AsyncWrite,
     T: Receive<R>,
@@ -216,7 +221,8 @@ where
     let mut state = Exchange::new(&head, config.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
-    let (context, informationals) = context::channel(head.persistence == Persistence::Close);
+    let (upgrade, upgrade_slot) = upgrade::channel();
+    let (context, informationals) = context::channel(head.persistence == Persistence::Close, upgrade_slot);
     let close = informationals.close_flag();
     let (producer, body) = incoming(head.body);
     let body = body.with_drain_config(config.drain);
@@ -354,7 +360,15 @@ where
     };
     match end {
         ReceiveEnd::Failed(error) => return (Err(error), buffer),
-        ReceiveEnd::Abandoned => return (Ok(Outcome::Close), buffer),
+        ReceiveEnd::Abandoned => {
+            return (
+                Ok(ExchangeResult {
+                    outcome: Outcome::Close,
+                    upgrade,
+                }),
+                buffer,
+            );
+        }
         ReceiveEnd::Complete => {}
     }
     let result = (|| {
@@ -363,7 +377,10 @@ where
         if close.get() {
             state.close_after_exchange();
         }
-        Ok(state.outcome())
+        Ok(ExchangeResult {
+            outcome: state.outcome(),
+            upgrade,
+        })
     })();
     (result, buffer)
 }

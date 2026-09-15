@@ -200,6 +200,37 @@ fn server_transfers_settled_halves_and_serves_read_ahead_before_transport() {
 }
 
 #[test]
+fn server_request_upgrade_future_receives_settled_typed_transport() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let claimed = RefCell::new(None);
+        let service = service_fn(async |(_, mut context): (Request<Incoming>, RequestContext)| {
+            claimed.replace(Some(context.on_upgrade::<Reader, Writer>()));
+            Ok::<_, Infallible>(response(false))
+        });
+        let outcome = Server::new()
+            .auto_date(false)
+            .serve_connection(
+                (
+                    reader(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\n\r\nraw"),
+                    Writer::limited(128),
+                ),
+                service,
+            )
+            .run()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
+        ));
+        let upgraded = claimed.into_inner().expect("service claimed upgrade").await.unwrap();
+        assert_eq!(upgraded.kind(), UpgradeKind::Protocol);
+        assert_eq!(upgraded.read_ahead(), b"raw");
+    });
+}
+
+#[test]
 fn client_delivers_final_head_and_retires_admission_on_handoff() {
     karmaio::Runtime::new().unwrap().block_on(async {
         for tunnel in [false, true] {
@@ -224,6 +255,45 @@ fn client_delivers_final_head_and_retires_admission_on_handoff() {
             );
             assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Closed);
         }
+    });
+}
+
+#[test]
+fn client_response_upgrade_future_receives_settled_typed_transport() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let (sender, driver) = Client::new().handshake((reader(response_wire(false)), Writer::limited(128)));
+        let (outcome, response) = pair(
+            driver.run(),
+            sender.send_request_with_upgrade::<Reader, Writer>(request(Empty::new(), false)),
+        )
+        .await;
+        let (response, upgrade) = response.unwrap();
+        assert_eq!(response.status(), 101);
+        assert!(matches!(
+            outcome.unwrap(),
+            ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
+        ));
+        let upgraded = upgrade.await.unwrap();
+        assert_eq!(upgraded.read_ahead(), b"raw");
+    });
+}
+
+#[test]
+fn upgrade_future_fails_when_the_response_does_not_upgrade() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let (sender, driver) = Client::new().handshake((
+            reader(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"),
+            Writer::limited(128),
+        ));
+        let (outcome, response) = pair(
+            driver.run(),
+            sender.send_request_with_upgrade::<Reader, Writer>(request(Empty::new(), false)),
+        )
+        .await;
+        assert!(matches!(outcome.unwrap(), ConnectionOutcome::Closed));
+        let (response, upgrade) = response.unwrap();
+        assert_eq!(response.status(), 204);
+        assert_eq!(upgrade.await.unwrap_err().kind(), ErrorKind::Upgrade);
     });
 }
 
@@ -335,7 +405,7 @@ fn early_switch_waits_for_upload_and_failure_never_transfers_io() {
 fn server_switch_waits_for_retained_request_body_to_finish() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let held=RefCell::new(None);
-        let service=service_fn(async |(request,_):(Request<Incoming>,RequestContext)| {held.replace(Some(request.into_body()));Ok::<_,Infallible>(response(false))});
+        let service=service_fn(async |(request,_): (Request<Incoming>, RequestContext)| {held.replace(Some(request.into_body()));Ok::<_,Infallible>(response(false))});
         let (writer,bytes)=ObservedWriter::new();
         let mut driver=pin!(Server::new().auto_date(false).serve_connection((reader(b"POST / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\nContent-Length: 4\r\n\r\nbodyraw"),writer),service).run());
         for _ in 0..5 {assert!(poll(driver.as_mut()).is_pending());}

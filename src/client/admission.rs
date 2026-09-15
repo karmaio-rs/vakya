@@ -4,6 +4,7 @@ use crate::{
     Request, Response,
     body::{Incoming, pipe::Producer},
     error::{Error, ErrorKind},
+    upgrade::{self, PendingUpgrade},
 };
 use std::{
     cell::RefCell,
@@ -85,6 +86,7 @@ pub(crate) struct Job<B> {
     pub(crate) request: Request<B>,
     pub(crate) response: Producer<ResponseEvent, Error>,
     pub(crate) control: Rc<Control>,
+    pub(crate) upgrade: PendingUpgrade,
 }
 
 /// A cloneable, local request sender for one connection and outgoing body type.
@@ -207,6 +209,31 @@ impl<B> SendRequest<B> {
             .await
             .map_err(SendError::Exchange)
     }
+
+    /// Submit a request and return its final response with a correlated upgrade future.
+    ///
+    /// Await the future only when the response accepts an HTTP upgrade or
+    /// CONNECT tunnel. The connection must continue to be driven until it
+    /// reports [`crate::connection::ConnectionOutcome::UpgradeClaimed`].
+    /// `R` and `W` must match the supplied transport's concrete halves.
+    ///
+    /// # Errors
+    /// Admission failures retain the unchanged request in [`SendError::Submission`].
+    /// Failures after transfer are returned as [`SendError::Exchange`].
+    ///
+    /// # Panics
+    /// Panics when submitting outside an active Karmaio runtime.
+    pub async fn send_request_with_upgrade<R: 'static, W: 'static>(
+        &self,
+        request: Request<B>,
+    ) -> Result<(Response<Incoming>, crate::upgrade::OnUpgrade<R, W>), SendError<B>> {
+        self.start_request(request)
+            .await
+            .map_err(SendError::Submission)?
+            .response_with_upgrade()
+            .await
+            .map_err(SendError::Exchange)
+    }
 }
 
 struct Reservation<'a, B> {
@@ -253,11 +280,13 @@ impl<B> RequestPermit<B> {
             });
         }
 
-        let (response, pending, control) = response::channel();
+        let (upgrade, upgrade_slot) = upgrade::channel();
+        let (response, pending, control) = response::channel(upgrade_slot);
         let job = Job {
             request,
             response,
             control,
+            upgrade,
         };
         let previous = std::mem::replace(&mut state.admission, Admission::Closed);
         state.admission = match previous {

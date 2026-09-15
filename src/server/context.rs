@@ -2,6 +2,7 @@
 use crate::{
     Response,
     error::{Error, ErrorKind},
+    upgrade::{OnUpgrade, UpgradeSlot},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -15,9 +16,15 @@ use std::{
 /// This handle is not cloneable. Dropping it has no effect on body consumption.
 /// It may be retained while producing a response; close requests made after a
 /// head was sent affect connection reuse rather than rewriting that head.
-#[derive(Debug)]
 pub struct RequestContext {
     shared: Rc<Shared>,
+    upgrade: UpgradeSlot,
+}
+
+impl std::fmt::Debug for RequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestContext").finish_non_exhaustive()
+    }
 }
 
 impl RequestContext {
@@ -27,6 +34,19 @@ impl RequestContext {
     #[inline]
     pub fn close_connection(&self) {
         self.shared.close.set(true);
+    }
+
+    /// Claim the transport if this request completes an HTTP upgrade or tunnel.
+    ///
+    /// The returned future resolves only after all HTTP-owned operations settle.
+    /// If it remains unclaimed, the connection driver preserves the transport in
+    /// [`crate::connection::ConnectionOutcome::Upgraded`] for compatibility.
+    /// `R` and `W` must be the concrete halves returned by the supplied
+    /// transport's [`karmaio::io::IntoOwnedSplit`] implementation. A mismatch
+    /// or repeated claim resolves with `Upgrade` rather than panicking.
+    #[inline]
+    pub fn on_upgrade<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
+        self.upgrade.claim()
     }
 
     /// Write an informational response before the final response is selected.
@@ -125,7 +145,7 @@ pub(crate) enum Command {
     Application(Response<()>),
 }
 
-pub(crate) fn channel(close: bool) -> (RequestContext, InformationalReceiver) {
+pub(crate) fn channel(close: bool, upgrade: UpgradeSlot) -> (RequestContext, InformationalReceiver) {
     let shared = Rc::new(Shared {
         close: Cell::new(close),
         final_selected: Cell::new(false),
@@ -138,7 +158,10 @@ pub(crate) fn channel(close: bool) -> (RequestContext, InformationalReceiver) {
         receiver: RefCell::new(None),
     });
     (
-        RequestContext { shared: shared.clone() },
+        RequestContext {
+            shared: shared.clone(),
+            upgrade,
+        },
         InformationalReceiver { shared },
     )
 }
@@ -255,7 +278,8 @@ mod tests {
 
     #[test]
     fn canceled_commands_release_queue_but_retain_in_flight_writes() {
-        let (mut context, receiver) = channel(false);
+        let (_, upgrade) = crate::upgrade::channel();
+        let (mut context, receiver) = channel(false, upgrade);
         {
             let mut send = pin!(context.send_informational(head()));
             assert!(poll(send.as_mut()).is_pending());
@@ -284,7 +308,8 @@ mod tests {
             receiver.select_final();
             assert!(matches!(poll(send.as_mut()), Poll::Ready(Err(error)) if error.kind()==ErrorKind::LocalMessage));
         }
-        let (mut context, receiver) = channel(false);
+        let (_, upgrade) = crate::upgrade::channel();
+        let (mut context, receiver) = channel(false, upgrade);
         let mut send = pin!(context.send_informational(head()));
         assert!(poll(send.as_mut()).is_pending());
         drop(receiver);

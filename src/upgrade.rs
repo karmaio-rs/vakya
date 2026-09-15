@@ -1,10 +1,21 @@
 //! Typed transport ownership after an HTTP protocol switch or CONNECT tunnel.
+use crate::error::{Error, ErrorKind};
 use bytes::{Buf, Bytes};
 use karmaio::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf},
     io::{AsyncRead, AsyncWrite, IntoOwnedSplit},
 };
-use std::{fmt, io};
+use std::{
+    any::{Any, TypeId},
+    cell::RefCell,
+    fmt,
+    future::Future,
+    io,
+    marker::PhantomData,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll, Waker},
+};
 
 /// The HTTP transition that transferred transport ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +24,202 @@ pub enum UpgradeKind {
     Protocol,
     /// A successful CONNECT response established a tunnel.
     Tunnel,
+}
+
+/// A future for transport ownership after an HTTP upgrade or CONNECT tunnel.
+///
+/// The future is obtained from the request-local server context or an accepted
+/// client's pending response. It resolves only after the HTTP driver has
+/// settled retained operations and transferred the concrete transport halves.
+/// It does not require `Send` or `Sync`, and does not erase the returned transport.
+///
+/// This follows Hyper's request-correlated pending/fulfill model while keeping
+/// Karmaio's owned-buffer I/O types visible in the result.
+#[must_use = "an upgrade future must be awaited to receive the transport"]
+pub struct OnUpgrade<R, W> {
+    shared: Option<Rc<RefCell<UpgradeState>>>,
+    immediate: Option<Error>,
+    marker: PhantomData<fn() -> (R, W)>,
+}
+
+impl<R, W> OnUpgrade<R, W> {
+    pub(crate) fn failed(error: Error) -> Self {
+        Self {
+            shared: None,
+            immediate: Some(error),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<R, W> fmt::Debug for OnUpgrade<R, W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnUpgrade").finish_non_exhaustive()
+    }
+}
+
+impl<R: 'static, W: 'static> Future for OnUpgrade<R, W> {
+    type Output = Result<Upgraded<R, W>, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        if let Some(error) = this.immediate.take() {
+            return Poll::Ready(Err(error));
+        }
+
+        let Some(shared) = &this.shared else {
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::Upgrade,
+                "upgrade future polled after completion",
+            )));
+        };
+        let result = {
+            let mut state = shared.borrow_mut();
+            match state.result.take() {
+                Some(result) => Some(result),
+                None => {
+                    state.waker = Some(cx.waker().clone());
+                    None
+                }
+            }
+        };
+        match result {
+            Some(Ok(upgraded)) => {
+                this.shared = None;
+                Poll::Ready(
+                    upgraded
+                        .downcast::<Upgraded<R, W>>()
+                        .map(|upgraded| *upgraded)
+                        .map_err(|_| {
+                            Error::new(ErrorKind::Upgrade, "upgrade transport types do not match this future")
+                        }),
+                )
+            }
+            Some(Err(error)) => {
+                this.shared = None;
+                Poll::Ready(Err(error))
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+impl<R, W> Drop for OnUpgrade<R, W> {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            let mut state = shared.borrow_mut();
+            state.receiver_alive = false;
+            state.waker = None;
+            state.result.take();
+        }
+    }
+}
+
+struct UpgradeState {
+    claimed: bool,
+    receiver_alive: bool,
+    expected: Option<(TypeId, TypeId)>,
+    result: Option<Result<Box<dyn Any>, Error>>,
+    waker: Option<Waker>,
+}
+
+pub(crate) struct UpgradeSlot {
+    shared: Rc<RefCell<UpgradeState>>,
+}
+
+impl fmt::Debug for UpgradeSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UpgradeSlot").finish_non_exhaustive()
+    }
+}
+
+impl UpgradeSlot {
+    pub(crate) fn claim<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
+        let mut state = self.shared.borrow_mut();
+        if state.claimed {
+            return OnUpgrade::failed(Error::new(ErrorKind::Upgrade, "upgrade was already claimed"));
+        }
+        state.claimed = true;
+        state.receiver_alive = true;
+        state.expected = Some((TypeId::of::<R>(), TypeId::of::<W>()));
+        drop(state);
+        OnUpgrade {
+            shared: Some(self.shared.clone()),
+            immediate: None,
+            marker: PhantomData,
+        }
+    }
+}
+
+pub(crate) struct PendingUpgrade {
+    shared: Rc<RefCell<UpgradeState>>,
+    settled: bool,
+}
+
+impl PendingUpgrade {
+    /// Deliver a settled handoff to a claimed future, or return it so the
+    /// connection outcome can retain the pre-existing ownership path.
+    pub(crate) fn fulfill<R: 'static, W: 'static>(
+        mut self,
+        upgraded: Upgraded<R, W>,
+    ) -> Result<UpgradeKind, Upgraded<R, W>> {
+        let kind = upgraded.kind();
+        self.settled = true;
+        let mut state = self.shared.borrow_mut();
+        let actual = (TypeId::of::<R>(), TypeId::of::<W>());
+        if state.claimed && state.receiver_alive && state.expected == Some(actual) {
+            state.result = Some(Ok(Box::new(upgraded)));
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+            Ok(kind)
+        } else {
+            state.result = Some(Err(Error::new(
+                ErrorKind::Upgrade,
+                if state.claimed && state.receiver_alive {
+                    "upgrade transport types do not match this connection"
+                } else {
+                    "upgrade was not claimed before handoff"
+                },
+            )));
+            Err(upgraded)
+        }
+    }
+}
+
+impl Drop for PendingUpgrade {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut state = self.shared.borrow_mut();
+        if state.result.is_none() {
+            state.result = Some(Err(Error::new(
+                ErrorKind::Upgrade,
+                "message did not complete an upgrade",
+            )));
+        }
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+pub(crate) fn channel() -> (PendingUpgrade, UpgradeSlot) {
+    let shared = Rc::new(RefCell::new(UpgradeState {
+        claimed: false,
+        receiver_alive: false,
+        expected: None,
+        result: None,
+        waker: None,
+    }));
+    (
+        PendingUpgrade {
+            shared: shared.clone(),
+            settled: false,
+        },
+        UpgradeSlot { shared },
+    )
 }
 
 /// Settled transport halves plus bytes read beyond the HTTP message boundary.
@@ -171,6 +378,49 @@ mod tests {
         pin::pin,
         task::{Context, Waker},
     };
+
+    #[test]
+    fn mismatched_or_dropped_claims_return_transport_to_connection_ownership() {
+        karmaio::Runtime::new().unwrap().block_on(async {
+            let (pending, mut slot) = channel();
+            let upgrade = slot.claim::<(), ()>();
+            let handed_off = Upgraded {
+                reader: 1u8,
+                writer: 2u8,
+                read_ahead: Bytes::from_static(b"raw"),
+                kind: UpgradeKind::Protocol,
+            };
+            let returned = pending.fulfill(handed_off).unwrap_err();
+            assert_eq!(
+                returned.into_parts(),
+                (1, 2, Bytes::from_static(b"raw"), UpgradeKind::Protocol)
+            );
+            assert_eq!(upgrade.await.unwrap_err().kind(), ErrorKind::Upgrade);
+
+            let (pending, mut slot) = channel();
+            let upgrade = slot.claim::<u8, u8>();
+            drop(upgrade);
+            let handed_off = Upgraded {
+                reader: 3u8,
+                writer: 4u8,
+                read_ahead: Bytes::new(),
+                kind: UpgradeKind::Tunnel,
+            };
+            assert!(pending.fulfill(handed_off).is_err());
+        });
+    }
+
+    #[test]
+    fn upgrade_claim_is_one_shot_and_non_upgrade_wakes_the_future() {
+        karmaio::Runtime::new().unwrap().block_on(async {
+            let (pending, mut slot) = channel();
+            let upgrade = slot.claim::<(), ()>();
+            let duplicate = slot.claim::<(), ()>();
+            assert_eq!(duplicate.await.unwrap_err().kind(), ErrorKind::Upgrade);
+            drop(pending);
+            assert_eq!(upgrade.await.unwrap_err().kind(), ErrorKind::Upgrade);
+        });
+    }
 
     #[test]
     fn splitting_preserves_partial_prefix_and_independent_halves() {

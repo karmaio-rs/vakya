@@ -6,6 +6,7 @@ use crate::{
         pipe::{self, Consumer, Producer, TakeError},
     },
     error::{Error, ErrorKind},
+    upgrade::{OnUpgrade, UpgradeSlot},
 };
 use karmaio::runtime::CancellationSource;
 use std::{
@@ -99,12 +100,23 @@ pub struct PendingResponse {
     control: UploadControl,
     delivered: bool,
     finished: bool,
+    upgrade: UpgradeSlot,
 }
 
 impl PendingResponse {
     /// Obtain an upload-abort handle that may outlive final-response delivery.
     pub fn control(&self) -> UploadControl {
         self.control.clone()
+    }
+
+    /// Claim the transport if the final response completes an HTTP upgrade or tunnel.
+    ///
+    /// Claim this before awaiting the final response. The future resolves only
+    /// after the HTTP driver has settled retained operations and relinquished
+    /// the transport. `R` and `W` must match the supplied transport's concrete
+    /// halves. A mismatch or repeated claim resolves with `Upgrade`.
+    pub fn on_upgrade<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
+        self.upgrade.claim()
     }
 
     /// Observe informational heads in wire order, followed by one final response.
@@ -153,6 +165,28 @@ impl PendingResponse {
 
         Err(Error::new(ErrorKind::Closed, "final response already consumed"))
     }
+
+    /// Wait for the final response and return its correlated upgrade future.
+    ///
+    /// This is the typed Karmaio counterpart to obtaining Hyper's `OnUpgrade`
+    /// from a response. Await the second value only when the final response
+    /// accepts an upgrade or CONNECT tunnel. `R` and `W` must match the supplied
+    /// transport's concrete halves.
+    ///
+    /// # Errors
+    /// Returns an exchange failure, or `Closed` if no final response remains.
+    pub async fn response_with_upgrade<R: 'static, W: 'static>(
+        mut self,
+    ) -> Result<(Response<Incoming>, OnUpgrade<R, W>), Error> {
+        let upgrade = self.on_upgrade();
+        while let Some(event) = self.next_event().await? {
+            if let ResponseEvent::Final(response) = event {
+                return Ok((response, upgrade));
+            }
+        }
+
+        Err(Error::new(ErrorKind::Closed, "final response already consumed"))
+    }
 }
 
 impl Drop for PendingResponse {
@@ -163,7 +197,7 @@ impl Drop for PendingResponse {
     }
 }
 
-pub(crate) fn channel() -> (Producer<ResponseEvent, Error>, PendingResponse, Rc<Control>) {
+pub(crate) fn channel(upgrade: UpgradeSlot) -> (Producer<ResponseEvent, Error>, PendingResponse, Rc<Control>) {
     let (sender, receiver) = pipe::channel();
     let control = Rc::new(Control {
         upload: CancellationSource::new(),
@@ -181,6 +215,7 @@ pub(crate) fn channel() -> (Producer<ResponseEvent, Error>, PendingResponse, Rc<
             control: UploadControl { inner: control.clone() },
             delivered: false,
             finished: false,
+            upgrade,
         },
         control,
     )
