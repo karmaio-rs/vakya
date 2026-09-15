@@ -119,6 +119,46 @@ impl<B> Drop for SendRequest<B> {
 }
 
 impl<B> SendRequest<B> {
+    /// Return whether a request permit can be acquired immediately.
+    ///
+    /// Like Hyper's sender readiness hint, this is only a snapshot. A cloned
+    /// sender may acquire admission before a later call to [`Self::try_reserve`].
+    /// A registered asynchronous waiter retains priority and reports not ready.
+    pub fn is_ready(&self) -> bool {
+        let state = self.shared.borrow();
+        !state.control.stopping() && matches!(state.admission, Admission::Ready)
+    }
+
+    /// Return whether the driver has closed or stopped request admission.
+    pub fn is_closed(&self) -> bool {
+        let state = self.shared.borrow();
+        state.control.stopping() || state.admission.is_closed()
+    }
+
+    /// Attempt to acquire exclusive admission without waiting.
+    ///
+    /// This performs the readiness check and reservation atomically with
+    /// respect to cloned local senders. A registered asynchronous waiter is
+    /// never overtaken.
+    ///
+    /// # Errors
+    /// Returns `Limit` when admission is currently occupied or reserved for a
+    /// waiter, and `Closed` after the driver closes or stops admission.
+    pub fn try_reserve(&self) -> Result<RequestPermit<B>, Error> {
+        let mut state = self.shared.borrow_mut();
+        if state.admission.is_closed() || state.control.stopping() {
+            return Err(closed());
+        }
+        if !matches!(state.admission, Admission::Ready) {
+            return Err(Error::new(ErrorKind::Limit, "request admission is not ready"));
+        }
+        state.admission = Admission::Reserved { waiter: None };
+        Ok(RequestPermit {
+            shared: self.shared.clone(),
+            active: true,
+        })
+    }
+
     /// Reserve exclusive admission, waiting for the current exchange to settle.
     /// Dropping this wait unregisters it; dropping its permit releases admission.
     ///

@@ -139,7 +139,14 @@ fn unsolicited_read_ahead_never_becomes_a_later_response() {
 fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let (sender, driver) = Builder::new().handshake::<_, Full<Bytes>>((reader(b""), Writer::limited(8)));
-        let permit = sender.reserve().await.unwrap();
+        assert!(sender.is_ready());
+        assert!(!sender.is_closed());
+        let permit = sender.try_reserve().unwrap();
+        assert!(!sender.is_ready());
+        assert_eq!(sender.try_reserve().err().unwrap().kind(), ErrorKind::Limit);
+        drop(permit);
+        assert!(sender.is_ready());
+        let permit = sender.try_reserve().unwrap();
         {
             let mut waiting = pin!(sender.reserve());
             assert!(poll(waiting.as_mut()).is_pending());
@@ -160,9 +167,14 @@ fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
         drop(permit);
         // Releasing admission wakes and reserves priority for the registered
         // waiter, even before that future is polled again.
+        assert!(!sender.is_ready());
+        assert_eq!(sender.try_reserve().err().unwrap().kind(), ErrorKind::Limit);
         assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Limit);
         let permit = waiting.await.unwrap();
         drop(driver);
+        assert!(sender.is_closed());
+        assert!(!sender.is_ready());
+        assert_eq!(sender.try_reserve().err().unwrap().kind(), ErrorKind::Closed);
         let error = permit
             .send(request(Full::new(Bytes::from_static(b"still mine"))))
             .err()
