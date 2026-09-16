@@ -351,7 +351,7 @@ mod tests {
         body::collect,
         body::{BodyExt, Full},
         io::transport::Portable,
-        proto::h1::encode::{BodyMetadata, EncodeLimits},
+        proto::h1::encode::{BodyMetadata, EncodeConfig},
         service::Service,
         test_transport::{Gate, ReadStep, Reader, WriteStep, Writer},
     };
@@ -369,7 +369,7 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    const LIMITS: EncodeLimits = EncodeLimits::new(4096, 4096);
+    const LIMITS: EncodeConfig = EncodeConfig::new(4096, 4096);
 
     fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(Waker::noop()))

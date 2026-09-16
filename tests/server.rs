@@ -150,7 +150,41 @@ fn keep_alive_preserves_buffered_requests_and_borrowed_local_service() {
 }
 
 #[test]
-fn streaming_echo_preserves_trailers_after_context_is_dropped() {
+fn preserved_request_header_case_is_reused_when_forwarded() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
+            let (parts, _) = request.into_parts();
+            let mut response = Response::new(Empty::new());
+            *response.headers_mut() = parts.headers;
+            *response.extensions_mut() = parts.extensions;
+            Ok::<_, Infallible>(response)
+        });
+        let (writer, bytes) = ObservedWriter::new();
+        Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .auto_date(false)
+            .serve_connection(
+                (
+                    reader(b"GET / HTTP/1.1\r\nhOsT: test\r\nx-WeIrD: one\r\nX-WEIRD: two\r\n\r\n"),
+                    writer,
+                ),
+                service,
+            )
+            .run()
+            .await
+            .unwrap();
+
+        let wire = output(&bytes);
+        assert!(wire.contains("\r\nhOsT: test\r\n"));
+        assert!(wire.contains("\r\nx-WeIrD: one\r\n"));
+        assert!(wire.contains("\r\nX-WEIRD: two\r\n"));
+        assert!(wire.contains("\r\nContent-Length: 0\r\n"));
+    });
+}
+
+#[test]
+fn streaming_echo_preserves_trailers_and_applies_title_case() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let service = service_fn(async |(request, context): (Request<Incoming>, RequestContext)| {
             drop(context);
@@ -164,14 +198,15 @@ fn streaming_echo_preserves_trailers_after_context_is_dropped() {
             ReadStep::Data(Bytes::from_static(b"4\r\nbody\r\n0\r\nx-end: yes\r\n\r\n")),
         ]);
         Builder::new()
+            .title_case_headers(true)
             .auto_date(false)
             .serve_connection((input, writer), service)
             .run()
             .await
             .unwrap();
         let wire = output(&bytes);
-        assert!(wire.contains("transfer-encoding: chunked\r\n"));
-        assert!(wire.ends_with("\r\n\r\n4\r\nbody\r\n0\r\nx-end: yes\r\n\r\n"));
+        assert!(wire.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(wire.ends_with("\r\n\r\n4\r\nbody\r\n0\r\nX-End: yes\r\n\r\n"));
     });
 }
 

@@ -1,3 +1,4 @@
+use super::header_case::HeaderCaseMap;
 use super::syntax::{is_tchar, quoted_string_len, trim_ows};
 use super::{BodyMode, Expectation, Persistence, TargetForm, UpgradeKind};
 use crate::error::{Error, ErrorKind};
@@ -76,6 +77,7 @@ pub(super) struct RequestHead {
     pub(super) target: Uri,
     pub(super) version: Version,
     pub(super) headers: HeaderMap,
+    pub(super) header_case: Option<HeaderCaseMap>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +85,7 @@ pub(super) struct ResponseHead {
     pub(super) version: Version,
     pub(super) status: StatusCode,
     pub(super) headers: HeaderMap,
+    pub(super) header_case: Option<HeaderCaseMap>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +122,7 @@ pub(super) struct HeadParser<R> {
     workspace: HeaderWorkspace,
     role: PhantomData<fn() -> R>,
     scan: HeadScan,
+    preserve_header_case: bool,
 }
 
 #[derive(Debug)]
@@ -185,7 +189,13 @@ impl<R> HeadParser<R> {
             workspace: HeaderWorkspace::new(limits.max_headers),
             role: PhantomData,
             scan: HeadScan::default(),
+            preserve_header_case: false,
         }
+    }
+
+    pub(super) fn with_preserved_header_case(mut self, enabled: bool) -> Self {
+        self.preserve_header_case = enabled;
+        self
     }
 
     fn parse_input_len(&self, input: &[u8]) -> usize {
@@ -227,7 +237,7 @@ impl HeadParser<RequestRole> {
                 .map_err(map_request_error)
             {
                 Ok(httparse::Status::Complete(consumed)) if consumed == input.len() => {
-                    build_shared_request_head(request, &input)
+                    build_shared_request_head(request, &input, self.preserve_header_case)
                 }
                 Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial) => Err(HeadError::InvalidStartLine),
                 Err(error) => Err(error),
@@ -257,7 +267,7 @@ impl HeadParser<ResponseRole> {
                 .map_err(map_response_error)
             {
                 Ok(httparse::Status::Complete(consumed)) if consumed == input.len() => {
-                    build_shared_response_head(response, &input)
+                    build_shared_response_head(response, &input, self.preserve_header_case)
                 }
                 Ok(httparse::Status::Complete(_)) | Ok(httparse::Status::Partial) => Err(HeadError::InvalidStartLine),
                 Err(error) => Err(error),
@@ -427,35 +437,45 @@ impl HeaderWorkspace {
     }
 }
 
-fn build_shared_request_head(request: httparse::Request<'_, '_>, input: &Bytes) -> Result<RequestHead, HeadError> {
+fn build_shared_request_head(
+    request: httparse::Request<'_, '_>,
+    input: &Bytes,
+    preserve_header_case: bool,
+) -> Result<RequestHead, HeadError> {
     let method = Method::from_bytes(request.method.ok_or(HeadError::InvalidStartLine)?.as_bytes())
         .map_err(|_| HeadError::InvalidMethod)?;
     let target = request.path.ok_or(HeadError::InvalidStartLine)?;
     let target = Uri::from_maybe_shared(input.slice_ref(target.as_bytes())).map_err(|_| HeadError::InvalidTarget)?;
     let version = version(request.version.ok_or(HeadError::InvalidStartLine)?)?;
-    let headers = shared_headers(request.headers, input)?;
+    let (headers, header_case) = shared_headers(request.headers, input, preserve_header_case)?;
 
     Ok(RequestHead {
         method,
         target,
         version,
         headers,
+        header_case,
     })
 }
 
-fn build_shared_response_head(response: httparse::Response<'_, '_>, input: &Bytes) -> Result<ResponseHead, HeadError> {
+fn build_shared_response_head(
+    response: httparse::Response<'_, '_>,
+    input: &Bytes,
+    preserve_header_case: bool,
+) -> Result<ResponseHead, HeadError> {
     let version = version(response.version.ok_or(HeadError::InvalidStartLine)?)?;
     let code = response.code.ok_or(HeadError::InvalidStartLine)?;
     if code > 599 {
         return Err(HeadError::InvalidStatus);
     }
     let status = StatusCode::from_u16(code).map_err(|_| HeadError::InvalidStatus)?;
-    let headers = shared_headers(response.headers, input)?;
+    let (headers, header_case) = shared_headers(response.headers, input, preserve_header_case)?;
 
     Ok(ResponseHead {
         version,
         status,
         headers,
+        header_case,
     })
 }
 
@@ -469,15 +489,23 @@ pub(super) fn own_headers(headers: &[httparse::Header<'_>]) -> Result<HeaderMap,
     Ok(owned)
 }
 
-fn shared_headers(headers: &[httparse::Header<'_>], input: &Bytes) -> Result<HeaderMap, HeadError> {
+fn shared_headers(
+    headers: &[httparse::Header<'_>],
+    input: &Bytes,
+    preserve_header_case: bool,
+) -> Result<(HeaderMap, Option<HeaderCaseMap>), HeadError> {
     let mut owned = HeaderMap::try_with_capacity(headers.len()).map_err(|_| HeadError::Limit(HeadLimit::HeaderMap))?;
+    let mut original = preserve_header_case.then(HeaderCaseMap::default);
     for header in headers {
         let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| HeadError::InvalidHeader)?;
         let value =
             HeaderValue::from_maybe_shared(input.slice_ref(header.value)).map_err(|_| HeadError::InvalidHeader)?;
+        if let Some(original) = &mut original {
+            original.append(name.clone(), input.slice_ref(header.name.as_bytes()));
+        }
         owned.append(name, value);
     }
-    Ok(owned)
+    Ok((owned, original))
 }
 
 fn version(minor: u8) -> Result<Version, HeadError> {

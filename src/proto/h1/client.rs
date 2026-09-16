@@ -5,6 +5,7 @@ use super::{
     encode::{BodyEncoder, BodyMetadata, prepare_request_head},
     exchange::{Direction, Exchange, HeadAction, Outcome},
     head::{HeadParser, ResponseRole},
+    header_case::HeaderCaseMap,
 };
 use crate::{
     Response,
@@ -75,7 +76,8 @@ where
     };
     let mut buffer = RecvBuffer::new(config.preferred_read, config.max_retained)?;
     let mut budget = WorkBudget::new();
-    let mut parser = HeadParser::<ResponseRole>::response(config.protocol.head);
+    let mut parser = HeadParser::<ResponseRole>::response(config.protocol.head)
+        .with_preserved_header_case(config.protocol.preserve_header_case);
 
     let mut exchanges = crate::trace::Exchanges::default();
     while let Some(job) = requests.next().await {
@@ -224,6 +226,7 @@ where
     T: Receive<R>,
 {
     let (parts, mut body) = request.into_parts();
+    let original_case = parts.extensions.get::<HeaderCaseMap>();
 
     let metadata = BodyMetadata {
         size: body.size_hint(),
@@ -235,6 +238,7 @@ where
         parts.uri,
         parts.version,
         parts.headers,
+        original_case,
         metadata,
         config.protocol.encode,
     )?;
@@ -400,6 +404,9 @@ async fn receive<R, T: Receive<R>>(
                         if let Some(info) = &config.tls_info {
                             message.extensions_mut().insert(info.clone());
                         }
+                        if let Some(header_case) = head.head.header_case {
+                            message.extensions_mut().insert(header_case);
+                        }
                         *message.status_mut() = head.head.status;
                         *message.version_mut() = head.head.version;
                         *message.headers_mut() = head.head.headers;
@@ -447,6 +454,9 @@ async fn receive<R, T: Receive<R>>(
     #[cfg(feature = "tls")]
     if let Some(info) = &config.tls_info {
         message.extensions_mut().insert(info.clone());
+    }
+    if let Some(header_case) = head.head.header_case {
+        message.extensions_mut().insert(header_case);
     }
     *message.status_mut() = head.head.status;
     *message.version_mut() = head.head.version;

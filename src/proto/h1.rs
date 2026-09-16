@@ -7,6 +7,7 @@ pub(super) mod decode;
 pub(super) mod encode;
 pub(super) mod exchange;
 pub(super) mod head;
+mod header_case;
 mod inline;
 #[cfg(feature = "server")]
 pub(crate) mod server;

@@ -187,6 +187,29 @@ impl Builder {
         self
     }
 
+    /// Record the original casing of received request header names.
+    ///
+    /// The metadata is kept in a private request extension. Vakya HTTP/1
+    /// encoders recognize it when the request is forwarded or its extensions
+    /// are transferred to a response. This preserves each received spelling;
+    /// fields without recorded metadata continue to use lowercase names.
+    /// Defaults to `false`.
+    pub fn preserve_header_case(&mut self, enabled: bool) -> &mut Self {
+        self.config.protocol.preserve_header_case = enabled;
+        self
+    }
+
+    /// Write outgoing header names in title case.
+    ///
+    /// This applies to response heads, generated framing fields, and trailers.
+    /// When [`Self::preserve_header_case`] metadata is present, the received
+    /// spelling takes precedence and title case is used only as a fallback.
+    /// Defaults to `false`, which writes lowercase names.
+    pub fn title_case_headers(&mut self, enabled: bool) -> &mut Self {
+        self.config.protocol.title_case_headers(enabled);
+        self
+    }
+
     /// Create a connection from established, independently splittable Karmaio I/O.
     /// The caller must have selected HTTP/1 on any negotiated transport.
     /// Generic transports use portable reads; no dialing, accepting, or spawning

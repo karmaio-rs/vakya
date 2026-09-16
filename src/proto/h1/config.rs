@@ -1,13 +1,14 @@
-use super::{decode::DecodeLimits, encode::EncodeLimits, head::HeadLimits};
+use super::{decode::DecodeLimits, encode::EncodeConfig, head::HeadLimits};
 use crate::error::{Error, ErrorKind};
 
-/// Protocol budgets shared by the client and server drivers.
+/// Protocol configuration shared by the client and server drivers.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Config {
     pub(crate) head: HeadLimits,
     pub(crate) decode: DecodeLimits,
-    pub(crate) encode: EncodeLimits,
+    pub(crate) encode: EncodeConfig,
     pub(crate) max_informational: usize,
+    pub(crate) preserve_header_case: bool,
 }
 
 impl Default for Config {
@@ -15,8 +16,9 @@ impl Default for Config {
         Self {
             head: HeadLimits::new(64 * 1024, 100),
             decode: DecodeLimits::default(),
-            encode: EncodeLimits::new(64 * 1024, 16 * 1024),
+            encode: EncodeConfig::new(64 * 1024, 16 * 1024),
             max_informational: 16,
+            preserve_header_case: false,
         }
     }
 }
@@ -72,6 +74,10 @@ impl Config {
         nonzero(bytes)?;
         self.encode.max_trailer_bytes = bytes;
         Ok(())
+    }
+
+    pub(crate) fn title_case_headers(&mut self, enabled: bool) {
+        self.encode.title_case_headers = enabled;
     }
 }
 

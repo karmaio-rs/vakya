@@ -2,9 +2,10 @@ use super::{
     BodyMode, Expectation, Persistence,
     bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
-    encode::{BodyEncoder, BodyMetadata, encode_response_head, prepare_response_head},
+    encode::{BodyEncoder, BodyMetadata, prepare_response_head},
     exchange::{Direction, Exchange, Outcome},
     head::{HeadParser, RequestRole, ValidatedRequestHead},
+    header_case::HeaderCaseMap,
 };
 use crate::{
     body::{Body, Incoming, SizeHint, TrailerHint},
@@ -86,7 +87,8 @@ where
         timeout: config.write_progress_timeout,
     };
     let mut buffer = RecvBuffer::new(config.preferred_read, config.max_retained)?;
-    let mut parser = HeadParser::<RequestRole>::request(config.protocol.head);
+    let mut parser = HeadParser::<RequestRole>::request(config.protocol.head)
+        .with_preserved_header_case(config.protocol.preserve_header_case);
     let mut date = DateCache::default();
     let mut budget = WorkBudget::new();
     // Graceful idle-read cancellation must leave transport shutdown usable.
@@ -230,6 +232,9 @@ where
     #[cfg(feature = "tls")]
     if let Some(info) = &config.tls_info {
         request.extensions_mut().insert(info.clone());
+    }
+    if let Some(header_case) = head.head.header_case {
+        request.extensions_mut().insert(header_case);
     }
     *request.method_mut() = head.head.method;
     *request.uri_mut() = head.head.target;
@@ -463,10 +468,12 @@ async fn write_informationals<W: AsyncWrite>(
                 return Err(Error::new(ErrorKind::Limit, "too many informational responses"));
             }
             let (parts, ()) = response.into_parts();
-            let head = encode_response_head(
+            let original_case = parts.extensions.get::<HeaderCaseMap>();
+            let (head, _) = prepare_response_head(
                 parts.status,
                 parts.version,
                 parts.headers,
+                original_case,
                 BodyMetadata {
                     size: SizeHint::with_exact(0),
                     trailers: TrailerHint::None,
@@ -547,10 +554,12 @@ where
         size: body.size_hint(),
         trailers: body.trailer_hint(),
     };
+    let original_case = parts.extensions.get::<HeaderCaseMap>();
     let (head, validated) = prepare_response_head(
         parts.status,
         version,
         parts.headers,
+        original_case,
         metadata,
         method,
         config.protocol.encode,

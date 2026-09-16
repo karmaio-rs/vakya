@@ -136,6 +136,79 @@ fn unsolicited_read_ahead_never_becomes_a_later_response() {
 }
 
 #[test]
+fn preserved_response_header_case_is_reused_when_forwarded() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let input = Reader::new([
+            ReadStep::Data(Bytes::from_static(
+                b"HTTP/1.1 200 OK\r\nhOsT: upstream.test\r\nx-WeIrD: one\r\nX-WEIRD: two\r\nContent-Length: 0\r\n\r\n",
+            )),
+            ReadStep::Data(Bytes::from_static(
+                b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            )),
+        ]);
+        let (writer, bytes) = ObservedWriter::new();
+        let (sender, driver) = Builder::new().preserve_header_case(true).handshake((input, writer));
+        let app = async {
+            let response = sender.send_request(request(Empty::new())).await.unwrap();
+            let (parts, body) = response.into_parts();
+            body.collect(0).await.unwrap();
+
+            let mut forwarded = Request::builder()
+                .method("GET")
+                .uri("/forwarded")
+                .body(Empty::new())
+                .unwrap();
+            *forwarded.headers_mut() = parts.headers;
+            *forwarded.extensions_mut() = parts.extensions;
+            let response = sender.send_request(forwarded).await.unwrap();
+            assert_eq!(response.status(), 204);
+        };
+        let (result, ()) = pair(driver.run(), app).await;
+        result.unwrap();
+
+        let wire = output(&bytes);
+        assert!(wire.contains("\r\nhOsT: upstream.test\r\n"));
+        assert!(wire.contains("\r\nx-WeIrD: one\r\n"));
+        assert!(wire.contains("\r\nX-WEIRD: two\r\n"));
+        assert!(wire.contains("\r\nContent-Length: 0\r\n"));
+    });
+}
+
+#[test]
+fn title_case_headers_applies_to_generated_fields_and_trailers() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let input = reader(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        let (writer, bytes) = ObservedWriter::new();
+        let mut builder = Builder::new();
+        builder.title_case_headers(true);
+        let (sender, driver) = builder.handshake((input, writer));
+        let app = async {
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-upload-checksum", "complete".parse().unwrap());
+            let request = Request::builder()
+                .method("POST")
+                .uri("/title-case")
+                .header("host", "test")
+                .header("x-proxy-field", "yes")
+                .header("connection", "close")
+                .body(Empty::new().with_trailers(trailers))
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), 204);
+        };
+        let (result, ()) = pair(driver.run(), app).await;
+        result.unwrap();
+
+        let wire = output(&bytes);
+        assert!(wire.contains("\r\nHost: test\r\n"));
+        assert!(wire.contains("\r\nX-Proxy-Field: yes\r\n"));
+        assert!(wire.contains("\r\nConnection: close\r\n"));
+        assert!(wire.contains("\r\nTransfer-Encoding: chunked\r\n"));
+        assert!(wire.ends_with("\r\n\r\n0\r\nX-Upload-Checksum: complete\r\n\r\n"));
+    });
+}
+
+#[test]
 fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let (sender, driver) = Builder::new().handshake::<_, Full<Bytes>>((reader(b""), Writer::limited(8)));

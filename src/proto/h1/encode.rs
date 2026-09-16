@@ -3,12 +3,13 @@ use super::{
     UpgradeKind,
     decode::validate_trailers,
     head::{HeadError, RequestHead, ResponseHead, parse_content_length, parse_transfer_encoding},
+    header_case::HeaderCaseMap,
 };
 use crate::body::{SizeHint, TrailerHint};
 use crate::error::{Error, ErrorKind};
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderValue, Method, StatusCode, Uri, Version,
+    HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version,
     header::{CONTENT_LENGTH, TRANSFER_ENCODING},
 };
 use std::fmt::{self, Write as _};
@@ -39,12 +40,13 @@ impl BodyMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EncodeLimits {
+pub(crate) struct EncodeConfig {
     pub(super) max_head_bytes: usize,
     pub(super) max_trailer_bytes: usize,
+    pub(super) title_case_headers: bool,
 }
 
-impl EncodeLimits {
+impl EncodeConfig {
     pub(super) const fn new(max_head_bytes: usize, max_trailer_bytes: usize) -> Self {
         assert!(
             max_head_bytes > 0 && max_trailer_bytes > 0,
@@ -53,6 +55,7 @@ impl EncodeLimits {
         Self {
             max_head_bytes,
             max_trailer_bytes,
+            title_case_headers: false,
         }
     }
 }
@@ -105,9 +108,9 @@ pub(super) fn encode_request_head(
     version: Version,
     headers: HeaderMap,
     metadata: BodyMetadata,
-    limits: EncodeLimits,
+    config: EncodeConfig,
 ) -> Result<EncodedHead, EncodeError> {
-    prepare_request_head(method, target, version, headers, metadata, limits).map(|(head, _)| head)
+    prepare_request_head(method, target, version, headers, None, metadata, config).map(|(head, _)| head)
 }
 
 pub(super) fn prepare_request_head(
@@ -115,8 +118,9 @@ pub(super) fn prepare_request_head(
     target: Uri,
     version: Version,
     mut headers: HeaderMap,
+    original_case: Option<&HeaderCaseMap>,
     metadata: BodyMetadata,
-    limits: EncodeLimits,
+    config: EncodeConfig,
 ) -> Result<(EncodedHead, super::head::ValidatedRequestHead), EncodeError> {
     let mode = plan_request_framing(&mut headers, version, metadata)?;
     let validated = RequestHead {
@@ -124,6 +128,7 @@ pub(super) fn prepare_request_head(
         target,
         version,
         headers,
+        header_case: None,
     }
     .validate()
     .map_err(map_head_error)?;
@@ -131,14 +136,19 @@ pub(super) fn prepare_request_head(
         return Err(EncodeError::InvalidFraming);
     }
 
-    let mut writer = BoundedWriter::new(limits.max_head_bytes);
+    let mut writer = BoundedWriter::new(config.max_head_bytes);
     writer.push(validated.head.method.as_str().as_bytes())?;
     writer.push(b" ")?;
     write!(&mut writer, "{}", validated.head.target).map_err(|_| EncodeError::Limit)?;
     writer.push(b" ")?;
     writer.push(version_bytes(version)?)?;
     writer.push(b"\r\n")?;
-    write_headers(&mut writer, &validated.head.headers)?;
+    write_headers(
+        &mut writer,
+        &validated.head.headers,
+        original_case,
+        config.title_case_headers,
+    )?;
     writer.push(b"\r\n")?;
     Ok((
         EncodedHead {
@@ -151,30 +161,33 @@ pub(super) fn prepare_request_head(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn encode_response_head(
     status: StatusCode,
     version: Version,
     headers: HeaderMap,
     metadata: BodyMetadata,
     request_method: &Method,
-    limits: EncodeLimits,
+    config: EncodeConfig,
 ) -> Result<EncodedHead, EncodeError> {
-    prepare_response_head(status, version, headers, metadata, request_method, limits).map(|(head, _)| head)
+    prepare_response_head(status, version, headers, None, metadata, request_method, config).map(|(head, _)| head)
 }
 
 pub(super) fn prepare_response_head(
     status: StatusCode,
     version: Version,
     mut headers: HeaderMap,
+    original_case: Option<&HeaderCaseMap>,
     metadata: BodyMetadata,
     request_method: &Method,
-    limits: EncodeLimits,
+    config: EncodeConfig,
 ) -> Result<(EncodedHead, super::head::ValidatedResponseHead), EncodeError> {
     let mode = plan_response_framing(&mut headers, version, status, metadata, request_method)?;
     let validated = ResponseHead {
         version,
         status,
         headers,
+        header_case: None,
     }
     .validate(request_method)
     .map_err(map_head_error)?;
@@ -182,14 +195,19 @@ pub(super) fn prepare_response_head(
         return Err(EncodeError::InvalidFraming);
     }
 
-    let mut writer = BoundedWriter::new(limits.max_head_bytes);
+    let mut writer = BoundedWriter::new(config.max_head_bytes);
     writer.push(version_bytes(version)?)?;
     writer.push(b" ")?;
     writer.push(status.as_str().as_bytes())?;
     writer.push(b" ")?;
     writer.push(status.canonical_reason().unwrap_or("").as_bytes())?;
     writer.push(b"\r\n")?;
-    write_headers(&mut writer, &validated.head.headers)?;
+    write_headers(
+        &mut writer,
+        &validated.head.headers,
+        original_case,
+        config.title_case_headers,
+    )?;
     writer.push(b"\r\n")?;
 
     Ok((
@@ -337,14 +355,46 @@ fn version_bytes(version: Version) -> Result<&'static [u8], EncodeError> {
     }
 }
 
-fn write_headers(writer: &mut BoundedWriter, headers: &HeaderMap) -> Result<(), EncodeError> {
-    for (name, value) in headers {
-        writer.push(name.as_str().as_bytes())?;
-        writer.push(b": ")?;
-        writer.push(value.as_bytes())?;
-        writer.push(b"\r\n")?;
+fn write_headers(
+    writer: &mut BoundedWriter,
+    headers: &HeaderMap,
+    original_case: Option<&HeaderCaseMap>,
+    title_case: bool,
+) -> Result<(), EncodeError> {
+    if let Some(original) = original_case {
+        for name in headers.keys() {
+            let mut spellings = original.get_all(name);
+            for value in headers.get_all(name) {
+                write_header_name(writer, name, spellings.next().map(Bytes::as_ref), title_case)?;
+                writer.push(b": ")?;
+                writer.push(value.as_bytes())?;
+                writer.push(b"\r\n")?;
+            }
+        }
+    } else {
+        for (name, value) in headers {
+            write_header_name(writer, name, None, title_case)?;
+            writer.push(b": ")?;
+            writer.push(value.as_bytes())?;
+            writer.push(b"\r\n")?;
+        }
     }
     Ok(())
+}
+
+fn write_header_name(
+    writer: &mut BoundedWriter,
+    name: &HeaderName,
+    original: Option<&[u8]>,
+    title_case: bool,
+) -> Result<(), EncodeError> {
+    if let Some(original) = original {
+        writer.push(original)
+    } else if title_case {
+        writer.push_title_case(name.as_str().as_bytes())
+    } else {
+        writer.push(name.as_str().as_bytes())
+    }
 }
 
 #[derive(Debug)]
@@ -368,6 +418,21 @@ impl BoundedWriter {
         }
         self.bytes.try_reserve(value.len()).map_err(|_| EncodeError::Limit)?;
         self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn push_title_case(&mut self, value: &[u8]) -> Result<(), EncodeError> {
+        let length = self.bytes.len().checked_add(value.len()).ok_or(EncodeError::Limit)?;
+        if length > self.limit {
+            return Err(EncodeError::Limit);
+        }
+        self.bytes.try_reserve(value.len()).map_err(|_| EncodeError::Limit)?;
+        let mut capitalize = true;
+        for &byte in value {
+            self.bytes
+                .push(if capitalize { byte.to_ascii_uppercase() } else { byte });
+            capitalize = byte == b'-';
+        }
         Ok(())
     }
 
@@ -405,13 +470,14 @@ enum BodyState {
 pub(super) struct BodyEncoder {
     state: BodyState,
     max_trailer_bytes: usize,
+    title_case_headers: bool,
     remaining_lower: u64,
     remaining_upper: Option<u64>,
     trailers: TrailerHint,
 }
 
 impl BodyEncoder {
-    pub(super) fn new(mode: BodyMode, metadata: BodyMetadata, limits: EncodeLimits) -> Result<Self, EncodeError> {
+    pub(super) fn new(mode: BodyMode, metadata: BodyMetadata, config: EncodeConfig) -> Result<Self, EncodeError> {
         match mode {
             BodyMode::Fixed(length)
                 if metadata.size.exact() != Some(length) || metadata.trailers != TrailerHint::None =>
@@ -429,7 +495,8 @@ impl BodyEncoder {
         };
         Ok(Self {
             state,
-            max_trailer_bytes: limits.max_trailer_bytes,
+            max_trailer_bytes: config.max_trailer_bytes,
+            title_case_headers: config.title_case_headers,
             remaining_lower: metadata.size.lower(),
             remaining_upper: metadata.size.upper(),
             trailers: metadata.trailers,
@@ -495,7 +562,7 @@ impl BodyEncoder {
         let mut writer = BoundedWriter::new(self.max_trailer_bytes);
         if writer
             .push(b"0\r\n")
-            .and_then(|()| write_headers(&mut writer, trailers))
+            .and_then(|()| write_headers(&mut writer, trailers, None, self.title_case_headers))
             .and_then(|()| writer.push(b"\r\n"))
             .is_err()
         {
@@ -562,7 +629,7 @@ mod tests {
     };
     use karmaio::buf::IoBuf;
 
-    const LIMITS: EncodeLimits = EncodeLimits::new(4096, 4096);
+    const LIMITS: EncodeConfig = EncodeConfig::new(4096, 4096);
 
     #[test]
     fn request_and_response_heads_round_trip() {
@@ -697,11 +764,21 @@ mod tests {
                 Version::HTTP_11,
                 headers,
                 BodyMetadata::exact(0),
-                EncodeLimits::new(8, 32)
+                EncodeConfig::new(8, 32)
             )
             .unwrap_err(),
             EncodeError::Limit
         );
+    }
+
+    #[test]
+    fn title_case_capitalizes_each_field_name_word_without_growing_it() {
+        let mut writer = BoundedWriter::new(11);
+        writer.push_title_case(b"x-http-etag").unwrap();
+        assert_eq!(writer.finish(), "X-Http-Etag");
+
+        let mut limited = BoundedWriter::new(10);
+        assert_eq!(limited.push_title_case(b"x-http-etag").unwrap_err(), EncodeError::Limit);
     }
 
     #[test]
