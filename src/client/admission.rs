@@ -121,8 +121,7 @@ impl<B> Drop for SendRequest<B> {
 impl<B> SendRequest<B> {
     /// Return whether a request permit can be acquired immediately.
     ///
-    /// Like Hyper's sender readiness hint, this is only a snapshot. A cloned
-    /// sender may acquire admission before a later call to [`Self::try_reserve`].
+    /// This is only a snapshot. A cloned sender may acquire admission before a later call to [`Self::try_reserve`].
     /// A registered asynchronous waiter retains priority and reports not ready.
     pub fn is_ready(&self) -> bool {
         let state = self.shared.borrow();

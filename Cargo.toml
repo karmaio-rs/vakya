@@ -37,11 +37,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
-name = "server"
+name = "hello"
 required-features = ["server"]
 
 [[example]]
-name = "streaming_echo"
+name = "echo"
 required-features = ["server"]
 
 [[example]]
@@ -49,15 +49,44 @@ name = "client"
 required-features = ["client"]
 
 [[example]]
-name = "informational"
+name = "client_json"
+required-features = ["client"]
+
+[[example]]
+name = "gateway"
+required-features = ["client", "server"]
+
+[[example]]
+name = "graceful_shutdown"
 required-features = ["server"]
 
 [[example]]
-name = "upgrade"
+name = "http_proxy"
+required-features = ["client", "server"]
+
+[[example]]
+name = "params"
 required-features = ["server"]
 
-[dev-dependencies]
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+[[example]]
+name = "service_struct_impl"
+required-features = ["server"]
+
+[[example]]
+name = "state"
+required-features = ["server"]
+
+[[example]]
+name = "upgrades"
+required-features = ["client", "server"]
+
+[[example]]
+name = "web_api"
+required-features = ["client", "server"]
+
+[[example]]
+name = "informational"
+required-features = ["server"]
 
 [[example]]
 name = "https_client"
@@ -66,3 +95,13 @@ required-features = ["client", "tls"]
 [[example]]
 name = "https_server"
 required-features = ["server", "tls"]
+
+[[example]]
+name = "body_utilities"
+
+[dev-dependencies]
+form_urlencoded = "1"
+karmaio = { version = "0.1.0", default-features = false, features = ["macros"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

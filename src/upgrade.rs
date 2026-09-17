@@ -32,9 +32,6 @@ pub enum UpgradeKind {
 /// client's pending response. It resolves only after the HTTP driver has
 /// settled retained operations and transferred the concrete transport halves.
 /// It does not require `Send` or `Sync`, and does not erase the returned transport.
-///
-/// This follows Hyper's request-correlated pending/fulfill model while keeping
-/// Karmaio's owned-buffer I/O types visible in the result.
 #[must_use = "an upgrade future must be awaited to receive the transport"]
 pub struct OnUpgrade<R, W> {
     shared: Option<Rc<RefCell<UpgradeState>>>,

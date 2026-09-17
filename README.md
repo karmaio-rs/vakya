@@ -25,17 +25,19 @@ No Vakya features are enabled by default. Bodies, body utilities, common HTTP ty
 | `tracing` | Connection/exchange spans, lifecycle, status, I/O progress, and error categories |
 | `full` | `client`, `server`, `tls`, and `tracing` |
 
-The examples are complete programs:
+The examples are complete programs. See [examples/README.md](examples/README.md) for the catalog and run commands.
 
-- [Client](examples/client.rs): supply a socket, drive HTTP concurrently, consume a response, and supervise shutdown.
-- [Server](examples/server.rs): accept a socket and supply an async service.
-- [Streaming echo](examples/streaming_echo.rs): return the incoming request body as the response body.
-- [Body utilities](examples/body_utilities.rs): compose bodies and collect them with explicit limits.
-- [Informational responses](examples/informational.rs): send heads through the request context.
-- [Transport handoff](examples/upgrade.rs): continue application I/O after HTTP settles.
-- [HTTPS client](examples/https_client.rs) and [HTTPS server](examples/https_server.rs): configure a provider and certificates in the application, perform TLS through Karmaio, then give the stream to Vakya.
+Getting started:
 
-For the plain HTTP examples, run `cargo run --example server --features server` and, in another terminal, `cargo run --example client --features client`.
+- [Hello](examples/hello.rs): accept connections and return "Hello World!".
+- [Echo](examples/echo.rs): route POST bodies, including streaming uppercase and bounded reverse.
+- [Client](examples/client.rs): request a URL and stream the response to stdout.
+
+Going further: reverse proxying, CONNECT tunnels, graceful shutdown, shared state, form parsing, and JSON APIs.
+
+Vakya-specific: [informational responses](examples/informational.rs), [HTTPS client](examples/https_client.rs) and [HTTPS server](examples/https_server.rs), and [body utilities](examples/body_utilities.rs). TLS configuration stays in the application; Karmaio establishes the session and Vakya frames HTTP/1.
+
+For the plain HTTP examples, run `cargo run --example hello --features server` and, in another terminal, `cargo run --example client --features client -- http://127.0.0.1:3000/`.
 
 ## Connections and ownership
 

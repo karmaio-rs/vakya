@@ -1,20 +1,25 @@
 //! Application-owned TLS configuration and dialing over an explicit socket address.
-//! Usage: https_client <address:port> <server-name> <ca.der>
+//!
+//! Usage: `cargo run --example https_client --features "client,tls" -- <address:port> <server-name> <ca.der>`
 use std::{
+    io::{self, Write},
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
+
 use vakya::{
     Request,
-    body::{BodyExt, Empty},
+    body::{Body, Empty},
     client::conn::http1::Builder,
     tls::{HTTP_11_ALPN, rustls},
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[karmaio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: https_client <address:port> <server-name> <ca.der>";
-    let address: std::net::SocketAddr = args.next().ok_or(usage)?.parse()?;
+    let address: SocketAddr = args.next().ok_or(usage)?.parse()?;
     let name = args.next().ok_or(usage)?;
     let ca = std::fs::read(args.next().ok_or(usage)?)?;
     let mut roots = rustls::RootCertStore::empty();
@@ -31,34 +36,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{name}:{}", address.port())
     };
     let peer_name = rustls::pki_types::ServerName::try_from(name)?;
-    karmaio::Runtime::new()?.block_on(async {
-        let socket = karmaio::net::tcp::TcpStream::connect(address).await?;
-        let tls = karmaio::tls::TlsConnector::new(Arc::new(config))
-            .connect(peer_name, socket)
+
+    let socket = karmaio::net::tcp::TcpStream::connect(address).await?;
+    let tls = karmaio::tls::TlsConnector::new(Arc::new(config))
+        .connect(peer_name, socket)
+        .await?;
+    let (sender, connection) = Builder::new().handshake_tls::<_, Empty>(tls)?;
+    let control = connection.control();
+    let driver = karmaio::runtime::spawn_local(connection.run());
+    let exchange = async {
+        let mut response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/")
+                    .header("host", authority)
+                    .body(Empty::new())?,
+            )
             .await?;
-        let (sender, connection) = Builder::new().handshake_tls::<_, Empty>(tls)?;
-        let control = connection.control();
-        let driver = karmaio::runtime::spawn_local(connection.run());
-        let exchange = async {
-            let response = sender
-                .send_request(
-                    Request::builder()
-                        .uri("/")
-                        .header("host", authority)
-                        .body(Empty::new())?,
-                )
-                .await?;
-            println!("{}", response.status());
-            let body = response.into_body().collect(1024 * 1024).await?;
-            println!("{}", String::from_utf8_lossy(body.bytes()));
-            Ok::<_, Box<dyn std::error::Error>>(())
+        println!("Response: {}", response.status());
+        println!("Headers: {:#?}\n", response.headers());
+
+        let mut stdout = io::stdout();
+        while let Some(frame) = response.body_mut().next_frame().await? {
+            if let Some(chunk) = frame.data_ref() {
+                stdout.write_all(chunk.as_ref())?;
+            }
         }
-        .await;
-        control.graceful_shutdown_with_deadline(Instant::now() + Duration::from_secs(5));
-        drop(sender);
-        let settled = driver.await?;
-        exchange?;
-        settled?;
-        Ok(())
-    })
+        println!("\n\nDone!");
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    control.graceful_shutdown_with_deadline(Instant::now() + Duration::from_secs(5));
+    drop(sender);
+    let settled = driver.await?;
+    exchange?;
+    settled?;
+    Ok(())
 }

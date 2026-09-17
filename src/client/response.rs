@@ -168,9 +168,8 @@ impl PendingResponse {
 
     /// Wait for the final response and return its correlated upgrade future.
     ///
-    /// This is the typed Karmaio counterpart to obtaining Hyper's `OnUpgrade`
-    /// from a response. Await the second value only when the final response
-    /// accepts an upgrade or CONNECT tunnel. `R` and `W` must match the supplied
+    /// Await the second value only when the final response accepts an upgrade or CONNECT tunnel.
+    /// `R` and `W` must match the supplied
     /// transport's concrete halves.
     ///
     /// # Errors
