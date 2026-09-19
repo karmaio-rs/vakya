@@ -1,13 +1,15 @@
 [package]
 name = "vakya"
+version = "0.1.0-alpha.1"
 description = "Completion-native HTTP building blocks for the Karmaio runtime"
 repository = "https://github.com/karmaio-rs/vakya"
+documentation = "https://docs.rs/vakya"
 readme = "README.md"
 authors = ["Tarak Sharma <tarak@taraksharma.com>"]
 license = "MIT OR Apache-2.0"
-exclude = ["AGENTS.md"]
 
-version = "0.1.0"
+# Publish the library and examples; repository tests remain source-only.
+include = ["LICENSE-APACHE", "LICENSE-MIT", "examples/**/*", "src/**/*",]
 
 categories = ["asynchronous", "network-programming", "web-programming"]
 keywords = ["async", "http", "karmaio"]
