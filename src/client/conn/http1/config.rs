@@ -27,7 +27,7 @@ impl Default for Config {
             write_progress_timeout: None,
             preferred_read: 16 * 1024,
             max_retained: 128 * 1024,
-            continue_wait: None,
+            continue_wait: Some(std::time::Duration::from_secs(1)),
         }
     }
 }

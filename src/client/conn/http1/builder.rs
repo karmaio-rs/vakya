@@ -180,7 +180,8 @@ impl Builder {
 
     /// Configure bounded waiting after flushing an Expect: 100-continue request
     /// head. A peer 100, any final response, or timeout permits the upload.
-    /// `None` (the default) sends immediately. This does not add an Expect header.
+    /// Defaults to one second. `None` sends the body immediately. This does
+    /// not add an Expect header.
     ///
     /// # Errors
     /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
@@ -335,6 +336,7 @@ mod timeout_tests {
     #[test]
     fn timeout_validation_preserves_configuration_on_rejection() {
         let mut builder = Builder::new();
+        assert_eq!(builder.config.continue_wait, Some(Duration::from_secs(1)));
         macro_rules! check {
             ($method:ident) => {{
                 let previous = builder.config.$method;

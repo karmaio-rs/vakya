@@ -249,6 +249,36 @@ fn observation_is_ordered_bounded_and_count_limited() {
 }
 
 #[test]
+fn default_continue_wait_holds_upload_until_peer_100() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let permit = Gate::default();
+        let (writer, bytes) = ObservedWriter::new();
+        let (sender, driver) = Client::new().handshake((
+            Reader::new([
+                ReadStep::Wait(permit.clone()),
+                ReadStep::Data(Bytes::from_static(
+                    b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )),
+            ]),
+            writer,
+        ));
+        let pending = sender.start_request(upload()).await.unwrap();
+        let mut driver = pin!(driver.run());
+        for _ in 0..10 {
+            assert!(poll(driver.as_mut()).is_pending());
+        }
+        let head = output(&bytes);
+        assert!(head.contains("expect: 100-continue"));
+        assert!(!head.contains("upload"));
+        permit.open();
+        let (result, response) = pair(driver, pending.response()).await;
+        result.unwrap();
+        response.unwrap();
+        assert!(output(&bytes).ends_with("upload"));
+    });
+}
+
+#[test]
 fn continue_timeout_sends_without_a_peer_permission() {
     struct NotifyWrite {
         writer: Writer,
