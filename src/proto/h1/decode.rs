@@ -16,6 +16,7 @@ use std::ops::Range;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DecodeLimits {
     max_chunk_line_bytes: usize,
+    max_chunk_extension_bytes: usize,
     max_trailer_bytes: usize,
     max_trailers: usize,
 }
@@ -28,9 +29,16 @@ impl DecodeLimits {
         );
         Self {
             max_chunk_line_bytes: chunk_line,
+            max_chunk_extension_bytes: 16 * 1024,
             max_trailer_bytes: trailer_bytes,
             max_trailers: trailers,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn with_chunk_extension_limit(mut self, bytes: usize) -> Self {
+        self.max_chunk_extension_bytes = bytes;
+        self
     }
 }
 
@@ -43,6 +51,7 @@ impl Default for DecodeLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DecodeLimit {
     ChunkLineBytes,
+    ChunkExtensionBytes,
     TrailerBytes,
     Trailers,
     TrailerMap,
@@ -107,6 +116,7 @@ enum DecoderState {
 pub(super) struct BodyDecoder {
     state: DecoderState,
     limits: DecodeLimits,
+    extension_bytes: usize,
     trailer_workspace: Option<HeaderWorkspace>,
 }
 
@@ -126,6 +136,7 @@ impl BodyDecoder {
         Self {
             state,
             limits,
+            extension_bytes: 0,
             trailer_workspace: None,
         }
     }
@@ -272,7 +283,10 @@ impl BodyDecoder {
                 if consumed > self.limits.max_chunk_line_bytes {
                     return Err(DecodeError::Limit(DecodeLimit::ChunkLineBytes));
                 }
-                return parse_chunk_line(&input[..index - 1]).map(|size| (Some((size, consumed)), 0));
+                let line = &input[..index - 1];
+                let size = parse_chunk_line(line)?;
+                self.charge_extensions(line)?;
+                return Ok((Some((size, consumed)), 0));
             }
             if index > 0 && input[index - 1] == b'\r' {
                 return Err(DecodeError::InvalidChunkSize);
@@ -363,6 +377,22 @@ impl BodyDecoder {
     fn fail<T>(&mut self, error: DecodeError) -> Result<T, DecodeError> {
         self.state = DecoderState::Failed(error);
         Err(error)
+    }
+
+    fn charge_extensions(&mut self, line: &[u8]) -> Result<(), DecodeError> {
+        let Some(start) = line.iter().position(|byte| *byte == b';') else {
+            return Ok(());
+        };
+        let added = line.len() - start;
+        let total = self
+            .extension_bytes
+            .checked_add(added)
+            .ok_or(DecodeError::Limit(DecodeLimit::ChunkExtensionBytes))?;
+        if total > self.limits.max_chunk_extension_bytes {
+            return Err(DecodeError::Limit(DecodeLimit::ChunkExtensionBytes));
+        }
+        self.extension_bytes = total;
+        Ok(())
     }
 }
 
@@ -677,6 +707,31 @@ mod tests {
             exact.decode(b"\r\n0\r\nA: 1\r\n\r\n", false).unwrap(),
             DecodeOutcome::Trailers { .. }
         ));
+
+        let extension_limits = DecodeLimits::new(32, 8, 1).with_chunk_extension_limit(4);
+        let mut over = BodyDecoder::with_limits(BodyMode::Chunked, extension_limits);
+        assert_eq!(
+            drive(&mut over, b"1;ab\r\nx\r\n1;c\r\ny\r\n0\r\n\r\n").unwrap_err(),
+            DecodeError::Limit(DecodeLimit::ChunkExtensionBytes)
+        );
+        let mut allowed = BodyDecoder::with_limits(BodyMode::Chunked, extension_limits);
+        assert!(drive(&mut allowed, b"1;a\r\nx\r\n0\r\n\r\n").is_ok());
+        let mut size_only = BodyDecoder::with_limits(BodyMode::Chunked, extension_limits);
+        assert!(drive(&mut size_only, b"1\r\nx\r\n1\r\ny\r\n0\r\n\r\n").is_ok());
+    }
+
+    fn drive(decoder: &mut BodyDecoder, mut input: &[u8]) -> Result<(), DecodeError> {
+        loop {
+            match decoder.decode(input, false)? {
+                DecodeOutcome::Trailers { .. } | DecodeOutcome::End { .. } => return Ok(()),
+                DecodeOutcome::NeedMore { consumed } | DecodeOutcome::Data { consumed, .. } => {
+                    input = &input[consumed..];
+                    if input.is_empty() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
