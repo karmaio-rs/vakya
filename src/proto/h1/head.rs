@@ -359,6 +359,7 @@ impl ResponseHead {
             || request_method == Method::HEAD
             || self.status.is_informational()
             || self.status == StatusCode::NO_CONTENT
+            || self.status == StatusCode::RESET_CONTENT
             || self.status == StatusCode::NOT_MODIFIED
         {
             BodyMode::None
@@ -1205,7 +1206,7 @@ mod tests {
                 .body,
             BodyMode::None
         );
-        for status in [100, 204, 304] {
+        for status in [100, 204, 205, 304] {
             let bytes = format!("HTTP/1.1 {status} Status\r\nContent-Length: 9\r\n\r\n");
             assert_eq!(
                 response(bytes.as_bytes()).validate(&Method::GET).unwrap().body,
@@ -1225,8 +1226,8 @@ mod tests {
         let reset = response(b"HTTP/1.1 205 Reset Content\r\n\r\n")
             .validate(&Method::GET)
             .unwrap();
-        assert_eq!(reset.body, BodyMode::UntilEof);
-        assert_eq!(reset.persistence, Persistence::Close);
+        assert_eq!(reset.body, BodyMode::None);
+        assert_eq!(reset.persistence, Persistence::Reusable);
         assert_eq!(
             response(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .validate(&Method::CONNECT)
