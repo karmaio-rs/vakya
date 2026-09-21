@@ -4,7 +4,7 @@ use super::{
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_response_head},
     exchange::{Direction, Exchange, Outcome},
-    head::{HeadParser, RequestRole, ValidatedRequestHead},
+    head::{HeadError, HeadParser, RequestHead, RequestRole, ValidatedRequestHead},
     header_case::HeaderCaseMap,
 };
 use crate::{
@@ -25,7 +25,7 @@ use crate::{
     upgrade::{self, PendingUpgrade, Upgraded},
 };
 use http::{
-    HeaderValue, Method, Request, Response, Version,
+    HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version,
     header::{CONNECTION, DATE},
 };
 use karmaio::{
@@ -109,12 +109,20 @@ where
                 return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
             }
 
-            match parser.head_len(buffer.bytes())? {
-                Some(consumed) => {
+            match parser.head_len(buffer.bytes()) {
+                Ok(Some(consumed)) => {
                     let input = buffer.take_shared_prefix(consumed)?;
-                    break parser.parse_shared(input)?.validate_received()?;
+                    match parser.parse_shared(input).and_then(RequestHead::validate_received) {
+                        Ok(head) => break head,
+                        Err(error) => {
+                            return Err(reply_illegal_head(&mut writer, error, &config, &mut date, shutdown).await);
+                        }
+                    }
                 }
-                None => {
+                Err(error) => {
+                    return Err(reply_illegal_head(&mut writer, error, &config, &mut date, shutdown).await);
+                }
+                Ok(None) => {
                     let mut read = pin!(
                         strategy
                             .read_until(&mut reader, buffer, Some(idle_read.token()), deadline)
@@ -592,6 +600,53 @@ where
     use karmaio::runtime::FutureExt;
     writer.flush().with_cancellation(source.token()).await?;
     Ok(head.persistence)
+}
+
+async fn reply_illegal_head<W: AsyncWrite>(
+    writer: &mut W,
+    error: HeadError,
+    config: &ServerConfig,
+    date: &mut DateCache,
+    shutdown: &CancellationSource,
+) -> Error {
+    let status = match error {
+        HeadError::Limit(_) => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    let failure = Error::from(error);
+    if !config.auto_error_response {
+        return failure;
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    if config.auto_date {
+        headers.insert(DATE, date.value());
+    }
+    let Ok((head, _)) = prepare_response_head(
+        status,
+        Version::HTTP_11,
+        headers,
+        None,
+        BodyMetadata {
+            size: SizeHint::with_exact(0),
+            trailers: TrailerHint::None,
+        },
+        &Method::GET,
+        config.protocol.encode,
+    ) else {
+        return failure;
+    };
+
+    let _ = async {
+        let (result, _) = write_all(writer, head.bytes, Some(shutdown.token())).await.into_parts();
+        result?;
+        writer.flush().with_cancellation(shutdown.token()).await?;
+        writer.shutdown().with_cancellation(shutdown.token()).await?;
+        Ok::<(), Error>(())
+    }
+    .await;
+    failure
 }
 
 #[derive(Default)]

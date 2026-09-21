@@ -187,6 +187,14 @@ impl Builder {
         self
     }
 
+    /// Send 400 or 431 before closing when a request head is illegal or exceeds
+    /// configured limits. Defaults to `true`. Partial heads that end at EOF
+    /// still close without a response.
+    pub fn auto_error_response(&mut self, enabled: bool) -> &mut Self {
+        self.config.auto_error_response = enabled;
+        self
+    }
+
     /// Record the original casing of received request header names.
     ///
     /// The metadata is kept in a private request extension. Vakya HTTP/1

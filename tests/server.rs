@@ -461,11 +461,13 @@ fn invalid_heads_and_local_framing_fail_before_response_bytes_are_written() {
             calls.set(1);
             Ok::<_, Infallible>(Response::new(Empty::new()))
         });
+        let (writer, bytes) = ObservedWriter::new();
         let error = Builder::new()
+            .auto_date(false)
             .serve_connection(
                 (
                     reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n"),
-                    Writer::new([]),
+                    writer,
                 ),
                 service,
             )
@@ -474,6 +476,10 @@ fn invalid_heads_and_local_framing_fail_before_response_bytes_are_written() {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidMessage);
         assert_eq!(calls.get(), 0);
+        let wire = output(&bytes);
+        assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(wire.contains("connection: close\r\n"));
+        assert!(wire.contains("content-length: 0\r\n"));
     });
 }
 
@@ -598,6 +604,7 @@ fn request_limits_and_partial_head_eof_fail_before_service_admission() {
             let mut builder = Builder::new();
             builder.head_limits(128, 1).unwrap();
             let error = builder
+                .auto_date(false)
                 .serve_connection((reader(wire), Writer::new([])), service)
                 .run()
                 .await
@@ -605,5 +612,69 @@ fn request_limits_and_partial_head_eof_fail_before_service_admission() {
             assert_eq!(error.kind(), expected);
             assert_eq!(calls.get(), 0);
         }
+    });
+}
+
+#[test]
+fn illegal_request_heads_send_400_or_431_unless_disabled() {
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let service =
+            service_fn(async |_: (Request<Incoming>, RequestContext)| Ok::<_, Infallible>(Response::new(Empty::new())));
+
+        let (writer, bytes) = ObservedWriter::new();
+        let error = Builder::new()
+            .auto_date(false)
+            .serve_connection(
+                (
+                    reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: foo\r\n\r\n"),
+                    writer,
+                ),
+                service,
+            )
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
+        assert!(output(&bytes).starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let (writer, bytes) = ObservedWriter::new();
+        let mut builder = Builder::new();
+        builder.head_limits(128, 1).unwrap();
+        let error = builder
+            .auto_date(false)
+            .serve_connection(
+                (reader(b"GET / HTTP/1.1\r\nHost: test\r\nX: one\r\n\r\n"), writer),
+                service,
+            )
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Limit);
+        assert!(output(&bytes).starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+
+        let (writer, bytes) = ObservedWriter::new();
+        let error = Builder::new()
+            .auto_error_response(false)
+            .serve_connection(
+                (
+                    reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: foo\r\n\r\n"),
+                    writer,
+                ),
+                service,
+            )
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
+        assert!(bytes.borrow().is_empty());
+
+        let (writer, bytes) = ObservedWriter::new();
+        let error = Builder::new()
+            .serve_connection((reader(b"GET / HTTP/1.1\r\nHost: test"), writer), service)
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
+        assert!(bytes.borrow().is_empty());
     });
 }

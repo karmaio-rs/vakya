@@ -13,6 +13,7 @@ pub(crate) struct Config {
     pub(crate) preferred_read: usize,
     pub(crate) max_retained: usize,
     pub(crate) auto_date: bool,
+    pub(crate) auto_error_response: bool,
 }
 
 impl Default for Config {
@@ -28,6 +29,7 @@ impl Default for Config {
             preferred_read: 16 * 1024,
             max_retained: 128 * 1024,
             auto_date: true,
+            auto_error_response: true,
         }
     }
 }
