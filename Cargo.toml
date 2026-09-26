@@ -22,9 +22,10 @@ default = []
 http1 = ["dep:httparse"]
 client = ["http1"]
 server = ["http1", "dep:httpdate"]
+fs = ["karmaio/fs"]
 tls = ["karmaio/tls-rustls"]
 tracing = ["dep:tracing"]
-full = ["client", "server", "tls", "tracing"]
+full = ["client", "server", "tls", "tracing", "fs"]
 
 [dependencies]
 bytes = "1"
@@ -41,6 +42,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[example]]
 name = "hello"
 required-features = ["server"]
+
+[[example]]
+name = "file_server"
+required-features = ["server", "fs"]
 
 [[example]]
 name = "echo"

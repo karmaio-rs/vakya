@@ -8,8 +8,9 @@
 //!
 //! No features are enabled by default. `client` and `server` each enable
 //! `http1`. `tls` adds supplied-TLS-stream integration without selecting a role,
-//! crypto provider, or trust store. `tracing` observes lifecycle events, and
-//! `full` enables both roles, TLS, and tracing.
+//! crypto provider, or trust store. `fs` adds supplied-file streaming bodies.
+//! `tracing` observes lifecycle events, and
+//! `full` enables both roles, TLS, tracing, and file bodies.
 //!
 //! # Execution and ownership
 //!

@@ -3,9 +3,15 @@
 mod boxed;
 mod collect;
 mod combinator;
+mod exact_length;
+#[cfg(feature = "fs")]
+mod file;
 mod frame;
 #[allow(dead_code)] // Bodies are available without a connection role.
 pub(crate) mod incoming;
+mod limited;
+mod map_data;
+mod reader;
 mod simple;
 mod size_hint;
 mod stream;
@@ -15,8 +21,15 @@ use karmaio::buf::IoBuf;
 pub use boxed::BoxBody;
 pub use collect::{CollectError, Collected, collect};
 pub use combinator::{Either, InspectFrame, MapError, MapFrame, WithTrailers};
+pub use exact_length::{ExactLength, ExactLengthError};
+#[cfg(feature = "fs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fs")))]
+pub use file::{FileBody, FileParts};
 pub use frame::Frame;
 pub use incoming::{Incoming, IncomingData};
+pub use limited::{LimitError, Limited};
+pub use map_data::MapData;
+pub use reader::{ReaderBody, ReaderParts};
 pub use simple::{Empty, Full};
 pub use size_hint::SizeHint;
 pub use stream::{BodyDataStream, BodyStream, StreamBody};
@@ -126,6 +139,38 @@ impl<B: Body + ?Sized> Body for &mut B {
 /// should remain available after a consuming operation.
 #[allow(async_fn_in_trait)]
 pub trait BodyExt: Body {
+    /// Transforms data buffers while preserving trailers and source errors.
+    /// Payload length becomes unknown and transformed recycling drops the output.
+    #[inline]
+    fn map_data<F, D>(self, map: F) -> MapData<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(Self::Data) -> D,
+        D: IoBuf,
+    {
+        MapData::new(self, map)
+    }
+
+    /// Bounds streaming payload bytes, rejecting overflowing frames in full.
+    /// Trailers are free; overflow reclaims the frame and drops the owned source.
+    #[inline]
+    fn limit(self, max_bytes: u64) -> Limited<Self>
+    where
+        Self: Sized,
+    {
+        Limited::new(self, max_bytes)
+    }
+
+    /// Validates an exact payload length and independently supplied trailer policy.
+    /// Violations reclaim the offending frame and drop the owned source.
+    #[inline]
+    fn with_exact_length(self, bytes: u64, trailer_hint: TrailerHint) -> ExactLength<Self>
+    where
+        Self: Sized,
+    {
+        ExactLength::new(self, bytes, trailer_hint)
+    }
+
     /// Erases this body locally, preserving metadata and recycling.
     ///
     /// This boxes the producer and each driven frame future. Payload and error

@@ -534,12 +534,17 @@ mod tests {
                 assert_eq!(payload.managed_strong_count(), Some(1));
                 assert_eq!(buffer.bytes(), b"NEXT");
 
-                let slice = IncomingData::slice(&payload, 1..3);
+                let mut slice = IncomingData::slice(&payload, 1..3);
                 assert_eq!(slice.as_ref(), b"od");
                 assert_eq!(payload.managed_strong_count(), Some(2));
-                drop(slice);
+                bytes::Buf::advance(&mut slice, 1);
+                let converted_slice = slice.into_bytes();
+                assert_eq!(converted_slice, b"d"[..]);
+                assert_ne!(converted_slice.as_ptr(), payload_pointer.wrapping_add(2));
                 assert_eq!(payload.managed_strong_count(), Some(1));
-                drop(payload);
+                let portable = payload.into_bytes();
+                assert_eq!(portable, b"body"[..]);
+                assert!(!buffer.managed_permit.as_ref().unwrap().is_held());
 
                 buffer.consume(4).unwrap();
                 assert_eq!(managed_read(&mut buffer, &mut reader).await.unwrap(), ReadStatus::Eof);

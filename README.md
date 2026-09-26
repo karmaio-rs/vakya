@@ -37,7 +37,8 @@ No Vakya features are enabled by default:
 | `server` | HTTP/1 server APIs; implies `http1` |
 | `tls` | Integration with established Karmaio Rustls streams |
 | `tracing` | Connection and exchange instrumentation |
-| `full` | `client`, `server`, `tls`, and `tracing` |
+| `fs` | Streaming bodies over supplied Karmaio files |
+| `full` | `client`, `server`, `tls`, `tracing`, and `fs` |
 
 See the [API documentation](https://docs.rs/vakya) for the complete public surface.
 

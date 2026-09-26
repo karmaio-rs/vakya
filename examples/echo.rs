@@ -6,7 +6,7 @@ use std::{convert::Infallible, io, net::SocketAddr};
 use bytes::Bytes;
 use vakya::{
     Method, Request, Response, StatusCode,
-    body::{Body, BodyExt, BoxBody, CollectError, Empty, Full, Incoming},
+    body::{Body, BodyExt, BoxBody, CollectError, Empty, Full, Incoming, IncomingData},
     error::Error,
     server::{RequestContext, conn::http1::Builder},
     service::service_fn,
@@ -21,16 +21,14 @@ async fn echo(
         ))),
         (&Method::POST, "/echo") => Ok(Response::new(map_bytes(req.into_body()).boxed())),
         (&Method::POST, "/echo/uppercase") => {
-            let body = req.into_body().map_frame(|frame| {
-                frame.map_data(|data| {
-                    Bytes::from(
-                        data.as_ref()
-                            .iter()
-                            .copied()
-                            .map(|byte| byte.to_ascii_uppercase())
-                            .collect::<Vec<_>>(),
-                    )
-                })
+            let body = req.into_body().map_data(|data| {
+                Bytes::from(
+                    data.as_ref()
+                        .iter()
+                        .copied()
+                        .map(|byte| byte.to_ascii_uppercase())
+                        .collect::<Vec<_>>(),
+                )
             });
             Ok(Response::new(body.boxed()))
         }
@@ -64,7 +62,7 @@ async fn echo(
 }
 
 fn map_bytes(body: Incoming) -> impl vakya::body::Body<Data = Bytes, Error = Error> {
-    body.map_frame(|frame| frame.map_data(|data| Bytes::copy_from_slice(data.as_ref())))
+    body.map_data(IncomingData::into_bytes)
 }
 
 fn empty() -> BoxBody<'static, Bytes, Error> {

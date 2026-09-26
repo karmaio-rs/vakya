@@ -207,6 +207,12 @@ impl fmt::Debug for Incoming {
 /// Data remains valid after its body, connection, or runtime is dropped.
 /// This type is local to the Karmaio execution context and is not `Send` or `Sync`.
 /// Retaining a managed view makes that connection use portable reads until all views of the lease are dropped.
+///
+/// ```compile_fail
+/// use vakya::body::IncomingData;
+/// fn require_send<T: Send>() {}
+/// require_send::<IncomingData>();
+/// ```
 #[derive(Clone)]
 pub struct IncomingData {
     storage: IncomingStorage,
@@ -256,6 +262,22 @@ impl Drop for ManagedIncoming {
 }
 
 impl IncomingData {
+    /// Convert the remaining payload view into portable, `Send` and `Sync` bytes.
+    ///
+    /// Existing `Bytes` storage transfers directly, preserving slicing and
+    /// advancement without copying. A managed-buffer view copies only its
+    /// remaining range and releases this view's lease reference. The lease is
+    /// returned when its last view disappears. `IncomingData` itself remains
+    /// uniformly local on every platform.
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        match self.storage {
+            IncomingStorage::Bytes(bytes) => bytes,
+            #[cfg(target_os = "linux")]
+            IncomingStorage::Managed { incoming, range } => Bytes::copy_from_slice(&incoming.buffer[range]),
+        }
+    }
+
     pub(crate) fn from_bytes(bytes: Bytes) -> Self {
         Self {
             storage: IncomingStorage::Bytes(bytes),
@@ -523,5 +545,24 @@ mod tests {
         assert_eq!(data.slice(1..4).as_ref(), b"ayl");
         assert_eq!(data.as_ref(), b"payload");
         assert!(!format!("{data:?}").contains("payload"));
+    }
+
+    #[test]
+    fn portable_conversion_moves_the_remaining_sliced_storage_without_copying() {
+        use bytes::Buf;
+        fn portable<T: Send + Sync>() {}
+        portable::<Bytes>();
+        let bytes = Bytes::from(b"payload".to_vec());
+        let pointer = bytes.as_ptr();
+        let original = IncomingData::from_bytes(bytes);
+        let mut view = original.slice(1..6);
+        view.advance(2);
+        let bytes = view.into_bytes();
+        assert_eq!(bytes, b"loa"[..]);
+        assert_eq!(bytes.as_ptr(), pointer.wrapping_add(3));
+        assert_eq!(original.as_ref(), b"payload");
+        let mut empty = original.clone();
+        empty.advance(empty.len());
+        assert!(empty.into_bytes().is_empty());
     }
 }

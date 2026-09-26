@@ -6,7 +6,7 @@ use std::{convert::Infallible, io, net::SocketAddr};
 use bytes::Bytes;
 use vakya::{
     Method, Request, Response, StatusCode,
-    body::{BodyExt, BoxBody, CollectError, Full, Incoming},
+    body::{BodyExt, BoxBody, CollectError, Full, Incoming, IncomingData},
     client::conn::http1::Builder as ClientBuilder,
     error::Error,
     server::{RequestContext, conn::http1::Builder as ServerBuilder},
@@ -93,7 +93,7 @@ async fn collect_body(req: Request<Incoming>) -> Result<Bytes, io::Error> {
 }
 
 fn map_bytes(body: Incoming) -> impl vakya::body::Body<Data = Bytes, Error = Error> {
-    body.map_frame(|frame| frame.map_data(|data| Bytes::copy_from_slice(data.as_ref())))
+    body.map_data(IncomingData::into_bytes)
 }
 
 fn full(chunk: impl Into<Bytes>) -> BoxBody<'static, Bytes, Error> {

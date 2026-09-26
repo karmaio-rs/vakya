@@ -5,7 +5,7 @@ use karmaio::io::Stream;
 use std::{cell::Cell, collections::VecDeque, convert::Infallible};
 use vakya::{
     HeaderMap, HeaderValue, Response,
-    body::{BodyExt, BoxBody, Frame, Full, StreamBody},
+    body::{Body, BodyExt, BoxBody, Frame, Full, ReaderBody, StreamBody, TrailerHint},
 };
 
 struct Chunks(VecDeque<Vec<u8>>);
@@ -40,17 +40,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 observed.set(observed.get() + data.len());
             }
         })
-        .map_frame(|frame| {
-            frame.map_data(|mut data| {
-                data.push(b'!');
-                data
-            })
+        .map_data(|mut data| {
+            data.push(b'!');
+            data
         })
         .with_trailers(trailers);
     let collected = body.collect(6).await?;
     assert_eq!(collected.as_ref(), b"hello!");
     assert_eq!(collected.trailers().unwrap()["x-complete"], "yes");
     assert_eq!(observed.get(), 5);
+
+    // A stream's exact length is checked through its actual terminal frame.
+    let mut body = StreamBody::new(Chunks(VecDeque::from([b"hello ".to_vec(), b"world".to_vec()])))
+        .with_exact_length(11, TrailerHint::None)
+        .limit(11);
+    assert_eq!(body.size_hint().exact(), Some(11));
+    let mut bytes = 0;
+    while let Some(frame) = body.next_frame().await? {
+        if let Ok(data) = frame.into_data() {
+            bytes += data.len();
+            // The buffer is returned to its source while that source remains
+            // available. No whole-body collection is needed for this limit.
+            body.recycle(data);
+        }
+    }
+    assert_eq!(bytes, 11);
+
+    // Owned readers retain a submitted read if its frame wait is dropped.
+    let mut reader = ReaderBody::with_chunk_size(std::io::Cursor::new(b"reader".to_vec()), 3)?;
+    let first = reader.next_frame().await?.unwrap().into_data().unwrap();
+    assert_eq!(&first[..], b"rea");
+    reader.recycle(first);
+    let collected = reader.collect(6).await?;
+    assert_eq!(collected.as_ref(), b"der");
 
     for streaming in [false, true] {
         let response = Response::new(response_body(streaming));
