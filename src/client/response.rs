@@ -6,7 +6,7 @@ use crate::{
         pipe::{self, Consumer, Producer, TakeError},
     },
     error::{Error, ErrorKind},
-    upgrade::{OnUpgrade, UpgradeSlot},
+    upgrade::{self, BoxedOnUpgrade, OnUpgrade, PendingUpgrade, UpgradeSlot, UpgradeState, UpgradeStorage},
 };
 use karmaio::runtime::CancellationSource;
 use std::{
@@ -23,6 +23,13 @@ pub(crate) struct Control {
     pub(crate) aborted: Cell<bool>,
     continue_allowed: Cell<bool>,
     continue_waker: RefCell<Option<Waker>>,
+    upgrade: RefCell<UpgradeState>,
+}
+
+impl UpgradeStorage for Control {
+    fn upgrade_state(&self) -> &RefCell<UpgradeState> {
+        &self.upgrade
+    }
 }
 
 struct ContinueWait<'a>(&'a RefCell<Option<Waker>>);
@@ -109,13 +116,22 @@ impl PendingResponse {
         self.control.clone()
     }
 
-    /// Claim the transport if the final response completes an HTTP upgrade or tunnel.
+    /// Claim local upgraded I/O without naming the transport's concrete halves.
     ///
-    /// Claim this before awaiting the final response. The future resolves only
-    /// after the HTTP driver has settled retained operations and relinquished
-    /// the transport. `R` and `W` must match the supplied transport's concrete
-    /// halves. A mismatch or repeated claim resolves with `Upgrade`.
-    pub fn on_upgrade<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
+    /// Claim before HTTP hands off ownership. The future resolves only after
+    /// retained HTTP operations settle. A duplicate claim fails with `Upgrade`;
+    /// dropping the claim before delivery preserves the concrete driver outcome.
+    /// Claims after driver retirement or transport transfer fail with `Upgrade`.
+    #[inline]
+    pub fn on_upgrade(&mut self) -> BoxedOnUpgrade {
+        self.upgrade.claim_boxed()
+    }
+
+    /// Claim the original concrete transport halves after HTTP settlement.
+    /// `R` and `W` must match the supplied transport's owned halves. A mismatch
+    /// or duplicate claim fails with `Upgrade` and preserves driver ownership.
+    #[inline]
+    pub fn on_upgrade_typed<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
         self.upgrade.claim()
     }
 
@@ -166,6 +182,17 @@ impl PendingResponse {
         Err(Error::new(ErrorKind::Closed, "final response already consumed"))
     }
 
+    /// Wait for the final response and return its local boxed upgrade claim.
+    /// Await the claim only when the response accepts an upgrade or tunnel.
+    ///
+    /// # Errors
+    /// Returns an exchange failure, or `Closed` if no final response remains.
+    pub async fn response_with_upgrade(mut self) -> Result<(Response<Incoming>, BoxedOnUpgrade), Error> {
+        let upgrade = self.on_upgrade();
+        let response = self.response().await?;
+        Ok((response, upgrade))
+    }
+
     /// Wait for the final response and return its correlated upgrade future.
     ///
     /// Await the second value only when the final response accepts an upgrade or CONNECT tunnel.
@@ -174,10 +201,10 @@ impl PendingResponse {
     ///
     /// # Errors
     /// Returns an exchange failure, or `Closed` if no final response remains.
-    pub async fn response_with_upgrade<R: 'static, W: 'static>(
+    pub async fn response_with_typed_upgrade<R: 'static, W: 'static>(
         mut self,
     ) -> Result<(Response<Incoming>, OnUpgrade<R, W>), Error> {
-        let upgrade = self.on_upgrade();
+        let upgrade = self.on_upgrade_typed();
         while let Some(event) = self.next_event().await? {
             if let ResponseEvent::Final(response) = event {
                 return Ok((response, upgrade));
@@ -196,7 +223,12 @@ impl Drop for PendingResponse {
     }
 }
 
-pub(crate) fn channel(upgrade: UpgradeSlot) -> (Producer<ResponseEvent, Error>, PendingResponse, Rc<Control>) {
+pub(crate) fn channel() -> (
+    Producer<ResponseEvent, Error>,
+    PendingResponse,
+    Rc<Control>,
+    PendingUpgrade,
+) {
     let (sender, receiver) = pipe::channel();
     let control = Rc::new(Control {
         upload: CancellationSource::new(),
@@ -205,8 +237,10 @@ pub(crate) fn channel(upgrade: UpgradeSlot) -> (Producer<ResponseEvent, Error>, 
         aborted: Cell::new(false),
         continue_allowed: Cell::new(false),
         continue_waker: RefCell::new(None),
+        upgrade: RefCell::new(UpgradeState::default()),
     });
 
+    let (upgrade, upgrade_slot) = upgrade::channel(control.clone());
     (
         sender,
         PendingResponse {
@@ -214,8 +248,25 @@ pub(crate) fn channel(upgrade: UpgradeSlot) -> (Producer<ResponseEvent, Error>, 
             control: UploadControl { inner: control.clone() },
             delivered: false,
             finished: false,
-            upgrade,
+            upgrade: upgrade_slot,
         },
         control,
+        upgrade,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn upgrade_endpoints_share_the_existing_client_control_allocation() {
+        karmaio::Runtime::new().unwrap().block_on(async {
+            let (_, mut pending, control, upgrade) = channel();
+            assert!(upgrade.uses_storage(control.as_ref()));
+            let claim = pending.on_upgrade();
+            assert!(Rc::ptr_eq(&pending.control.inner, &control));
+            drop(upgrade);
+            assert_eq!(claim.await.unwrap_err().kind(), ErrorKind::Upgrade);
+        });
+    }
 }

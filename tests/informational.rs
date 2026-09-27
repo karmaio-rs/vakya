@@ -335,7 +335,7 @@ fn expect_echo_survives_context_drop_and_buffered_payload_without_late_continue(
         for fragmented in [false,true] {
             let steps = if fragmented { vec![ReadStep::Data(Bytes::from_static(b"POST / HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")),ReadStep::Data(Bytes::from_static(b"upload"))] }
                 else { vec![ReadStep::Data(Bytes::from_static(b"POST / HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: 6\r\nConnection: close\r\n\r\nupload"))] };
-            let service = service_fn(async |(request, context): (Request<Incoming>, RequestContext)| { drop(context); Ok::<_, Infallible>(Response::new(request.into_body())) });
+            let service = vakya::server::request_service_fn(async |request: Request<Incoming>| { Ok::<_, Infallible>(Response::new(request.into_body())) });
             let (writer, bytes) = ObservedWriter::new();
             Server::new().auto_date(false).serve_connection((Reader::new(steps), writer), service).run().await.unwrap();
             let wire = output(&bytes); assert!(wire.ends_with("upload")); assert_eq!(wire.matches("HTTP/1.1").count(), 1); assert!(!wire.contains("100 Continue"));

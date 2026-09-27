@@ -4,7 +4,7 @@ use crate::{
     Request, Response,
     body::{Incoming, pipe::Producer},
     error::{Error, ErrorKind},
-    upgrade::{self, PendingUpgrade},
+    upgrade::PendingUpgrade,
 };
 use std::{
     cell::RefCell,
@@ -249,6 +249,28 @@ impl<B> SendRequest<B> {
             .map_err(SendError::Exchange)
     }
 
+    /// Submit a request and return its final response with a local boxed upgrade claim.
+    /// Await the claim only when the response accepts an upgrade or tunnel.
+    /// Drive the connection concurrently through its settled handoff.
+    ///
+    /// # Errors
+    /// Admission failures retain the unchanged request in [`SendError::Submission`].
+    /// Accepted exchange failures are returned as [`SendError::Exchange`].
+    ///
+    /// # Panics
+    /// Panics when submitting outside an active Karmaio runtime.
+    pub async fn send_request_with_upgrade(
+        &self,
+        request: Request<B>,
+    ) -> Result<(Response<Incoming>, crate::upgrade::BoxedOnUpgrade), SendError<B>> {
+        self.start_request(request)
+            .await
+            .map_err(SendError::Submission)?
+            .response_with_upgrade()
+            .await
+            .map_err(SendError::Exchange)
+    }
+
     /// Submit a request and return its final response with a correlated upgrade future.
     ///
     /// Await the future only when the response accepts an HTTP upgrade or
@@ -262,14 +284,14 @@ impl<B> SendRequest<B> {
     ///
     /// # Panics
     /// Panics when submitting outside an active Karmaio runtime.
-    pub async fn send_request_with_upgrade<R: 'static, W: 'static>(
+    pub async fn send_request_with_typed_upgrade<R: 'static, W: 'static>(
         &self,
         request: Request<B>,
     ) -> Result<(Response<Incoming>, crate::upgrade::OnUpgrade<R, W>), SendError<B>> {
         self.start_request(request)
             .await
             .map_err(SendError::Submission)?
-            .response_with_upgrade()
+            .response_with_typed_upgrade()
             .await
             .map_err(SendError::Exchange)
     }
@@ -319,8 +341,7 @@ impl<B> RequestPermit<B> {
             });
         }
 
-        let (upgrade, upgrade_slot) = upgrade::channel();
-        let (response, pending, control) = response::channel(upgrade_slot);
+        let (response, pending, control, upgrade) = response::channel();
         let job = Job {
             request,
             response,

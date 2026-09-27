@@ -6,10 +6,7 @@ use std::{convert::Infallible, io, net::SocketAddr, str};
 use bytes::Bytes;
 use karmaio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{
-        split::{OwnedReadHalf, OwnedWriteHalf},
-        tcp::TcpStream,
-    },
+    net::tcp::TcpStream,
 };
 use vakya::{
     Request, Response, StatusCode,
@@ -17,13 +14,12 @@ use vakya::{
     client::conn::http1::Builder as ClientBuilder,
     server::{RequestContext, conn::http1::Builder as ServerBuilder},
     service::service_fn,
-    upgrade::Upgraded,
+    upgrade::BoxedUpgraded,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-type TcpUpgraded = Upgraded<OwnedReadHalf<TcpStream>, OwnedWriteHalf<TcpStream>>;
 
-async fn server_upgraded_io(mut upgraded: TcpUpgraded) -> io::Result<()> {
+async fn server_upgraded_io(mut upgraded: BoxedUpgraded) -> io::Result<()> {
     let (result, buf) = upgraded.read_exact(vec![0; 7]).await.into_parts();
     result?;
     println!("server[foobar] recv: {:?}", str::from_utf8(&buf));
@@ -43,7 +39,7 @@ async fn server_upgrade(
         return Ok(res);
     }
 
-    let upgrade = context.on_upgrade::<OwnedReadHalf<TcpStream>, OwnedWriteHalf<TcpStream>>();
+    let upgrade = context.on_upgrade();
     karmaio::runtime::spawn_local(async move {
         match upgrade.await {
             Ok(upgraded) => {
@@ -63,7 +59,7 @@ async fn server_upgrade(
     Ok(res)
 }
 
-async fn client_upgraded_io(mut upgraded: TcpUpgraded) -> io::Result<()> {
+async fn client_upgraded_io(mut upgraded: BoxedUpgraded) -> io::Result<()> {
     let (result, _) = upgraded.write_all(Bytes::from_static(b"foo=bar")).await.into_parts();
     result?;
     println!("client[foobar] sent");
@@ -99,9 +95,7 @@ async fn client_upgrade_request(addr: SocketAddr) -> Result<()> {
         }
     });
 
-    let (res, upgrade) = sender
-        .send_request_with_upgrade::<OwnedReadHalf<TcpStream>, OwnedWriteHalf<TcpStream>>(req)
-        .await?;
+    let (res, upgrade) = sender.send_request_with_upgrade(req).await?;
     if res.status() != StatusCode::SWITCHING_PROTOCOLS {
         panic!("Our server didn't upgrade: {}", res.status());
     }

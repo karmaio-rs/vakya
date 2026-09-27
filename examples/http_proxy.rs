@@ -40,7 +40,7 @@ async fn proxy(
             return Ok(resp);
         };
 
-        let upgrade = context.on_upgrade::<OwnedReadHalf<TcpStream>, OwnedWriteHalf<TcpStream>>();
+        let upgrade = context.on_upgrade_typed::<OwnedReadHalf<TcpStream>, OwnedWriteHalf<TcpStream>>();
         karmaio::runtime::spawn_local(async move {
             match upgrade.await {
                 Ok(upgraded) => {

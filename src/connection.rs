@@ -38,12 +38,38 @@ pub struct ConnectionControl {
 #[derive(Debug, Default)]
 struct ControlState {
     trace: crate::trace::Scope,
-    stopping: std::cell::Cell<bool>,
-    abort: std::cell::Cell<bool>,
-    deadline: std::cell::Cell<Option<std::time::Instant>>,
+    shutdown: std::cell::Cell<Shutdown>,
     driver: std::cell::RefCell<Option<std::task::Waker>>,
     admission: std::cell::RefCell<Option<std::task::Waker>>,
     idle: std::cell::RefCell<Option<std::task::Waker>>,
+}
+
+/// Control handles request monotonic shutdown transitions. The driver escalates
+/// an expired graceful deadline to Aborted and stops admission on release.
+/// This state requests work; only the retained driver future certifies settlement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Shutdown {
+    #[default]
+    Running,
+    Graceful {
+        deadline: Option<std::time::Instant>,
+    },
+    Aborted,
+}
+
+impl Shutdown {
+    fn graceful(self, requested: Option<std::time::Instant>) -> Self {
+        match self {
+            Self::Aborted => Self::Aborted,
+            Self::Running => Self::Graceful { deadline: requested },
+            Self::Graceful { deadline } => Self::Graceful {
+                deadline: match (deadline, requested) {
+                    (Some(old), Some(new)) => Some(old.min(new)),
+                    (old, new) => old.or(new),
+                },
+            },
+        }
+    }
 }
 
 #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
@@ -65,7 +91,7 @@ impl ConnectionControl {
     /// observed while closing are still reported by `run()`.
     pub fn graceful_shutdown(&self) {
         self.shared.trace.lifecycle("graceful shutdown requested");
-        self.shared.stopping.set(true);
+        self.shared.shutdown.set(self.shared.shutdown.get().graceful(None));
         self.wake();
     }
 
@@ -73,18 +99,19 @@ impl ConnectionControl {
     /// `run()` reports `Canceled` unless an originating failure is retained.
     pub fn abort(&self) {
         self.shared.trace.lifecycle("abort requested");
-        self.shared.abort.set(true);
-        self.graceful_shutdown();
+        self.shared.shutdown.set(Shutdown::Aborted);
+        self.wake();
     }
 
     /// Stop admission now and escalate to abort at this absolute deadline.
     /// Repeated requests retain the earliest deadline. Expiration is reported
     /// as `Timeout` after transport operations settle.
     pub fn graceful_shutdown_with_deadline(&self, deadline: std::time::Instant) {
-        self.shared.deadline.set(Some(
-            self.shared.deadline.get().map_or(deadline, |old| old.min(deadline)),
-        ));
-        self.graceful_shutdown();
+        self.shared.trace.lifecycle("graceful shutdown requested");
+        self.shared
+            .shutdown
+            .set(self.shared.shutdown.get().graceful(Some(deadline)));
+        self.wake();
     }
 
     fn wake(&self) {
@@ -97,7 +124,7 @@ impl ConnectionControl {
     }
 
     pub(crate) fn stopping(&self) -> bool {
-        self.shared.stopping.get()
+        self.shared.shutdown.get() != Shutdown::Running
     }
 
     #[cfg(feature = "client")]
@@ -122,12 +149,12 @@ impl ConnectionControl {
         loop {
             let deadline = poll_fn(|cx| {
                 self.shared.driver.borrow_mut().replace(cx.waker().clone());
-                if self.shared.abort.get() {
-                    return Poll::Ready(None);
-                }
-                match self.shared.deadline.get() {
-                    Some(deadline) => Poll::Ready(Some(deadline)),
-                    None => Poll::Pending,
+                match self.shared.shutdown.get() {
+                    Shutdown::Aborted => Poll::Ready(None),
+                    Shutdown::Graceful {
+                        deadline: Some(deadline),
+                    } => Poll::Ready(Some(deadline)),
+                    Shutdown::Running | Shutdown::Graceful { deadline: None } => Poll::Pending,
                 }
             })
             .await;
@@ -140,7 +167,11 @@ impl ConnectionControl {
 
             let changed = poll_fn(|cx| {
                 self.shared.driver.borrow_mut().replace(cx.waker().clone());
-                if self.shared.abort.get() || self.shared.deadline.get() != Some(deadline) {
+                if self.shared.shutdown.get()
+                    != (Shutdown::Graceful {
+                        deadline: Some(deadline),
+                    })
+                {
                     return Poll::Ready(true);
                 }
                 use std::future::Future;
@@ -149,6 +180,8 @@ impl ConnectionControl {
             .await;
 
             if !changed {
+                self.shared.shutdown.set(Shutdown::Aborted);
+                self.wake();
                 return ErrorKind::Timeout;
             }
         }
@@ -174,7 +207,7 @@ impl ConnectionControl {
 
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
-                self.0.shared.stopping.set(true);
+                self.0.shared.shutdown.set(self.0.shared.shutdown.get().graceful(None));
                 self.0.wake();
                 self.0.shared.trace.lifecycle("driver released");
             }
@@ -206,5 +239,34 @@ impl ConnectionControl {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn shutdown_requests_preserve_the_earliest_deadline_and_abort() {
+        let control = ConnectionControl::new("test");
+        let early = Instant::now() + Duration::from_secs(1);
+        let late = early + Duration::from_secs(1);
+        assert!(!control.stopping());
+        control.graceful_shutdown();
+        assert!(control.stopping());
+        assert_eq!(control.shared.shutdown.get(), Shutdown::Graceful { deadline: None });
+        control.graceful_shutdown_with_deadline(late);
+        control.graceful_shutdown_with_deadline(early);
+        control.graceful_shutdown();
+        control.graceful_shutdown_with_deadline(late);
+        assert_eq!(
+            control.shared.shutdown.get(),
+            Shutdown::Graceful { deadline: Some(early) }
+        );
+        control.abort();
+        control.graceful_shutdown();
+        control.graceful_shutdown_with_deadline(early);
+        assert_eq!(control.shared.shutdown.get(), Shutdown::Aborted);
     }
 }

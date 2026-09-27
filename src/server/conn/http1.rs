@@ -6,7 +6,7 @@ use crate::{
     error::Error,
 };
 pub use builder::Builder;
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
 /// An unboxed, caller-driven HTTP/1 server activity.
 ///
@@ -20,7 +20,25 @@ pub struct Connection<F> {
     control: ConnectionControl,
 }
 
+/// A nameable local server connection with one boxed driver future.
+/// Concrete transport outcomes and borrowed application lifetimes are retained.
+/// No `Send` bound is added; use [`Connection::boxed`] to opt into erasure.
+pub type BoxedConnection<'a, R, W> =
+    Connection<Pin<Box<dyn Future<Output = Result<ConnectionOutcome<R, W>, Error>> + 'a>>>;
+
 impl<R, W, F: Future<Output = Result<ConnectionOutcome<R, W>, Error>>> Connection<F> {
+    /// Box this driver once, retaining its control and concrete transport outcome.
+    /// The lifetime permits borrowing local bodies and services. No task is spawned.
+    pub fn boxed<'a>(self) -> BoxedConnection<'a, R, W>
+    where
+        F: 'a,
+    {
+        Connection {
+            future: Box::pin(self.future),
+            control: self.control,
+        }
+    }
+
     /// Obtain a local handle for graceful shutdown or explicit abort.
     pub fn control(&self) -> ConnectionControl {
         self.control.clone()

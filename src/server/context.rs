@@ -2,7 +2,7 @@
 use crate::{
     Response,
     error::{Error, ErrorKind},
-    upgrade::{OnUpgrade, UpgradeSlot},
+    upgrade::{self, BoxedOnUpgrade, OnUpgrade, PendingUpgrade, UpgradeSlot, UpgradeState, UpgradeStorage},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -36,16 +36,22 @@ impl RequestContext {
         self.shared.close.set(true);
     }
 
-    /// Claim the transport if this request completes an HTTP upgrade or tunnel.
+    /// Claim local upgraded I/O without naming the transport's concrete halves.
     ///
-    /// The returned future resolves only after all HTTP-owned operations settle.
-    /// If it remains unclaimed, the connection driver preserves the transport in
-    /// [`crate::connection::ConnectionOutcome::Upgraded`] for compatibility.
-    /// `R` and `W` must be the concrete halves returned by the supplied
-    /// transport's [`karmaio::io::IntoOwnedSplit`] implementation. A mismatch
-    /// or repeated claim resolves with `Upgrade` rather than panicking.
+    /// Claim before HTTP hands off ownership. The future resolves only after
+    /// retained HTTP operations settle. A duplicate claim fails with `Upgrade`;
+    /// dropping the claim before delivery preserves the concrete driver outcome.
+    /// Claims after driver retirement or transport transfer fail with `Upgrade`.
     #[inline]
-    pub fn on_upgrade<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
+    pub fn on_upgrade(&mut self) -> BoxedOnUpgrade {
+        self.upgrade.claim_boxed()
+    }
+
+    /// Claim the original concrete transport halves after HTTP settlement.
+    /// `R` and `W` must match the supplied transport's owned halves. A mismatch
+    /// or duplicate claim fails with `Upgrade` and preserves driver ownership.
+    #[inline]
+    pub fn on_upgrade_typed<R: 'static, W: 'static>(&mut self) -> OnUpgrade<R, W> {
         self.upgrade.claim()
     }
 
@@ -68,10 +74,10 @@ impl RequestContext {
                 "application informational status must exclude 100 and 101",
             ));
         }
-        if self.shared.closed.get() {
+        if self.shared.admission.get() == Admission::Closed {
             return Err(closed());
         }
-        if self.shared.final_selected.get() {
+        if self.shared.admission.get() == Admission::FinalSelected {
             return Err(late());
         }
         {
@@ -91,7 +97,7 @@ impl RequestContext {
                 };
                 return Poll::Ready(result);
             }
-            if self.shared.closed.get() {
+            if self.shared.admission.get() == Admission::Closed {
                 return Poll::Ready(Err(closed()));
             }
             self.shared.application.borrow_mut().replace(cx.waker().clone());
@@ -104,14 +110,37 @@ impl RequestContext {
 #[derive(Debug)]
 struct Shared {
     close: Cell<bool>,
-    final_selected: Cell<bool>,
-    closed: Cell<bool>,
-    continue_requested: Cell<bool>,
-    continue_done: Cell<bool>,
+    admission: Cell<Admission>,
+    automatic_continue: Cell<AutomaticContinue>,
     command: RefCell<CommandState>,
     application: RefCell<Option<Waker>>,
     writer: RefCell<Option<Waker>>,
     receiver: RefCell<Option<Waker>>,
+    upgrade: RefCell<UpgradeState>,
+}
+
+impl UpgradeStorage for Shared {
+    fn upgrade_state(&self) -> &RefCell<UpgradeState> {
+        &self.upgrade
+    }
+}
+
+// The service may queue commands while Open. The service-call coordinator
+// selects FinalSelected; only dropping the driver endpoint enters Closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Admission {
+    Open,
+    FinalSelected,
+    Closed,
+}
+
+// Receive demand requests Continue once; the writer completes it after flush.
+// Final selection releases demand without pretending a Continue was written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticContinue {
+    Idle,
+    Requested,
+    Complete,
 }
 
 #[derive(Debug)]
@@ -145,24 +174,25 @@ pub(crate) enum Command {
     Application(Response<()>),
 }
 
-pub(crate) fn channel(close: bool, upgrade: UpgradeSlot) -> (RequestContext, InformationalReceiver) {
+pub(crate) fn channel(close: bool) -> (RequestContext, InformationalReceiver, PendingUpgrade) {
     let shared = Rc::new(Shared {
         close: Cell::new(close),
-        final_selected: Cell::new(false),
-        closed: Cell::new(false),
-        continue_requested: Cell::new(false),
-        continue_done: Cell::new(false),
+        admission: Cell::new(Admission::Open),
+        automatic_continue: Cell::new(AutomaticContinue::Idle),
         command: RefCell::new(CommandState::Idle),
         application: RefCell::new(None),
         writer: RefCell::new(None),
         receiver: RefCell::new(None),
+        upgrade: RefCell::new(UpgradeState::default()),
     });
+    let (upgrade, upgrade_slot) = upgrade::channel(shared.clone());
     (
         RequestContext {
             shared: shared.clone(),
-            upgrade,
+            upgrade: upgrade_slot,
         },
         InformationalReceiver { shared },
+        upgrade,
     )
 }
 
@@ -174,7 +204,9 @@ impl InformationalReceiver {
     /// Stop admission of new heads, reject any unstarted command, and release
     /// Continue demand. A head already being written must still be settled.
     pub(crate) fn select_final(&self) {
-        self.shared.final_selected.set(true);
+        if self.shared.admission.get() == Admission::Open {
+            self.shared.admission.set(Admission::FinalSelected);
+        }
         {
             let mut state = self.shared.command.borrow_mut();
             if matches!(*state, CommandState::Queued(_)) {
@@ -187,13 +219,17 @@ impl InformationalReceiver {
     }
 
     pub(crate) async fn continue_permission(&self) -> Result<(), Error> {
-        self.shared.continue_requested.set(true);
+        if self.shared.automatic_continue.get() == AutomaticContinue::Idle {
+            self.shared.automatic_continue.set(AutomaticContinue::Requested);
+        }
         wake(&self.shared.writer);
         poll_fn(|cx| {
-            if self.shared.closed.get() {
+            if self.shared.admission.get() == Admission::Closed {
                 return Poll::Ready(Err(closed()));
             }
-            if self.shared.final_selected.get() || self.shared.continue_done.get() {
+            if self.shared.admission.get() == Admission::FinalSelected
+                || self.shared.automatic_continue.get() == AutomaticContinue::Complete
+            {
                 return Poll::Ready(Ok(()));
             }
             self.shared.receiver.borrow_mut().replace(cx.waker().clone());
@@ -203,16 +239,16 @@ impl InformationalReceiver {
     }
 
     pub(crate) fn continued(&self) {
-        self.shared.continue_done.set(true);
+        self.shared.automatic_continue.set(AutomaticContinue::Complete);
         wake(&self.shared.receiver);
     }
 
     pub(crate) async fn next(&self) -> Option<Command> {
         poll_fn(|cx| {
-            if self.shared.closed.get() || self.shared.final_selected.get() {
+            if self.shared.admission.get() != Admission::Open {
                 return Poll::Ready(None);
             }
-            if self.shared.continue_requested.get() && !self.shared.continue_done.get() {
+            if self.shared.automatic_continue.get() == AutomaticContinue::Requested {
                 return Poll::Ready(Some(Command::Continue));
             }
             let mut state = self.shared.command.borrow_mut();
@@ -243,7 +279,7 @@ impl InformationalReceiver {
 
 impl Drop for InformationalReceiver {
     fn drop(&mut self) {
-        self.shared.closed.set(true);
+        self.shared.admission.set(Admission::Closed);
         wake(&self.shared.application);
         wake(&self.shared.receiver);
     }
@@ -277,9 +313,56 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_endpoints_share_the_existing_server_context_allocation() {
+        let (context, receiver, upgrade) = channel(false);
+        assert!(upgrade.uses_storage(context.shared.as_ref()));
+        assert!(Rc::ptr_eq(&context.shared, &receiver.shared));
+    }
+
+    #[test]
+    fn continue_completion_is_not_reset_by_repeated_demand() {
+        let (_, receiver, _upgrade) = channel(false);
+        {
+            let mut permission = pin!(receiver.continue_permission());
+            assert!(poll(permission.as_mut()).is_pending());
+            let mut command = pin!(receiver.next());
+            assert!(matches!(poll(command.as_mut()), Poll::Ready(Some(Command::Continue))));
+            receiver.continued();
+            assert!(matches!(poll(permission.as_mut()), Poll::Ready(Ok(()))));
+        }
+        let mut permission = pin!(receiver.continue_permission());
+        assert!(matches!(poll(permission.as_mut()), Poll::Ready(Ok(()))));
+        let mut command = pin!(receiver.next());
+        assert!(poll(command.as_mut()).is_pending());
+        assert_eq!(receiver.shared.automatic_continue.get(), AutomaticContinue::Complete);
+    }
+
+    #[test]
+    fn final_selection_releases_continue_without_claiming_it_was_written() {
+        let (mut context, receiver, _upgrade) = channel(false);
+        {
+            let mut permission = pin!(receiver.continue_permission());
+            assert!(poll(permission.as_mut()).is_pending());
+            receiver.select_final();
+            receiver.select_final();
+            assert!(matches!(poll(permission.as_mut()), Poll::Ready(Ok(()))));
+            assert_eq!(receiver.shared.automatic_continue.get(), AutomaticContinue::Requested);
+            let mut command = pin!(receiver.next());
+            assert!(matches!(poll(command.as_mut()), Poll::Ready(None)));
+        }
+        {
+            let mut send = pin!(context.send_informational(head()));
+            assert!(matches!(poll(send.as_mut()), Poll::Ready(Err(error)) if error.kind() == ErrorKind::LocalMessage));
+        }
+        drop(receiver);
+        assert_eq!(context.shared.admission.get(), Admission::Closed);
+        let mut send = pin!(context.send_informational(head()));
+        assert!(matches!(poll(send.as_mut()), Poll::Ready(Err(error)) if error.kind() == ErrorKind::Closed));
+    }
+
+    #[test]
     fn canceled_commands_release_queue_but_retain_in_flight_writes() {
-        let (_, upgrade) = crate::upgrade::channel();
-        let (mut context, receiver) = channel(false, upgrade);
+        let (mut context, receiver, _upgrade) = channel(false);
         {
             let mut send = pin!(context.send_informational(head()));
             assert!(poll(send.as_mut()).is_pending());
@@ -308,8 +391,7 @@ mod tests {
             receiver.select_final();
             assert!(matches!(poll(send.as_mut()), Poll::Ready(Err(error)) if error.kind()==ErrorKind::LocalMessage));
         }
-        let (_, upgrade) = crate::upgrade::channel();
-        let (mut context, receiver) = channel(false, upgrade);
+        let (mut context, receiver, _upgrade) = channel(false);
         let mut send = pin!(context.send_informational(head()));
         assert!(poll(send.as_mut()).is_pending());
         drop(receiver);

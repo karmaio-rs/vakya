@@ -22,7 +22,7 @@ use crate::{
         context::{self, Command, InformationalReceiver, RequestContext},
     },
     service::Service,
-    upgrade::{self, PendingUpgrade, Upgraded},
+    upgrade::{PendingUpgrade, Upgraded},
 };
 use http::{
     HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version,
@@ -231,8 +231,7 @@ where
     let mut state = Exchange::new(&head, config.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
-    let (upgrade, upgrade_slot) = upgrade::channel();
-    let (context, informationals) = context::channel(head.persistence == Persistence::Close, upgrade_slot);
+    let (context, informationals, upgrade) = context::channel(head.persistence == Persistence::Close);
     let close = informationals.close_flag();
     let (producer, body) = incoming(head.body);
     let body = body.with_drain_config(config.drain);

@@ -7,11 +7,10 @@ use bytes::Bytes;
 use vakya::{
     Request, Response,
     body::{Full, Incoming},
-    server::{RequestContext, conn::http1::Builder},
-    service::service_fn,
+    server::{conn::http1::Builder, request_service_fn},
 };
 
-async fn hello(_: (Request<Incoming>, RequestContext)) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn hello(_: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     Ok(Response::new(Full::new(Bytes::from("Hello World!"))))
 }
 
@@ -24,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (socket, _) = listener.accept().await?;
         karmaio::runtime::spawn_local(async move {
-            if let Err(err) = Builder::new().serve_tcp(socket, service_fn(hello)).run().await {
+            if let Err(err) = Builder::new().serve_tcp(socket, request_service_fn(hello)).run().await {
                 eprintln!("Error serving connection: {err:?}");
             }
         });

@@ -5,8 +5,7 @@ use std::{io, net::SocketAddr};
 use vakya::{
     Request, Response,
     body::{FileBody, Incoming},
-    server::{RequestContext, conn::http1::Builder},
-    service::service_fn,
+    server::{conn::http1::Builder, request_service_fn},
 };
 
 #[karmaio::main]
@@ -22,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Cloning the supplied handle does not introduce a shared seek cursor.
         let file = file.clone();
         karmaio::runtime::spawn_local(async move {
-            let service = service_fn(async |_: (Request<Incoming>, RequestContext)| {
+            let service = request_service_fn(async |_: Request<Incoming>| {
                 Ok::<_, io::Error>(Response::new(FileBody::new(file.clone()).await?))
             });
             if let Err(error) = Builder::new().serve_tcp(stream, service).run().await {

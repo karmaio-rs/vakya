@@ -186,8 +186,7 @@ fn preserved_request_header_case_is_reused_when_forwarded() {
 #[test]
 fn streaming_echo_preserves_trailers_and_applies_title_case() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let service = service_fn(async |(request, context): (Request<Incoming>, RequestContext)| {
-            drop(context);
+        let service = vakya::server::request_service_fn(async |request: Request<Incoming>| {
             Ok::<_, Infallible>(Response::new(request.into_body()))
         });
         let (writer, bytes) = ObservedWriter::new();

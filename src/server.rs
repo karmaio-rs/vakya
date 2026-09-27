@@ -5,3 +5,6 @@
 pub mod conn;
 pub(crate) mod context;
 pub use context::RequestContext;
+
+mod request_service;
+pub use request_service::{RequestServiceFn, request_service_fn};
