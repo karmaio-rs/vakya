@@ -1,6 +1,6 @@
 //! Deadline scopes retain submitted operations until their buffers return.
 use crate::{
-    error::{Error, ErrorKind},
+    error::{DeadlineElapsed, Error, ErrorKind, TimeoutPhase},
     future::{Race, race},
 };
 use karmaio::{
@@ -55,12 +55,9 @@ pub(crate) fn configured_after(timeout: Option<Duration>) -> Result<Option<Insta
 }
 
 #[allow(dead_code)]
-fn timed<T>(result: io::Result<T>, elapsed: bool) -> io::Result<T> {
+fn timed<T>(result: io::Result<T>, elapsed: bool, phase: TimeoutPhase) -> io::Result<T> {
     if elapsed && (result.is_ok() || result.as_ref().is_err_and(is_operation_canceled)) {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "HTTP transport progress deadline exceeded",
-        ))
+        Err(io::Error::new(io::ErrorKind::TimedOut, DeadlineElapsed(phase)))
     } else {
         result
     }
@@ -81,7 +78,7 @@ impl<W: AsyncWrite> AsyncWrite for Write<W> {
             Err(error) => return BufResult(Err(error), buffer),
         };
         let (BufResult(result, buffer), elapsed) = settle(deadline, pin!(self.inner.write(buffer))).await;
-        BufResult(timed(result, elapsed), buffer)
+        BufResult(timed(result, elapsed, TimeoutPhase::WriteProgress), buffer)
     }
     async fn write_vectored<B: IoVectoredBuf>(&mut self, buffers: B) -> BufResult<usize, B> {
         let deadline = match after(self.timeout) {
@@ -89,15 +86,15 @@ impl<W: AsyncWrite> AsyncWrite for Write<W> {
             Err(error) => return BufResult(Err(error), buffers),
         };
         let (BufResult(result, buffers), elapsed) = settle(deadline, pin!(self.inner.write_vectored(buffers))).await;
-        BufResult(timed(result, elapsed), buffers)
+        BufResult(timed(result, elapsed, TimeoutPhase::WriteProgress), buffers)
     }
     async fn flush(&mut self) -> io::Result<()> {
         let (result, elapsed) = settle(after(self.timeout)?, pin!(self.inner.flush())).await;
-        timed(result, elapsed)
+        timed(result, elapsed, TimeoutPhase::WriteProgress)
     }
     async fn shutdown(&mut self) -> io::Result<()> {
         let (result, elapsed) = settle(after(self.timeout)?, pin!(self.inner.shutdown())).await;
-        timed(result, elapsed)
+        timed(result, elapsed, TimeoutPhase::Shutdown)
     }
 }
 
@@ -169,7 +166,7 @@ mod tests {
             assert!(elapsed);
             assert!(returned.get());
             assert_eq!(
-                timed(result, elapsed).unwrap_err().kind(),
+                timed(result, elapsed, TimeoutPhase::WriteProgress).unwrap_err().kind(),
                 io::ErrorKind::ConnectionReset
             );
         });

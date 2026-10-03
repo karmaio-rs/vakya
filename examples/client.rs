@@ -8,8 +8,8 @@ use std::{
 };
 
 use vakya::{
-    Request,
-    body::{Body, Empty},
+    Request, Response,
+    body::{Body, BodyExt, Empty, Incoming},
     client::conn::http1::Builder,
 };
 
@@ -41,11 +41,7 @@ async fn fetch_url(url: vakya::Uri) -> Result<()> {
     let stream = karmaio::net::tcp::TcpStream::connect(addr).await?;
 
     let (sender, conn) = Builder::new().handshake_tcp::<Empty>(stream);
-    karmaio::runtime::spawn_local(async move {
-        if let Err(err) = conn.run().await {
-            eprintln!("Connection failed: {err:?}");
-        }
-    });
+    let driver = karmaio::runtime::spawn_local(async move { conn.run().await });
 
     let authority = url.authority().ok_or("uri has no authority")?.clone();
     let path = url.path_and_query().map(|path| path.as_str()).unwrap_or("/");
@@ -54,19 +50,35 @@ async fn fetch_url(url: vakya::Uri) -> Result<()> {
         .header(http::header::HOST, authority.as_str())
         .body(Empty::new())?;
 
-    let mut res = sender.send_request(req).await?;
+    let mut pending = sender.start_request(req).await?;
+    let completion = pending.take_completion().unwrap();
+    // This CLI makes one request. Dropping the last sender asks the driver to
+    // finish accepted work and close when the exchange settles.
+    drop(sender);
+    let application: Result<()> = async { print_response(pending.response().await?).await }.await;
+    // Even a limit or stdout failure drops the owned body before awaiting the
+    // receipt, allowing the driver to settle abandonment and shutdown.
+    let settled = completion.await;
+    let driven = driver.await?;
+    application?;
+    let outcome = settled?;
+    driven?;
+    println!("\n\nExchange completed: {outcome:?}");
+    Ok(())
+}
 
+async fn print_response(res: Response<Incoming>) -> Result<()> {
     println!("Response: {}", res.status());
     println!("Headers: {:#?}\n", res.headers());
 
+    let mut body = res.into_body().limit(8 * 1024 * 1024);
     let mut stdout = io::stdout();
-    while let Some(frame) = res.body_mut().next_frame().await? {
-        if let Some(chunk) = frame.data_ref() {
+    while let Some(frame) = body.next_frame().await? {
+        if let Ok(chunk) = frame.into_data() {
             stdout.write_all(chunk.as_ref())?;
+            body.recycle(chunk);
         }
     }
-
-    println!("\n\nDone!");
     Ok(())
 }
 

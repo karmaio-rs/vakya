@@ -2,7 +2,7 @@
 use crate::body::incoming::ManagedLeasePermit;
 use crate::{
     body::IncomingData,
-    error::{Error, ErrorKind},
+    error::{Error, ErrorDetail, ErrorKind, LimitKind},
 };
 use bytes::{Buf, Bytes, BytesMut};
 use karmaio::{
@@ -213,7 +213,11 @@ impl RecvBuffer {
         let available = self.max_retained - self.len();
 
         if available == 0 {
-            return (Err(Error::new(ErrorKind::Limit, "receive buffer limit reached")), self);
+            return (
+                Err(Error::new(ErrorKind::Limit, "receive buffer limit reached")
+                    .with_detail(ErrorDetail::IncomingLimit(LimitKind::RetainedInput))),
+                self,
+            );
         }
 
         let target = available.min(self.preferred_read);

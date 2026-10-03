@@ -1,11 +1,12 @@
 //! Response observation and upload control for accepted client requests.
+use super::completion::{CompletionState, ExchangeCompletion};
 use crate::{
     Response,
     body::{
         Incoming,
         pipe::{self, Consumer, Producer, TakeError},
     },
-    error::{Error, ErrorKind},
+    error::{Error, ErrorDetail, ErrorKind},
     upgrade::{self, BoxedOnUpgrade, OnUpgrade, PendingUpgrade, UpgradeSlot, UpgradeState, UpgradeStorage},
 };
 use karmaio::runtime::CancellationSource;
@@ -24,6 +25,7 @@ pub(crate) struct Control {
     continue_allowed: Cell<bool>,
     continue_waker: RefCell<Option<Waker>>,
     upgrade: RefCell<UpgradeState>,
+    pub(super) completion: RefCell<CompletionState>,
 }
 
 impl UpgradeStorage for Control {
@@ -111,6 +113,15 @@ pub struct PendingResponse {
 }
 
 impl PendingResponse {
+    /// Take this accepted request's settlement receipt once.
+    ///
+    /// Dropping the receipt does not cancel work. Drive the connection and
+    /// consume or abandon the response body independently before awaiting it.
+    /// Returns `None` after the receipt has already been taken.
+    pub fn take_completion(&mut self) -> Option<ExchangeCompletion> {
+        ExchangeCompletion::take(&self.control.inner)
+    }
+
     /// Obtain an upload-abort handle that may outlive final-response delivery.
     pub fn control(&self) -> UploadControl {
         self.control.clone()
@@ -162,7 +173,7 @@ impl PendingResponse {
             }
             _ => {
                 self.finished = true;
-                Err(Error::new(ErrorKind::Closed, "response driver closed"))
+                Err(Error::new(ErrorKind::Closed, "response driver closed").with_detail(ErrorDetail::DriverLost))
             }
         }
     }
@@ -238,6 +249,7 @@ pub(crate) fn channel() -> (
         continue_allowed: Cell::new(false),
         continue_waker: RefCell::new(None),
         upgrade: RefCell::new(UpgradeState::default()),
+        completion: RefCell::new(CompletionState::default()),
     });
 
     let (upgrade, upgrade_slot) = upgrade::channel(control.clone());

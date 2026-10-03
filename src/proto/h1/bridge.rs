@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     body::{Body, Frame, Incoming, SizeHint, TrailerHint, incoming::IncomingProducer, pipe::OfferError},
-    error::{Error, ErrorKind},
+    error::{Error, ErrorDetail, ErrorKind, TimeoutPhase},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -101,11 +101,12 @@ pub(super) async fn receive_body_configured<R, S: Receive<R>>(
             _ => 0,
         };
 
-        if !producer.charge_drain(consumed, payload) {
+        if let Err(limit) = producer.charge_drain(consumed, payload) {
             return (
                 ReceiveEnd::fail(
                     producer,
-                    Error::new(ErrorKind::Limit, "body drain payload or wire limit exceeded"),
+                    Error::new(ErrorKind::Limit, "body drain payload or wire limit exceeded")
+                        .with_detail(ErrorDetail::IncomingLimit(limit)),
                 ),
                 buffer,
             );
@@ -204,13 +205,21 @@ async fn read_or_abandoned<R, S: Receive<R>>(
     let mut read = pin!(read);
     let mut abandoned = pin!(producer.abandoned());
 
-    match race(read.as_mut(), abandoned.as_mut()).await {
+    let (result, buffer) = match race(read.as_mut(), abandoned.as_mut()).await {
         Race::First(result) => result,
         Race::Second(()) => {
             abandonment.cancel();
             read.await
         }
-    }
+    };
+    let result = result.map_err(|error| {
+        if error.detail() == Some(ErrorDetail::Timeout(TimeoutPhase::Head)) {
+            error.with_detail(ErrorDetail::Timeout(TimeoutPhase::BodyProgress))
+        } else {
+            error
+        }
+    });
+    (result, buffer)
 }
 
 #[derive(Debug)]

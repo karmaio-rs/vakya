@@ -15,7 +15,8 @@ use std::future::Future;
 /// Configuration for low-level HTTP/1 server connections.
 ///
 /// Defaults bound heads to 64 KiB/100 fields, retained input to 128 KiB with
-/// 16 KiB reads, chunk lines to 8 KiB, and trailers to 16 KiB/32 fields.
+/// 16 KiB reads, chunk lines to 8 KiB, total chunk extensions to 16 KiB,
+/// and trailers to 16 KiB/32 fields.
 /// Missing Date headers are inserted where HTTP requires them.
 #[derive(Clone, Debug, Default)]
 pub struct Builder {
@@ -28,17 +29,7 @@ impl Builder {
         Self::default()
     }
 
-    /// Set request-head byte and field limits for this connection.
-    ///
-    /// # Errors
-    /// Returns an error for zero limits. Encoded response heads share the byte limit.
-    pub fn head_limits(&mut self, bytes: usize, fields: usize) -> Result<&mut Self, Error> {
-        self.config.protocol.head_limits(bytes, fields)?;
-        Ok(self)
-    }
-
     /// Set incoming head bytes and field count without changing outgoing limits.
-    /// Later calls to `head_limits` set both directions again.
     ///
     /// # Errors
     /// Returns `LocalMessage` for zero limits without changing configuration.
@@ -57,11 +48,12 @@ impl Builder {
     }
 
     /// Set incoming chunk-line, trailer-byte, and trailer-field limits independently.
-    /// Later calls to `body_limits` set the trailer byte limit in both directions again.
+    /// The total chunk-extension budget is preserved; configure it separately
+    /// with [`Self::incoming_chunk_extension_limit`].
     ///
     /// # Errors
     /// Returns `LocalMessage` for zero limits without changing configuration.
-    pub fn incoming_body_limits(
+    pub fn incoming_framing_limits(
         &mut self,
         chunk_line: usize,
         trailer_bytes: usize,
@@ -69,8 +61,18 @@ impl Builder {
     ) -> Result<&mut Self, Error> {
         self.config
             .protocol
-            .incoming_body_limits(chunk_line, trailer_bytes, trailer_fields)?;
+            .incoming_framing_limits(chunk_line, trailer_bytes, trailer_fields)?;
         Ok(self)
+    }
+
+    /// Set the total incoming chunk-extension bytes allowed per message body.
+    /// Defaults to 16 KiB; zero forbids extensions. The budget includes the
+    /// semicolon and extension syntax on every chunk, including the last chunk.
+    /// Other framing-limit setters preserve this setting. Payload bytes are
+    /// unaffected; use [`crate::body::BodyExt::limit`] to bound consumption.
+    pub fn incoming_chunk_extension_limit(&mut self, bytes: usize) -> &mut Self {
+        self.config.protocol.incoming_chunk_extension_limit(bytes);
+        self
     }
 
     /// Set encoded trailer bytes without changing incoming limits.
@@ -144,22 +146,6 @@ impl Builder {
     pub fn write_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
         crate::io::deadline::configured_after(timeout)?;
         self.config.write_progress_timeout = timeout;
-        Ok(self)
-    }
-
-    /// Set incoming chunk-line, trailer-byte, and trailer-field limits.
-    ///
-    /// # Errors
-    /// Returns an error for zero limits. Trailer output shares the byte limit.
-    pub fn body_limits(
-        &mut self,
-        chunk_line: usize,
-        trailer_bytes: usize,
-        trailer_fields: usize,
-    ) -> Result<&mut Self, Error> {
-        self.config
-            .protocol
-            .body_limits(chunk_line, trailer_bytes, trailer_fields)?;
         Ok(self)
     }
 

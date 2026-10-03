@@ -241,10 +241,26 @@ fn tcp_head_and_demanded_body_timeouts_cancel_real_reads() {
                         karmaio::time::sleep(Duration::from_millis(6)).await;
                         let error = Body::next_frame(response.body_mut()).await.unwrap_err();
                         assert_eq!(error.kind(), ErrorKind::Timeout);
+                        assert_eq!(
+                            error.detail(),
+                            Some(vakya::error::ErrorDetail::Timeout(if body {
+                                vakya::error::TimeoutPhase::BodyProgress
+                            } else {
+                                vakya::error::TimeoutPhase::Head
+                            }))
+                        );
                     }
                     Err(error) => {
                         assert!(!body);
                         assert_eq!(error.kind(), ErrorKind::Timeout);
+                        assert_eq!(
+                            error.detail(),
+                            Some(vakya::error::ErrorDetail::Timeout(if body {
+                                vakya::error::TimeoutPhase::BodyProgress
+                            } else {
+                                vakya::error::TimeoutPhase::Head
+                            }))
+                        );
                     }
                 }
             };

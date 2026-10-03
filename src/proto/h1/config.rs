@@ -24,12 +24,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub(crate) fn head_limits(&mut self, bytes: usize, headers: usize) -> Result<(), Error> {
-        self.incoming_head_limits(bytes, headers)?;
-        self.encode.max_head_bytes = bytes;
-        Ok(())
-    }
-
     pub(crate) fn incoming_head_limits(&mut self, bytes: usize, headers: usize) -> Result<(), Error> {
         if bytes == 0 || headers == 0 {
             return Err(Error::new(ErrorKind::LocalMessage, "head limits must be nonzero"));
@@ -38,18 +32,7 @@ impl Config {
         Ok(())
     }
 
-    pub(crate) fn body_limits(
-        &mut self,
-        chunk_line: usize,
-        trailer_bytes: usize,
-        trailers: usize,
-    ) -> Result<(), Error> {
-        self.incoming_body_limits(chunk_line, trailer_bytes, trailers)?;
-        self.encode.max_trailer_bytes = trailer_bytes;
-        Ok(())
-    }
-
-    pub(crate) fn incoming_body_limits(
+    pub(crate) fn incoming_framing_limits(
         &mut self,
         chunk_line: usize,
         trailer_bytes: usize,
@@ -61,9 +44,14 @@ impl Config {
                 "body framing limits must be nonzero",
             ));
         }
-        self.decode = DecodeLimits::new(chunk_line, trailer_bytes, trailers);
+        self.decode = self.decode.with_framing_limits(chunk_line, trailer_bytes, trailers);
         Ok(())
     }
+
+    pub(crate) fn incoming_chunk_extension_limit(&mut self, bytes: usize) {
+        self.decode = self.decode.with_chunk_extension_limit(bytes);
+    }
+
     pub(crate) fn outgoing_head_limit(&mut self, bytes: usize) -> Result<(), Error> {
         nonzero(bytes)?;
         self.encode.max_head_bytes = bytes;
@@ -95,29 +83,42 @@ mod tests {
     #[test]
     fn directional_limits_are_independent_and_rejection_is_atomic() {
         let mut config = Config::default();
-        config.head_limits(400, 10).unwrap();
-        config.body_limits(100, 200, 5).unwrap();
+        config.outgoing_head_limit(400).unwrap();
+        config.outgoing_trailer_limit(200).unwrap();
         config.incoming_head_limits(40, 2).unwrap();
-        config.incoming_body_limits(10, 20, 1).unwrap();
+        config.incoming_framing_limits(10, 20, 1).unwrap();
         assert_eq!(config.encode.max_head_bytes, 400);
         assert_eq!(config.encode.max_trailer_bytes, 200);
         config.outgoing_head_limit(800).unwrap();
         config.outgoing_trailer_limit(600).unwrap();
         assert_eq!(config.head, HeadLimits::new(40, 2));
         assert_eq!(config.decode, DecodeLimits::new(10, 20, 1));
-        assert!(config.head_limits(900, 0).is_err());
-        assert!(config.body_limits(1, 900, 0).is_err());
+        assert!(config.incoming_head_limits(900, 0).is_err());
+        assert!(config.incoming_framing_limits(1, 900, 0).is_err());
         assert!(config.outgoing_head_limit(0).is_err());
         assert!(config.outgoing_trailer_limit(0).is_err());
         assert_eq!(config.head, HeadLimits::new(40, 2));
         assert_eq!(config.decode, DecodeLimits::new(10, 20, 1));
         assert_eq!(config.encode.max_head_bytes, 800);
         assert_eq!(config.encode.max_trailer_bytes, 600);
-        config.head_limits(500, 4).unwrap();
-        config.body_limits(50, 300, 3).unwrap();
-        assert_eq!(config.head, HeadLimits::new(500, 4));
-        assert_eq!(config.decode, DecodeLimits::new(50, 300, 3));
-        assert_eq!(config.encode.max_head_bytes, 500);
-        assert_eq!(config.encode.max_trailer_bytes, 300);
+    }
+
+    #[test]
+    fn framing_updates_preserve_independent_extension_budget_including_zero() {
+        for bytes in [0, 1, usize::MAX] {
+            let mut config = Config::default();
+            config.incoming_chunk_extension_limit(bytes);
+            config.incoming_framing_limits(50, 300, 3).unwrap();
+            let expected = DecodeLimits::new(50, 300, 3).with_chunk_extension_limit(bytes);
+            assert_eq!(config.decode, expected);
+            for limits in [(0, 900, 8), (1, 0, 8), (1, 900, 0)] {
+                assert!(config.incoming_framing_limits(limits.0, limits.1, limits.2).is_err());
+                assert_eq!(config.decode, expected);
+            }
+            config.incoming_head_limits(50, 3).unwrap();
+            config.outgoing_head_limit(50).unwrap();
+            config.outgoing_trailer_limit(50).unwrap();
+            assert_eq!(config.decode, expected);
+        }
     }
 }

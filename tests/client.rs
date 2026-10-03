@@ -15,12 +15,15 @@ use std::{
     task::{Context, Poll, Waker},
 };
 use support::transport::{Gate, ReadStep, Reader, Writer};
+#[cfg(feature = "server")]
+use vakya::Response;
 use vakya::{
-    HeaderMap, Request, Response,
+    HeaderMap, Request,
     body::{Body, BodyExt, Empty, Frame, Full, SizeHint, TrailerHint},
-    client::conn::http1::Builder,
+    client::{CloseReason, ExchangeOutcome, conn::http1::Builder},
     error::ErrorKind,
 };
+
 struct ObservedWriter {
     writer: Writer,
     output: Rc<RefCell<Vec<u8>>>,
@@ -216,7 +219,14 @@ fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
         assert!(!sender.is_closed());
         let permit = sender.try_reserve().unwrap();
         assert!(!sender.is_ready());
-        assert_eq!(sender.try_reserve().err().unwrap().kind(), ErrorKind::Limit);
+        let error = sender.try_reserve().err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert_eq!(
+            error.detail(),
+            Some(vakya::error::ErrorDetail::Busy(
+                vakya::error::BusyReason::RequestAdmission
+            ))
+        );
         drop(permit);
         assert!(sender.is_ready());
         let permit = sender.try_reserve().unwrap();
@@ -229,7 +239,13 @@ fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
                 .err()
                 .unwrap();
             let (request, error) = error.into_parts();
-            assert_eq!(error.kind(), ErrorKind::Limit);
+            assert_eq!(error.kind(), ErrorKind::Busy);
+            assert_eq!(
+                error.detail(),
+                Some(vakya::error::ErrorDetail::Busy(
+                    vakya::error::BusyReason::ReservationWaiter
+                ))
+            );
             assert_eq!(
                 request.into_body().collect(20).await.unwrap().bytes().as_ref(),
                 b"unchanged"
@@ -241,8 +257,15 @@ fn reservations_are_bounded_cancel_safe_and_recover_unsubmitted_requests() {
         // Releasing admission wakes and reserves priority for the registered
         // waiter, even before that future is polled again.
         assert!(!sender.is_ready());
-        assert_eq!(sender.try_reserve().err().unwrap().kind(), ErrorKind::Limit);
-        assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Limit);
+        assert_eq!(sender.try_reserve().err().unwrap().kind(), ErrorKind::Busy);
+        let error = sender.reserve().await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert_eq!(
+            error.detail(),
+            Some(vakya::error::ErrorDetail::Busy(
+                vakya::error::BusyReason::ReservationWaiter
+            ))
+        );
         let permit = waiting.await.unwrap();
         drop(driver);
         assert!(sender.is_closed());
@@ -335,7 +358,7 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
                 ]),
                 writer,
             ));
-            let pending = sender
+            let mut pending = sender
                 .start_request(request(Delayed {
                     gate: gate.clone(),
                     produced: &produced,
@@ -343,6 +366,7 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
                 }))
                 .await
                 .unwrap();
+            let mut completion = pin!(pending.take_completion().unwrap());
             let mut driver = pin!(driver.run());
             let mut response = pin!(pending.response());
             assert!(poll(driver.as_mut()).is_pending());
@@ -351,6 +375,7 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
             };
             assert_eq!(response.status().as_u16(), status);
             assert!(!produced.get());
+            assert!(poll(completion.as_mut()).is_pending());
             let mut reserve = pin!(sender.reserve());
             assert!(poll(reserve.as_mut()).is_pending());
             let mut collect = pin!(response.into_body().collect(8));
@@ -367,10 +392,12 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
             assert_eq!(collected.expect("body completed").bytes().as_ref(), b"ok");
             assert!(poll(driver.as_mut()).is_pending());
             assert!(poll(reserve.as_mut()).is_pending());
+            assert!(poll(completion.as_mut()).is_pending());
             gate.open();
             assert!(poll(driver.as_mut()).is_pending());
             assert!(produced.get());
             assert_eq!(recycled.get(), 1);
+            assert_eq!(completion.await.unwrap(), ExchangeOutcome::Reusable);
             let permit = reserve.await.unwrap();
             let pending = permit
                 .send(request(Delayed {
@@ -398,7 +425,7 @@ fn explicit_upload_abort_after_final_delivery_retires_connection() {
             reader(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"),
             Writer::limited(128),
         ));
-        let pending = sender
+        let mut pending = sender
             .start_request(request(Delayed {
                 gate: Gate::default(),
                 produced: &produced,
@@ -406,6 +433,7 @@ fn explicit_upload_abort_after_final_delivery_retires_connection() {
             }))
             .await
             .unwrap();
+        let completion = pending.take_completion().unwrap();
         let control = pending.control();
         let mut driver = pin!(driver.run());
         let mut response = pin!(pending.response());
@@ -413,6 +441,10 @@ fn explicit_upload_abort_after_final_delivery_retires_connection() {
         assert!(matches!(poll(response.as_mut()), Poll::Ready(Ok(_))));
         control.abort();
         driver.await.unwrap();
+        assert_eq!(
+            completion.await.unwrap(),
+            ExchangeOutcome::Closed(CloseReason::UploadAbort)
+        );
         assert!(!produced.get());
         assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Closed);
     });
@@ -428,7 +460,7 @@ fn waiter_and_incoming_abandonment_retire_without_waiting_for_producer() {
                 reader(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
                 Writer::limited(128),
             ));
-            let pending = sender
+            let mut pending = sender
                 .start_request(request(Delayed {
                     gate: Gate::default(),
                     produced: &produced,
@@ -436,15 +468,21 @@ fn waiter_and_incoming_abandonment_retire_without_waiting_for_producer() {
                 }))
                 .await
                 .unwrap();
+            let completion = pending.take_completion().unwrap();
             let mut driver = pin!(driver.run());
             assert!(poll(driver.as_mut()).is_pending());
             if before {
                 drop(pending);
                 assert_eq!(driver.await.unwrap_err().kind(), ErrorKind::Canceled);
+                assert_eq!(completion.await.unwrap_err().kind(), ErrorKind::Canceled);
             } else {
                 let response = pending.response().await.unwrap();
                 drop(response);
                 driver.await.unwrap();
+                assert_eq!(
+                    completion.await.unwrap(),
+                    ExchangeOutcome::Closed(CloseReason::BodyAbandonment)
+                );
             }
             assert!(!produced.get());
             assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Closed);
@@ -520,14 +558,20 @@ fn send_failure_settles_submitted_read_and_preserves_its_source() {
             "original write failure",
         ))]);
         let (sender, driver) = Builder::new().handshake((reader, writer));
-        let pending = sender.start_request(request(Empty::new())).await.unwrap();
+        let mut pending = sender.start_request(request(Empty::new())).await.unwrap();
+        let mut completion = pin!(pending.take_completion().unwrap());
         let mut driver = pin!(driver.run());
         assert!(poll(driver.as_mut()).is_pending());
         let mut response = pin!(pending.response());
         assert!(poll(response.as_mut()).is_pending());
+        assert!(poll(completion.as_mut()).is_pending());
         complete.open();
         let (driver, response) = pair(driver, response).await;
-        for error in [driver.unwrap_err(), response.unwrap_err()] {
+        for error in [
+            driver.unwrap_err(),
+            response.unwrap_err(),
+            completion.await.unwrap_err(),
+        ] {
             assert_eq!(error.kind(), ErrorKind::Io);
             assert_eq!(
                 std::error::Error::source(&error)
@@ -631,7 +675,8 @@ fn upload_abort_racing_successful_flush_still_retires_connection() {
         };
         let (sender, driver) =
             Builder::new().handshake((reader(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), writer));
-        let pending = sender.start_request(request(Empty::new())).await.unwrap();
+        let mut pending = sender.start_request(request(Empty::new())).await.unwrap();
+        let mut completion = pin!(pending.take_completion().unwrap());
         let control = pending.control();
         let mut driver = pin!(driver.run());
         assert!(poll(driver.as_mut()).is_pending());
@@ -641,8 +686,13 @@ fn upload_abort_racing_successful_flush_still_retires_connection() {
         assert!(poll(driver.as_mut()).is_pending());
         control.abort();
         assert!(poll(driver.as_mut()).is_pending());
+        assert!(poll(completion.as_mut()).is_pending());
         gate.open();
         driver.await.unwrap();
+        assert_eq!(
+            completion.await.unwrap(),
+            ExchangeOutcome::Closed(CloseReason::UploadAbort)
+        );
         assert_eq!(sender.reserve().await.err().unwrap().kind(), ErrorKind::Closed);
     });
 }

@@ -3,7 +3,7 @@ use super::{
     BodyMode,
     head::{HeadError, HeaderWorkspace, own_headers},
 };
-use crate::error::{Error, ErrorKind};
+use crate::error::{Error, ErrorDetail, ErrorKind, LimitKind};
 use http::{
     HeaderMap,
     header::{
@@ -35,7 +35,11 @@ impl DecodeLimits {
         }
     }
 
-    #[cfg(test)]
+    /// Replace ordinary framing bounds without resetting the independent budget.
+    pub(super) const fn with_framing_limits(self, chunk_line: usize, trailer_bytes: usize, trailers: usize) -> Self {
+        Self::new(chunk_line, trailer_bytes, trailers).with_chunk_extension_limit(self.max_chunk_extension_bytes)
+    }
+
     pub(super) const fn with_chunk_extension_limit(mut self, bytes: usize) -> Self {
         self.max_chunk_extension_bytes = bytes;
         self
@@ -82,7 +86,16 @@ impl From<DecodeError> for Error {
             DecodeError::Limit(_) => ErrorKind::Limit,
             _ => ErrorKind::InvalidMessage,
         };
-        Self::with_source(kind, "received body framing failed", error)
+        Self::with_source(kind, "received body framing failed", error).classified(match error {
+            DecodeError::Limit(limit) => Some(ErrorDetail::IncomingLimit(match limit {
+                DecodeLimit::ChunkLineBytes => LimitKind::ChunkLineBytes,
+                DecodeLimit::ChunkExtensionBytes => LimitKind::ChunkExtensionBytes,
+                DecodeLimit::TrailerBytes => LimitKind::TrailerBytes,
+                DecodeLimit::Trailers => LimitKind::TrailerCount,
+                DecodeLimit::TrailerMap => LimitKind::TrailerMapCapacity,
+            })),
+            _ => None,
+        })
     }
 }
 
@@ -491,6 +504,22 @@ mod tests {
     use super::{BodyDecoder, DecodeError, DecodeLimit, DecodeLimits, DecodeOutcome};
     use crate::proto::h1::BodyMode;
     use http::HeaderMap;
+
+    #[test]
+    fn public_details_distinguish_all_framing_limits() {
+        use crate::error::{Error, ErrorDetail, LimitKind};
+        for (private, public) in [
+            (DecodeLimit::ChunkLineBytes, LimitKind::ChunkLineBytes),
+            (DecodeLimit::ChunkExtensionBytes, LimitKind::ChunkExtensionBytes),
+            (DecodeLimit::TrailerBytes, LimitKind::TrailerBytes),
+            (DecodeLimit::Trailers, LimitKind::TrailerCount),
+            (DecodeLimit::TrailerMap, LimitKind::TrailerMapCapacity),
+        ] {
+            let error = Error::from(DecodeError::Limit(private));
+            assert_eq!(error.detail(), Some(ErrorDetail::IncomingLimit(public)));
+            assert!(std::error::Error::source(&error).unwrap().is::<DecodeError>());
+        }
+    }
 
     #[test]
     fn non_chunked_modes_preserve_boundaries_and_eof() {

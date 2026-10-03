@@ -1,9 +1,10 @@
 //! Bounded request admission and ownership transfer to a client connection.
+use super::completion::CompletionGuard;
 use super::response::{self, Control, PendingResponse, ResponseEvent};
 use crate::{
     Request, Response,
     body::{Incoming, pipe::Producer},
-    error::{Error, ErrorKind},
+    error::{BusyReason, Error, ErrorDetail, ErrorKind},
     upgrade::PendingUpgrade,
 };
 use std::{
@@ -87,6 +88,7 @@ pub(crate) struct Job<B> {
     pub(crate) response: Producer<ResponseEvent, Error>,
     pub(crate) control: Rc<Control>,
     pub(crate) upgrade: PendingUpgrade,
+    pub(crate) completion: CompletionGuard,
 }
 
 /// A cloneable, local request sender for one connection and outgoing body type.
@@ -141,7 +143,7 @@ impl<B> SendRequest<B> {
     /// never overtaken.
     ///
     /// # Errors
-    /// Returns `Limit` when admission is currently occupied or reserved for a
+    /// Returns `Busy` when admission is currently occupied or reserved for a
     /// waiter, and `Closed` after the driver closes or stops admission.
     pub fn try_reserve(&self) -> Result<RequestPermit<B>, Error> {
         let mut state = self.shared.borrow_mut();
@@ -149,7 +151,8 @@ impl<B> SendRequest<B> {
             return Err(closed());
         }
         if !matches!(state.admission, Admission::Ready) {
-            return Err(Error::new(ErrorKind::Limit, "request admission is not ready"));
+            return Err(Error::new(ErrorKind::Busy, "request admission is not ready")
+                .with_detail(ErrorDetail::Busy(BusyReason::RequestAdmission)));
         }
         state.admission = Admission::Reserved { waiter: None };
         Ok(RequestPermit {
@@ -162,7 +165,7 @@ impl<B> SendRequest<B> {
     /// Dropping this wait unregisters it; dropping its permit releases admission.
     ///
     /// # Errors
-    /// Returns `Limit` if another reservation already waits, or `Closed` when
+    /// Returns `Busy` if another reservation already waits, or `Closed` when
     /// the driver has closed. A waiting reservation has priority over newcomers.
     pub async fn reserve(&self) -> Result<RequestPermit<B>, Error> {
         let mut wait = Reservation {
@@ -196,10 +199,8 @@ impl<B> SendRequest<B> {
 
             let occupied = state.admission.waiter_mut().is_none_or(|waiter| waiter.is_some());
             if !wait.registered && occupied {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::Limit,
-                    "request reservation already occupied",
-                )));
+                return Poll::Ready(Err(Error::new(ErrorKind::Busy, "request reservation already occupied")
+                    .with_detail(ErrorDetail::Busy(BusyReason::ReservationWaiter))));
             }
 
             state.control.admission_waker(cx.waker());
@@ -342,7 +343,9 @@ impl<B> RequestPermit<B> {
         }
 
         let (response, pending, control, upgrade) = response::channel();
+        let completion = CompletionGuard::new(control.clone());
         let job = Job {
+            completion,
             request,
             response,
             control,
@@ -490,8 +493,15 @@ impl<B> Receiver<B> {
         .await
     }
 
-    pub(crate) fn release(&mut self) {
+    /// Decide final admission before publishing an exchange's reuse receipt.
+    pub(crate) fn release(&mut self) -> bool {
+        let state = self.shared.borrow();
+        if state.control.stopping() || state.senders == 0 {
+            return false;
+        }
+        drop(state);
         release(&self.shared);
+        true
     }
 }
 

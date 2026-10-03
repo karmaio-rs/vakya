@@ -198,6 +198,7 @@ fn assert_closed<R, W>(result: Result<ConnectionOutcome<R, W>, vakya::error::Err
     match result {
         Ok(ConnectionOutcome::Closed) => {}
         Ok(ConnectionOutcome::Upgraded(_)) => panic!("{role}, ALPN {alpn:?}: unexpected upgrade"),
+        Ok(ConnectionOutcome::Recovered(_)) => panic!("ordinary run must shut down"),
         Ok(ConnectionOutcome::UpgradeClaimed(_)) => {
             panic!("{role}, ALPN {alpn:?}: unexpected claimed upgrade")
         }

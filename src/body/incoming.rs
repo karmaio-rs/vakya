@@ -1,5 +1,5 @@
 use super::{Body, Frame, SizeHint, TrailerHint, frame::Kind, pipe};
-use crate::error::{Error, ErrorKind};
+use crate::error::{Error, ErrorDetail, ErrorKind, LimitKind, TimeoutPhase};
 use bytes::Bytes;
 use karmaio::buf::IoBuf;
 #[cfg(target_os = "linux")]
@@ -68,16 +68,18 @@ impl Incoming {
             while let Some(frame) = self.next_frame().await? {
                 budget.step().await;
                 if let Ok(data) = frame.into_data() {
-                    remaining = remaining
-                        .checked_sub(data.len() as u64)
-                        .ok_or_else(|| Error::new(ErrorKind::Limit, "body drain payload limit exceeded"))?;
+                    remaining = remaining.checked_sub(data.len() as u64).ok_or_else(|| {
+                        Error::new(ErrorKind::Limit, "body drain payload limit exceeded")
+                            .with_detail(ErrorDetail::IncomingLimit(LimitKind::DrainPayload))
+                    })?;
                 }
             }
             Ok(())
         };
-        karmaio::time::timeout_at(deadline, drain)
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, "body drain deadline exceeded"))?
+        karmaio::time::timeout_at(deadline, drain).await.map_err(|_| {
+            Error::new(ErrorKind::Timeout, "body drain deadline exceeded")
+                .with_detail(ErrorDetail::Timeout(TimeoutPhase::Drain))
+        })?
     }
 
     /// Used only when protocol semantics establish that no body frames remain.
@@ -168,7 +170,8 @@ impl Body for Incoming {
             Err(pipe::TakeError::Disconnected) => Err(Error::new(
                 ErrorKind::Closed,
                 "incoming body driver ended without framing completion",
-            )),
+            )
+            .with_detail(ErrorDetail::DriverLost)),
         };
         if !matches!(result, Ok(Some(_))) {
             self.finish();
@@ -487,6 +490,7 @@ mod tests {
                 panic!("disconnect hidden")
             };
             assert_eq!(error.kind(), ErrorKind::Closed);
+            assert_eq!(error.detail(), Some(ErrorDetail::DriverLost));
         }
         assert!(incoming.is_end_stream());
         assert!(matches!(poll(pin!(incoming.next_frame())), Poll::Ready(Ok(None))));

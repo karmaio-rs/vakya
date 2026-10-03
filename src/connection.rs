@@ -1,13 +1,35 @@
 //! Controls and outcomes of a caller-driven HTTP connection.
-use crate::error::{Error, ErrorKind};
+use crate::error::{Error, ErrorDetail, ErrorKind, TimeoutPhase};
 use crate::upgrade::{UpgradeKind, Upgraded};
 use std::fmt;
+
+/// Concrete transport halves and unconsumed read-ahead after HTTP settlement.
+/// Recovery avoids local shutdown; it does not promise that the peer kept the
+/// transport open. Received bytes from a canceled idle read are preserved.
+pub struct ConnectionParts<R, W> {
+    /// The original settled read half.
+    pub reader: R,
+    /// The original settled write half.
+    pub writer: W,
+    /// Unconsumed bytes received beyond the last admitted HTTP message.
+    pub read_ahead: bytes::Bytes,
+}
+
+impl<R, W> fmt::Debug for ConnectionParts<R, W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionParts")
+            .field("read_ahead_bytes", &self.read_ahead.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Ownership returned after all retained HTTP operations have settled.
 /// The caller continues driving an upgraded transport using its concrete halves.
 pub enum ConnectionOutcome<R, W> {
     /// HTTP completed and the connection was closed.
     Closed,
+    /// HTTP retired cleanly without local shutdown, returning settled transport.
+    Recovered(ConnectionParts<R, W>),
     /// HTTP transferred the transport and preserved unread protocol bytes.
     Upgraded(Upgraded<R, W>),
     /// HTTP transferred the transport to a claimed [`crate::upgrade::OnUpgrade`].
@@ -18,6 +40,7 @@ impl<R, W> fmt::Debug for ConnectionOutcome<R, W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => f.write_str("Closed"),
+            Self::Recovered(parts) => f.debug_tuple("Recovered").field(parts).finish(),
             Self::Upgraded(io) => f.debug_tuple("Upgraded").field(io).finish(),
             Self::UpgradeClaimed(kind) => f.debug_tuple("UpgradeClaimed").field(kind).finish(),
         }
@@ -39,6 +62,7 @@ pub struct ConnectionControl {
 struct ControlState {
     trace: crate::trace::Scope,
     shutdown: std::cell::Cell<Shutdown>,
+    recover_transport: std::cell::Cell<bool>,
     driver: std::cell::RefCell<Option<std::task::Waker>>,
     admission: std::cell::RefCell<Option<std::task::Waker>>,
     idle: std::cell::RefCell<Option<std::task::Waker>>,
@@ -81,6 +105,15 @@ impl ConnectionControl {
                 ..ControlState::default()
             }),
         }
+    }
+
+    // Set only by consuming Connection::run_without_shutdown before driving.
+    pub(crate) fn recover_transport(&self) {
+        self.shared.recover_transport.set(true);
+    }
+
+    pub(crate) fn recovering(&self) -> bool {
+        self.shared.recover_transport.get()
     }
 
     /// Stop new admission and finish accepted work without an implicit deadline.
@@ -227,7 +260,9 @@ impl ConnectionControl {
                 let result = future.await;
                 match result {
                     Err(error) if !error.is_canceled() => Err(error),
-                    _ => Err(Error::new(kind, "connection shutdown requested")),
+                    _ => Err(Error::new(kind, "connection shutdown requested").classified(
+                        (kind == ErrorKind::Timeout).then_some(ErrorDetail::Timeout(TimeoutPhase::Shutdown)),
+                    )),
                 }
             }
         };

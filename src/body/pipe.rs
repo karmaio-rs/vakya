@@ -59,15 +59,18 @@ pub(crate) struct Producer<T, E> {
 impl<T, E> Producer<T, E> {
     /// Charge consumed framing bytes only after a consumer opts into draining.
     #[cfg(feature = "http1")]
-    pub(crate) fn charge_drain(&self, bytes: usize, payload: usize) -> bool {
+    pub(crate) fn charge_drain(&self, bytes: usize, payload: usize) -> Result<(), crate::error::LimitKind> {
         let Some((wire, data)) = self.shared.drain_remaining.get() else {
-            return true;
+            return Ok(());
         };
-        let (Some(wire), Some(data)) = (wire.checked_sub(bytes as u64), data.checked_sub(payload as u64)) else {
-            return false;
-        };
+        let data = data
+            .checked_sub(payload as u64)
+            .ok_or(crate::error::LimitKind::DrainPayload)?;
+        let wire = wire
+            .checked_sub(bytes as u64)
+            .ok_or(crate::error::LimitKind::DrainWire)?;
         self.shared.drain_remaining.set(Some((wire, data)));
-        true
+        Ok(())
     }
 
     /// Waits until the body consumer asks for another item.
@@ -443,6 +446,18 @@ mod tests {
         },
         task::{Context, Poll, Wake, Waker},
     };
+
+    #[cfg(feature = "http1")]
+    #[test]
+    fn drain_limits_distinguish_payload_and_wire_without_partial_charging() {
+        use crate::error::LimitKind;
+        let (producer, consumer) = channel::<(), ()>();
+        consumer.drain_budget(2, 1);
+        assert_eq!(producer.charge_drain(3, 3), Err(LimitKind::DrainPayload));
+        assert_eq!(producer.charge_drain(4, 2), Err(LimitKind::DrainWire));
+        assert_eq!(producer.charge_drain(3, 2), Ok(()));
+        assert_eq!(producer.charge_drain(1, 0), Err(LimitKind::DrainWire));
+    }
 
     struct CounterWake(AtomicUsize);
 

@@ -1,7 +1,7 @@
 //! Request-local coordination between a service and its connection driver.
 use crate::{
     Response,
-    error::{Error, ErrorKind},
+    error::{BusyReason, Error, ErrorDetail, ErrorKind},
     upgrade::{self, BoxedOnUpgrade, OnUpgrade, PendingUpgrade, UpgradeSlot, UpgradeState, UpgradeStorage},
 };
 use std::{
@@ -65,7 +65,7 @@ impl RequestContext {
     /// # Errors
     /// Rejects non-informational statuses, 100, 101, late sends, invalid heads,
     /// count/size limits, and transport failures. A canceled in-flight send
-    /// occupies the command slot until its write completes (`Limit` meanwhile).
+    /// occupies the command slot until its write completes (`Busy` meanwhile).
     pub async fn send_informational(&mut self, response: Response<()>) -> Result<(), Error> {
         let status = response.status();
         if !status.is_informational() || status == 100 || status == 101 {
@@ -83,7 +83,8 @@ impl RequestContext {
         {
             let mut state = self.shared.command.borrow_mut();
             if !matches!(*state, CommandState::Idle) {
-                return Err(Error::new(ErrorKind::Limit, "informational write is still settling"));
+                return Err(Error::new(ErrorKind::Busy, "informational write is still settling")
+                    .with_detail(ErrorDetail::Busy(BusyReason::InformationalWrite)));
             }
             *state = CommandState::Queued(response);
         }
@@ -382,7 +383,9 @@ mod tests {
         }
         {
             let mut send = pin!(context.send_informational(head()));
-            assert!(matches!(poll(send.as_mut()), Poll::Ready(Err(error)) if error.kind()==ErrorKind::Limit));
+            assert!(
+                matches!(poll(send.as_mut()), Poll::Ready(Err(error)) if error.kind()==ErrorKind::Busy && error.detail()==Some(ErrorDetail::Busy(BusyReason::InformationalWrite)))
+            );
         }
         receiver.complete(Ok(()));
         {

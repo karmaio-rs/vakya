@@ -3,27 +3,15 @@ use super::{
     head::{ResponseHead, ValidatedRequestHead, ValidatedResponseHead},
     upgrade_protocols_match,
 };
-use crate::error::{Error, ErrorKind};
+use crate::error::{Error, ErrorDetail, ErrorKind, LimitKind};
 use http::{HeaderValue, Method, header::UPGRADE};
 
+/// Successful terminal results returned by already-settled directional activities.
+/// Retirement includes abandonment and explicit upload abort, never pending I/O.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Direction {
-    Request,
-    Response,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Progress {
-    Active,
-    Stopping,
+pub(super) enum ActivityEnd {
     Complete,
-    Aborted,
-}
-
-impl Progress {
-    fn settled(self) -> bool {
-        matches!(self, Self::Complete | Self::Aborted)
-    }
+    Retired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,25 +30,21 @@ pub(super) enum HeadAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Outcome {
-    Active,
     Reusable,
     Close,
     Handoff(UpgradeKind),
 }
 
-/// Protocol decisions for one exchange, independent of service-future lifetime.
+/// Message policy for one exchange, independent of directional activity lifetime.
 ///
-/// A head event is not an I/O-completion event. Drivers must acknowledge both
-/// directions only after their framing, producer terminal checks, and owned I/O
-/// have settled. An abort requests that work stop; it never asserts that buffers
-/// have returned. No transport, body allocation, or scheduling lives here.
+/// Heads select policy; they do not assert I/O completion. The driver retains and
+/// awaits both activities, including producer terminal checks and canceled owned
+/// operations, before consuming this policy in `finish`. Originating failures
+/// remain driver errors. No transport, body allocation, or scheduling lives here.
 #[derive(Debug)]
-pub(super) struct Exchange {
-    request: Progress,
-    response: Progress,
+pub(super) struct ExchangePolicy {
     phase: ResponsePhase,
     persistence: Persistence,
-    failed: bool,
     method: Method,
     upgrade: Option<UpgradeKind>,
     offered_protocols: Vec<HeaderValue>,
@@ -68,14 +52,11 @@ pub(super) struct Exchange {
     max_informational: usize,
 }
 
-impl Exchange {
+impl ExchangePolicy {
     pub(super) fn new(request: &ValidatedRequestHead, max_informational: usize) -> Self {
         Self {
-            request: Progress::Active,
-            response: Progress::Active,
             phase: ResponsePhase::AwaitingHead,
             persistence: request.persistence,
-            failed: false,
             method: request.head.method.clone(),
             upgrade: request.upgrade,
             offered_protocols: if request.upgrade == Some(UpgradeKind::Protocol) {
@@ -91,15 +72,7 @@ impl Exchange {
     /// Validate a peer response in the context of its request. A final response
     /// does not settle or cancel the upload. Drivers own Expect permission.
     pub(super) fn receive_head(&mut self, head: ResponseHead) -> Result<(ValidatedResponseHead, HeadAction), Error> {
-        let result = self.accept_head(head);
-        if result.is_err() {
-            self.abort();
-        }
-        result
-    }
-
-    fn accept_head(&mut self, head: ResponseHead) -> Result<(ValidatedResponseHead, HeadAction), Error> {
-        if self.failed || self.phase != ResponsePhase::AwaitingHead {
+        if self.phase != ResponsePhase::AwaitingHead {
             return Err(Error::new(
                 ErrorKind::InvalidMessage,
                 "response head after final response",
@@ -121,7 +94,8 @@ impl Exchange {
         }
         if head.head.status.is_informational() {
             if self.informational == self.max_informational {
-                return Err(Error::new(ErrorKind::Limit, "too many informational responses"));
+                return Err(Error::new(ErrorKind::Limit, "too many informational responses")
+                    .with_detail(ErrorDetail::IncomingLimit(LimitKind::InformationalResponses)));
             }
             self.informational += 1;
             return Ok((head, HeadAction::Informational));
@@ -134,9 +108,9 @@ impl Exchange {
     }
 
     /// Record a validated final head committed by the server writer. Upload
-    /// completion remains independent and is acknowledged through `settle`.
+    /// completion remains independent and is supplied to `finish`.
     pub(super) fn sent_final(&mut self, persistence: Persistence) -> Result<(), Error> {
-        if self.failed || self.phase != ResponsePhase::AwaitingHead {
+        if self.phase != ResponsePhase::AwaitingHead {
             return Err(Error::new(ErrorKind::Internal, "invalid final response transition"));
         }
         self.phase = ResponsePhase::Final;
@@ -149,8 +123,7 @@ impl Exchange {
     /// Validate the server's chosen transition before committing any bytes.
     pub(super) fn sent_response(&mut self, head: &ValidatedResponseHead) -> Result<(), Error> {
         if let Some(upgrade) = head.upgrade {
-            if self.failed
-                || self.phase != ResponsePhase::AwaitingHead
+            if self.phase != ResponsePhase::AwaitingHead
                 || self.upgrade != Some(upgrade)
                 || (upgrade == UpgradeKind::Protocol
                     && !upgrade_protocols_match(&self.offered_protocols, &head.head.headers))
@@ -174,51 +147,21 @@ impl Exchange {
         self.persistence = Persistence::Close;
     }
 
-    pub(super) fn abort(&mut self) {
-        self.failed = true;
-        for progress in [&mut self.request, &mut self.response] {
-            if *progress == Progress::Active {
-                *progress = Progress::Stopping;
+    /// Compose terminal activity results exactly once. The driver must await
+    /// both directions before calling, even when either was asked to stop.
+    pub(super) fn finish(self, request: ActivityEnd, response: ActivityEnd) -> Result<Outcome, Error> {
+        if request == ActivityEnd::Retired || response == ActivityEnd::Retired {
+            return Ok(Outcome::Close);
+        }
+        match self.phase {
+            ResponsePhase::AwaitingHead => {
+                Err(Error::new(ErrorKind::Internal, "exchange completed without final head"))
             }
-        }
-    }
-
-    /// Acknowledge actual direction completion, including any pending operation.
-    /// `clean` requires a complete body and successful terminal producer checks.
-    pub(super) fn settle(&mut self, direction: Direction, clean: bool) -> Result<(), Error> {
-        let progress = match direction {
-            Direction::Request => &mut self.request,
-            Direction::Response => &mut self.response,
-        };
-        if progress.settled()
-            || (direction == Direction::Response && clean && self.phase == ResponsePhase::AwaitingHead)
-        {
-            self.abort();
-            return Err(Error::new(
-                ErrorKind::Internal,
-                "invalid exchange completion transition",
-            ));
-        }
-        *progress = if clean { Progress::Complete } else { Progress::Aborted };
-        if !clean {
-            self.abort();
-        }
-        Ok(())
-    }
-
-    pub(super) fn outcome(&self) -> Outcome {
-        if !self.request.settled() || !self.response.settled() {
-            return Outcome::Active;
-        }
-        if self.failed {
-            return Outcome::Close;
-        }
-        if let ResponsePhase::Upgrade(kind) = self.phase {
-            return Outcome::Handoff(kind);
-        }
-        match self.persistence {
-            Persistence::Reusable => Outcome::Reusable,
-            Persistence::Close => Outcome::Close,
+            ResponsePhase::Upgrade(kind) => Ok(Outcome::Handoff(kind)),
+            ResponsePhase::Final => Ok(match self.persistence {
+                Persistence::Reusable => Outcome::Reusable,
+                Persistence::Close => Outcome::Close,
+            }),
         }
     }
 }
@@ -232,12 +175,12 @@ mod tests {
     };
     use bytes::Bytes;
 
-    fn exchange(wire: &[u8]) -> Exchange {
+    fn exchange(wire: &[u8]) -> ExchangePolicy {
         let config = Config::default();
         let mut parser = HeadParser::<RequestRole>::request(config.head);
         let consumed = parser.head_len(wire).unwrap().expect("complete request fixture");
         let head = parser.parse_shared(Bytes::copy_from_slice(&wire[..consumed])).unwrap();
-        Exchange::new(&head.validate().unwrap(), config.max_informational)
+        ExchangePolicy::new(&head.validate().unwrap(), config.max_informational)
     }
 
     fn response(wire: &[u8]) -> ResponseHead {
@@ -247,43 +190,55 @@ mod tests {
     }
 
     #[test]
-    fn early_final_preserves_upload_and_reuse_waits_for_both_directions() {
+    fn early_final_selects_policy_without_directional_progress() {
         for status in ["200 OK", "400 Bad Request", "500 Internal Server Error"] {
-            for first in [Direction::Request, Direction::Response] {
-                let mut state = exchange(
-                    b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n",
-                );
-                let (_, action) = state
-                    .receive_head(response(
-                        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
-                    ))
+            let mut state = exchange(
+                b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n",
+            );
+            let (_, action) = state
+                .receive_head(response(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                ))
+                .unwrap();
+            assert_eq!(action, HeadAction::Final);
+            assert_eq!(
+                state.finish(ActivityEnd::Complete, ActivityEnd::Complete).unwrap(),
+                Outcome::Reusable
+            );
+        }
+    }
+
+    #[test]
+    fn retired_activity_prevents_handoff_or_reuse() {
+        for request in [ActivityEnd::Complete, ActivityEnd::Retired] {
+            for response_end in [ActivityEnd::Complete, ActivityEnd::Retired] {
+                let mut state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
+                state
+                    .receive_head(response(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
                     .unwrap();
-                assert_eq!(action, HeadAction::Final);
-                assert_eq!(state.request, Progress::Active);
-                state.settle(first, true).unwrap();
-                assert_eq!(state.outcome(), Outcome::Active);
-                let second = if first == Direction::Request {
-                    Direction::Response
-                } else {
-                    Direction::Request
-                };
-                state.settle(second, true).unwrap();
-                assert_eq!(state.outcome(), Outcome::Reusable);
+                let outcome = state.finish(request, response_end).unwrap();
+                assert_eq!(
+                    outcome,
+                    if request == ActivityEnd::Complete && response_end == ActivityEnd::Complete {
+                        Outcome::Reusable
+                    } else {
+                        Outcome::Close
+                    }
+                );
             }
         }
     }
 
     #[test]
-    fn abort_does_not_claim_completion_or_allow_reuse() {
-        let mut state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
-        state.abort();
-        assert_eq!(state.request, Progress::Stopping);
-        assert_eq!(state.response, Progress::Stopping);
-        assert_eq!(state.outcome(), Outcome::Active);
-        state.settle(Direction::Request, false).unwrap();
-        assert_eq!(state.outcome(), Outcome::Active);
-        state.settle(Direction::Response, false).unwrap();
-        assert_eq!(state.outcome(), Outcome::Close);
+    fn clean_completion_requires_a_final_head() {
+        let state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        assert_eq!(
+            state
+                .finish(ActivityEnd::Complete, ActivityEnd::Complete)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Internal
+        );
     }
 
     #[test]
@@ -333,10 +288,16 @@ mod tests {
                 state.receive_head(response(reply)).unwrap().1,
                 HeadAction::Upgrade(kind)
             );
-            state.settle(Direction::Response, true).unwrap();
-            assert_eq!(state.outcome(), Outcome::Active);
-            state.settle(Direction::Request, true).unwrap();
-            assert_eq!(state.outcome(), Outcome::Handoff(kind));
+            assert_eq!(
+                state.finish(ActivityEnd::Complete, ActivityEnd::Complete).unwrap(),
+                Outcome::Handoff(kind)
+            );
+            let mut state = exchange(request);
+            state.receive_head(response(reply)).unwrap();
+            assert_eq!(
+                state.finish(ActivityEnd::Retired, ActivityEnd::Complete).unwrap(),
+                Outcome::Close
+            );
         }
         for request in [
             b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".as_slice(),
@@ -363,10 +324,10 @@ mod tests {
         ] {
             let mut state = exchange(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
             state.receive_head(response(reply)).unwrap();
-            state.settle(Direction::Request, true).unwrap();
-            assert_eq!(state.outcome(), Outcome::Active);
-            state.settle(Direction::Response, true).unwrap();
-            assert_eq!(state.outcome(), Outcome::Close);
+            assert_eq!(
+                state.finish(ActivityEnd::Complete, ActivityEnd::Complete).unwrap(),
+                Outcome::Close
+            );
         }
     }
 }

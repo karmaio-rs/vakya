@@ -23,6 +23,8 @@ pub enum ErrorKind {
     Body,
     /// An application service failed to produce a response.
     Service,
+    /// An admission or command slot is occupied by another local operation.
+    Busy,
     /// A configured size, count, or work limit was exceeded.
     Limit,
     /// A configured elapsed-time limit was exceeded.
@@ -54,6 +56,7 @@ impl ErrorKind {
             Self::LocalMessage => "invalid local message",
             Self::Body => "body failure",
             Self::Service => "service failure",
+            Self::Busy => "operation busy",
             Self::Limit => "configured limit exceeded",
             Self::Timeout => "deadline exceeded",
             Self::Unsupported => "unsupported HTTP behavior",
@@ -65,6 +68,96 @@ impl ErrorKind {
     }
 }
 
+/// Structured context for failures that need more than a broad error kind.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum ErrorDetail {
+    /// A local admission or command slot is occupied.
+    Busy(BusyReason),
+    /// Received input exceeded a framing, delivery, or retention budget.
+    IncomingLimit(LimitKind),
+    /// Generated output exceeded an encoding or informational budget.
+    OutgoingLimit(LimitKind),
+    /// An elapsed-time limit expired in this phase.
+    Timeout(TimeoutPhase),
+    /// Recoverable allocation or capacity reservation failed.
+    Allocation,
+    /// The driver was dropped without certifying I/O settlement.
+    DriverLost,
+}
+
+/// The occupied local slot behind an [`ErrorKind::Busy`] failure.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum BusyReason {
+    /// A request or permit already owns admission.
+    RequestAdmission,
+    /// Another request reservation waiter is registered.
+    ReservationWaiter,
+    /// An informational head write still owns its command slot.
+    InformationalWrite,
+}
+
+/// The size or count budget exceeded by an HTTP operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum LimitKind {
+    /// Serialized message head bytes.
+    HeadBytes,
+    /// Message head field count.
+    HeaderCount,
+    /// Capacity of the standard message head map.
+    HeadMapCapacity,
+    /// One chunk-size line, including extensions.
+    ChunkLineBytes,
+    /// Aggregate chunk-extension bytes.
+    ChunkExtensionBytes,
+    /// Serialized trailing header bytes.
+    TrailerBytes,
+    /// Trailing field count.
+    TrailerCount,
+    /// Capacity of the standard trailing header map.
+    TrailerMapCapacity,
+    /// Retained unconsumed receive bytes.
+    RetainedInput,
+    /// Informational response count.
+    InformationalResponses,
+    /// Payload bytes discarded while draining.
+    DrainPayload,
+    /// Payload plus framing bytes discarded while draining.
+    DrainWire,
+}
+
+/// The operation phase whose elapsed-time budget expired.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum TimeoutPhase {
+    /// An underlying transport's unspecified timeout.
+    Transport,
+    /// Receiving a complete final message head.
+    Head,
+    /// Receiving demanded body progress.
+    BodyProgress,
+    /// Writing or flushing transport progress.
+    WriteProgress,
+    /// Draining the body within its total deadline.
+    Drain,
+    /// Graceful connection shutdown or transport shutdown settlement.
+    Shutdown,
+}
+
+#[cfg(feature = "http1")]
+#[derive(Debug)]
+pub(crate) struct DeadlineElapsed(pub(crate) TimeoutPhase);
+#[cfg(feature = "http1")]
+impl fmt::Display for DeadlineElapsed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HTTP transport progress deadline exceeded")
+    }
+}
+#[cfg(feature = "http1")]
+impl StdError for DeadlineElapsed {}
+
 /// An error returned by a Vakya HTTP or connection operation.
 ///
 /// The error exposes a stable [`ErrorKind`] and may retain an underlying source.
@@ -74,6 +167,7 @@ impl ErrorKind {
 pub struct Error {
     kind: ErrorKind,
     context: &'static str,
+    detail: Option<ErrorDetail>,
     source: Option<Source>,
 }
 
@@ -88,6 +182,7 @@ impl Error {
         Self {
             kind,
             context,
+            detail: None,
             source: None,
         }
     }
@@ -101,6 +196,20 @@ impl Error {
         error
     }
 
+    pub(crate) fn with_detail(self, detail: ErrorDetail) -> Self {
+        self.classified(Some(detail))
+    }
+    pub(crate) fn classified(mut self, detail: Option<ErrorDetail>) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    /// Returns optional structured failure context without inspecting diagnostics.
+    #[inline]
+    pub const fn detail(&self) -> Option<ErrorDetail> {
+        self.detail
+    }
+
     /// Share a source only when both a body and its driver must report it.
     /// The public error remains non-Clone and source downcasts stay unchanged.
     #[cfg(feature = "http1")]
@@ -112,11 +221,13 @@ impl Error {
         let first = Self {
             kind: self.kind,
             context: self.context,
+            detail: self.detail,
             source: source.clone().map(Source::Shared),
         };
         let second = Self {
             kind: self.kind,
             context: self.context,
+            detail: self.detail,
             source: source.map(Source::Shared),
         };
         (first, second)
@@ -141,7 +252,22 @@ impl Error {
             ErrorKind::Io
         };
 
-        Self::with_source(kind, "HTTP I/O operation failed", source)
+        let detail = if kind == ErrorKind::Timeout {
+            #[cfg(feature = "http1")]
+            let phase = source
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<DeadlineElapsed>())
+                .map(|elapsed| elapsed.0)
+                .unwrap_or(TimeoutPhase::Transport);
+            #[cfg(not(feature = "http1"))]
+            let phase = TimeoutPhase::Transport;
+            Some(ErrorDetail::Timeout(phase))
+        } else if source.kind() == io::ErrorKind::OutOfMemory {
+            Some(ErrorDetail::Allocation)
+        } else {
+            None
+        };
+        Self::with_source(kind, "HTTP I/O operation failed", source).classified(detail)
     }
 
     /// Returns the high-level category of this error.
@@ -163,6 +289,7 @@ impl fmt::Debug for Error {
             .debug_struct("Error")
             .field("kind", &self.kind)
             .field("context", &self.context)
+            .field("detail", &self.detail)
             .field("has_source", &self.source.is_some())
             .finish_non_exhaustive()
     }
@@ -192,7 +319,7 @@ impl From<io::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, ErrorKind};
+    use super::{Error, ErrorDetail, ErrorKind, TimeoutPhase};
     use std::{error::Error as _, fmt, io};
 
     #[derive(Debug)]
@@ -224,6 +351,47 @@ mod tests {
             error.source().map(ToString::to_string).as_deref(),
             Some("peer supplied detail")
         );
+    }
+
+    #[test]
+    fn transport_details_preserve_originating_sources() {
+        let error = Error::from(io::Error::new(io::ErrorKind::TimedOut, LocalError));
+        assert_eq!(error.detail(), Some(ErrorDetail::Timeout(TimeoutPhase::Transport)));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .get_ref()
+                .unwrap()
+                .is::<LocalError>()
+        );
+        let error = Error::from(io::Error::from(io::ErrorKind::OutOfMemory));
+        assert_eq!(error.detail(), Some(ErrorDetail::Allocation));
+    }
+
+    #[cfg(feature = "http1")]
+    #[test]
+    fn split_preserves_details_and_original_source_identity() {
+        let error =
+            Error::with_source(ErrorKind::Body, "static context", LocalError).with_detail(ErrorDetail::DriverLost);
+        let (first, second) = error.split();
+        assert_eq!(first.detail(), Some(ErrorDetail::DriverLost));
+        assert_eq!(second.detail(), first.detail());
+        assert!(std::ptr::eq(first.source().unwrap(), second.source().unwrap()));
+        assert!(first.source().unwrap().is::<LocalError>());
+        assert!(!format!("{first:?} {second}").contains("private local detail"));
+        for phase in [
+            TimeoutPhase::Head,
+            TimeoutPhase::BodyProgress,
+            TimeoutPhase::WriteProgress,
+            TimeoutPhase::Shutdown,
+        ] {
+            let error = Error::from(io::Error::new(io::ErrorKind::TimedOut, super::DeadlineElapsed(phase)));
+            assert_eq!(error.detail(), Some(ErrorDetail::Timeout(phase)));
+            assert!(error.source().unwrap().is::<io::Error>());
+        }
     }
 
     #[test]

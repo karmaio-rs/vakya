@@ -6,7 +6,7 @@ use super::{
     header_case::HeaderCaseMap,
 };
 use crate::body::{SizeHint, TrailerHint};
-use crate::error::{Error, ErrorKind};
+use crate::error::{Error, ErrorDetail, ErrorKind, LimitKind};
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version,
@@ -69,7 +69,8 @@ pub(super) enum EncodeError {
     TrailersForbidden,
     FrameAfterEnd,
     Unsupported,
-    Limit,
+    Limit(LimitKind),
+    Allocation,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -83,11 +84,15 @@ impl std::error::Error for EncodeError {}
 impl From<EncodeError> for Error {
     fn from(error: EncodeError) -> Self {
         let kind = match error {
-            EncodeError::Limit => ErrorKind::Limit,
+            EncodeError::Limit(_) | EncodeError::Allocation => ErrorKind::Limit,
             EncodeError::Unsupported => ErrorKind::Unsupported,
             _ => ErrorKind::LocalMessage,
         };
-        Self::with_source(kind, "outgoing HTTP message cannot be encoded safely", error)
+        Self::with_source(kind, "outgoing HTTP message cannot be encoded safely", error).classified(match error {
+            EncodeError::Limit(limit) => Some(ErrorDetail::OutgoingLimit(limit)),
+            EncodeError::Allocation => Some(ErrorDetail::Allocation),
+            _ => None,
+        })
     }
 }
 
@@ -139,7 +144,8 @@ pub(super) fn prepare_request_head(
     let mut writer = BoundedWriter::new(config.max_head_bytes);
     writer.push(validated.head.method.as_str().as_bytes())?;
     writer.push(b" ")?;
-    write!(&mut writer, "{}", validated.head.target).map_err(|_| EncodeError::Limit)?;
+    write!(&mut writer, "{}", validated.head.target)
+        .map_err(|_| writer.failure.unwrap_or(EncodeError::Limit(LimitKind::HeadBytes)))?;
     writer.push(b" ")?;
     writer.push(version_bytes(version)?)?;
     writer.push(b"\r\n")?;
@@ -338,7 +344,11 @@ fn reject_framing_headers(headers: &HeaderMap) -> Result<(), EncodeError> {
 
 fn map_head_error(error: HeadError) -> EncodeError {
     match error {
-        HeadError::Limit(_) => EncodeError::Limit,
+        HeadError::Limit(limit) => EncodeError::Limit(match limit {
+            super::head::HeadLimit::Bytes => LimitKind::HeadBytes,
+            super::head::HeadLimit::Headers => LimitKind::HeaderCount,
+            super::head::HeadLimit::HeaderMap => LimitKind::HeadMapCapacity,
+        }),
         HeadError::UnsupportedTransferCoding | HeadError::UnsupportedVersion => EncodeError::Unsupported,
         HeadError::AmbiguousMessageLength | HeadError::InvalidContentLength | HeadError::InvalidTransferEncoding => {
             EncodeError::InvalidFraming
@@ -399,6 +409,8 @@ fn write_header_name(
 
 #[derive(Debug)]
 struct BoundedWriter {
+    kind: LimitKind,
+    failure: Option<EncodeError>,
     bytes: Vec<u8>,
     limit: usize,
 }
@@ -408,25 +420,39 @@ impl BoundedWriter {
         Self {
             bytes: Vec::new(),
             limit,
+            kind: LimitKind::HeadBytes,
+            failure: None,
         }
     }
 
     fn push(&mut self, value: &[u8]) -> Result<(), EncodeError> {
-        let length = self.bytes.len().checked_add(value.len()).ok_or(EncodeError::Limit)?;
+        let length = self
+            .bytes
+            .len()
+            .checked_add(value.len())
+            .ok_or(EncodeError::Limit(self.kind))?;
         if length > self.limit {
-            return Err(EncodeError::Limit);
+            return Err(EncodeError::Limit(self.kind));
         }
-        self.bytes.try_reserve(value.len()).map_err(|_| EncodeError::Limit)?;
+        self.bytes
+            .try_reserve(value.len())
+            .map_err(|_| EncodeError::Allocation)?;
         self.bytes.extend_from_slice(value);
         Ok(())
     }
 
     fn push_title_case(&mut self, value: &[u8]) -> Result<(), EncodeError> {
-        let length = self.bytes.len().checked_add(value.len()).ok_or(EncodeError::Limit)?;
+        let length = self
+            .bytes
+            .len()
+            .checked_add(value.len())
+            .ok_or(EncodeError::Limit(self.kind))?;
         if length > self.limit {
-            return Err(EncodeError::Limit);
+            return Err(EncodeError::Limit(self.kind));
         }
-        self.bytes.try_reserve(value.len()).map_err(|_| EncodeError::Limit)?;
+        self.bytes
+            .try_reserve(value.len())
+            .map_err(|_| EncodeError::Allocation)?;
         let mut capitalize = true;
         for &byte in value {
             self.bytes
@@ -444,7 +470,10 @@ impl BoundedWriter {
 impl fmt::Write for BoundedWriter {
     #[inline]
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.push(value.as_bytes()).map_err(|_| fmt::Error)
+        self.push(value.as_bytes()).map_err(|error| {
+            self.failure = Some(error);
+            fmt::Error
+        })
     }
 }
 
@@ -560,13 +589,13 @@ impl BodyEncoder {
             return self.fail(EncodeError::TrailersForbidden);
         }
         let mut writer = BoundedWriter::new(self.max_trailer_bytes);
-        if writer
+        writer.kind = LimitKind::TrailerBytes;
+        if let Err(error) = writer
             .push(b"0\r\n")
             .and_then(|()| write_headers(&mut writer, trailers, None, self.title_case_headers))
             .and_then(|()| writer.push(b"\r\n"))
-            .is_err()
         {
-            return self.fail(EncodeError::Limit);
+            return self.fail(error);
         }
         self.state = BodyState::Done;
         Ok(writer.finish())
@@ -630,6 +659,33 @@ mod tests {
     use karmaio::buf::IoBuf;
 
     const LIMITS: EncodeConfig = EncodeConfig::new(4096, 4096);
+
+    #[test]
+    fn public_encoding_details_keep_direction_and_allocation_failure() {
+        for kind in [
+            LimitKind::HeadBytes,
+            LimitKind::HeaderCount,
+            LimitKind::HeadMapCapacity,
+            LimitKind::TrailerBytes,
+        ] {
+            assert_eq!(
+                Error::from(EncodeError::Limit(kind)).detail(),
+                Some(ErrorDetail::OutgoingLimit(kind))
+            );
+        }
+        assert_eq!(
+            Error::from(EncodeError::Allocation).detail(),
+            Some(ErrorDetail::Allocation)
+        );
+        let mut encoder =
+            BodyEncoder::new(BodyMode::Chunked, BodyMetadata::unknown(), EncodeConfig::new(4096, 1)).unwrap();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-end", HeaderValue::from_static("yes"));
+        assert_eq!(
+            Error::from(encoder.trailers(&trailers).unwrap_err()).detail(),
+            Some(ErrorDetail::OutgoingLimit(LimitKind::TrailerBytes))
+        );
+    }
 
     #[test]
     fn request_and_response_heads_round_trip() {
@@ -767,7 +823,7 @@ mod tests {
                 EncodeConfig::new(8, 32)
             )
             .unwrap_err(),
-            EncodeError::Limit
+            EncodeError::Limit(LimitKind::HeadBytes)
         );
     }
 
@@ -778,7 +834,10 @@ mod tests {
         assert_eq!(writer.finish(), "X-Http-Etag");
 
         let mut limited = BoundedWriter::new(10);
-        assert_eq!(limited.push_title_case(b"x-http-etag").unwrap_err(), EncodeError::Limit);
+        assert_eq!(
+            limited.push_title_case(b"x-http-etag").unwrap_err(),
+            EncodeError::Limit(LimitKind::HeadBytes)
+        );
     }
 
     #[test]

@@ -242,8 +242,15 @@ fn observation_is_ordered_bounded_and_count_limited() {
         };
         assert_eq!(head.headers()["link"], "</a>");
         let (driver, event) = pair(driver, pending.next_event()).await;
-        assert_eq!(driver.unwrap_err().kind(), ErrorKind::Limit);
-        assert_eq!(event.unwrap_err().kind(), ErrorKind::Limit);
+        for error in [driver.unwrap_err(), event.unwrap_err()] {
+            assert_eq!(error.kind(), ErrorKind::Limit);
+            assert_eq!(
+                error.detail(),
+                Some(vakya::error::ErrorDetail::IncomingLimit(
+                    vakya::error::LimitKind::InformationalResponses
+                ))
+            );
+        }
         assert!(pending.next_event().await.unwrap().is_none());
     });
 }

@@ -50,6 +50,21 @@ impl<R, W, F: Future<Output = Result<ConnectionOutcome<R, W>, Error>>> Connectio
         self.control.clone()
     }
 
+    /// Drive HTTP and recover concrete halves at a clean terminal boundary.
+    ///
+    /// This selects recovery before driving starts and avoids local transport
+    /// shutdown on clean closure. Pending reads and flushes still settle, and
+    /// unread input is preserved. Upgrade outcomes remain unchanged. Protocol,
+    /// body, and I/O failures, explicit abort, and unfinished body abandonment
+    /// do not return recovered parts. The peer may already have closed its side.
+    ///
+    /// # Errors
+    /// Returns the same originating failures and settled cancellation as [`Self::run`].
+    pub fn run_without_shutdown(self) -> F {
+        self.control.recover_transport();
+        self.future
+    }
+
     /// Drive requests sequentially, with independent request-body writes and
     /// response reads, until closure or error.
     ///

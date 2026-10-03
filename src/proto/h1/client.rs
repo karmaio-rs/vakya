@@ -3,7 +3,7 @@ use super::{
     bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_request_head},
-    exchange::{Direction, Exchange, HeadAction, Outcome},
+    exchange::{ActivityEnd, ExchangePolicy, HeadAction, Outcome},
     head::{HeadParser, ResponseRole},
     header_case::HeaderCaseMap,
 };
@@ -12,12 +12,14 @@ use crate::{
     body::Body,
     body::pipe::Producer,
     client::{
+        CloseReason, ExchangeOutcome,
         admission::{Job, Receiver},
+        completion::CompletionGuard,
         conn::http1::config::Config as ClientConfig,
         response::{Control, ResponseEvent},
     },
-    connection::ConnectionOutcome,
-    error::{Error, ErrorKind},
+    connection::{ConnectionOutcome, ConnectionParts},
+    error::{Error, ErrorDetail, ErrorKind, TimeoutPhase},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -47,14 +49,41 @@ where
 {
     let shutdown = karmaio::runtime::CancellationSource::new();
 
-    connection
+    let mut terminal = None;
+    let result = connection
         .instrument(connection.drive(
             &shutdown,
-            pin!(run_inner(io, requests, strategy, config, &connection, &shutdown)),
+            pin!(run_inner(
+                io,
+                requests,
+                strategy,
+                config,
+                &connection,
+                &shutdown,
+                &mut terminal
+            )),
         ))
-        .await
+        .await;
+    // The outer shutdown controller may replace a cancellation with its deadline
+    // outcome. Publish only after that final originating-error composition.
+    if let Some((completion, outcome)) = terminal {
+        match result {
+            Ok(result) => {
+                completion.finish(Ok(outcome));
+                Ok(result)
+            }
+            Err(error) => {
+                let (driver, receipt) = error.split();
+                completion.finish(Err(receipt));
+                Err(driver)
+            }
+        }
+    } else {
+        result
+    }
 }
 
+#[allow(clippy::too_many_arguments)] // Terminal receipt follows outer shutdown composition.
 async fn run_inner<I, B, T>(
     io: I,
     mut requests: Receiver<B>,
@@ -62,6 +91,7 @@ async fn run_inner<I, B, T>(
     config: ClientConfig,
     connection: &crate::connection::ConnectionControl,
     shutdown: &karmaio::runtime::CancellationSource,
+    terminal: &mut Option<(CompletionGuard, ExchangeOutcome)>,
 ) -> Result<ConnectionOutcome<I::ReadHalf, I::WriteHalf>, Error>
 where
     I: IntoOwnedSplit,
@@ -79,6 +109,7 @@ where
     let mut parser = HeadParser::<ResponseRole>::response(config.protocol.head)
         .with_preserved_header_case(config.protocol.preserve_header_case);
 
+    let mut can_recover = true;
     let mut exchanges = crate::trace::Exchanges::default();
     while let Some(job) = requests.next().await {
         budget.step().await;
@@ -87,9 +118,11 @@ where
             response,
             control,
             upgrade,
+            completion,
         } = job;
+        *terminal = Some((completion, ExchangeOutcome::Closed(CloseReason::MessagePolicy)));
         let span = exchanges.next();
-        let (next, persistence) = span
+        let settled = span
             .instrument(exchange(
                 &mut reader,
                 &mut writer,
@@ -103,24 +136,32 @@ where
                 shutdown,
             ))
             .await?;
-        span.outcome(match persistence {
+        span.outcome(match settled.outcome {
             Outcome::Handoff(_) => "handoff",
             Outcome::Close => "close",
             Outcome::Reusable => "reusable",
-            Outcome::Active => "active",
         });
-        buffer = next;
+        buffer = settled.buffer;
 
-        match persistence {
+        match settled.outcome {
             Outcome::Handoff(kind) => {
                 drop(requests);
                 let upgraded = Upgraded::new(reader, writer.inner, buffer.take_all(), kind);
-                return Ok(match upgrade.fulfill(upgraded) {
+                let outcome = match upgrade.fulfill(upgraded) {
                     Ok(kind) => ConnectionOutcome::UpgradeClaimed(kind),
                     Err(upgraded) => ConnectionOutcome::Upgraded(upgraded),
-                });
+                };
+                terminal.as_mut().expect("active receipt").1 = ExchangeOutcome::Upgraded(kind);
+                return Ok(outcome);
             }
-            Outcome::Close => break,
+            Outcome::Close => {
+                can_recover = !matches!(
+                    settled.close_reason,
+                    CloseReason::BodyAbandonment | CloseReason::UploadAbort
+                );
+                terminal.as_mut().expect("active receipt").1 = ExchangeOutcome::Closed(settled.close_reason);
+                break;
+            }
             Outcome::Reusable => {
                 // No other request has been sent: read-ahead cannot belong to
                 // a later response. Only handoff may transfer this prefix.
@@ -131,21 +172,41 @@ where
                     ));
                 }
             }
-            Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled client exchange")),
         }
 
-        if connection.stopping() {
+        if !requests.release() {
+            terminal.as_mut().expect("active receipt").1 = ExchangeOutcome::Closed(if connection.stopping() {
+                CloseReason::Shutdown
+            } else {
+                CloseReason::ApplicationClosure
+            });
             break;
         }
-
-        requests.release();
+        terminal
+            .take()
+            .expect("active receipt")
+            .0
+            .finish(Ok(ExchangeOutcome::Reusable));
     }
     // Close admission before awaiting transport shutdown so reservations cannot
     // wait for an exchange that will never run.
     drop(requests);
+    if connection.recovering() && can_recover {
+        return Ok(ConnectionOutcome::Recovered(ConnectionParts {
+            reader,
+            writer: writer.inner,
+            read_ahead: buffer.take_all(),
+        }));
+    }
     writer.shutdown().with_cancellation(shutdown.token()).await?;
 
     Ok(ConnectionOutcome::Closed)
+}
+
+struct SettledExchange {
+    buffer: RecvBuffer,
+    outcome: Outcome,
+    close_reason: CloseReason,
 }
 
 #[allow(clippy::too_many_arguments)] // Disjoint exchange resources and connection cancellation.
@@ -160,7 +221,7 @@ async fn exchange<R, W, B, T>(
     control: std::rc::Rc<Control>,
     config: &ClientConfig,
     shutdown: &karmaio::runtime::CancellationSource,
-) -> Result<(RecvBuffer, Outcome), Error>
+) -> Result<SettledExchange, Error>
 where
     W: AsyncWrite,
     B: Body,
@@ -218,7 +279,7 @@ async fn exchange_inner<R, W, B, T>(
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
     config: &ClientConfig,
-) -> Result<(RecvBuffer, Outcome), Error>
+) -> Result<SettledExchange, Error>
 where
     W: AsyncWrite,
     B: Body,
@@ -243,7 +304,7 @@ where
         config.protocol.encode,
     )?;
 
-    let state = Exchange::new(&request, config.protocol.max_informational);
+    let state = ExchangePolicy::new(&request, config.protocol.max_informational);
     let mut encoder = BodyEncoder::new(head.mode, metadata, config.protocol.encode)?;
 
     let send = async {
@@ -311,7 +372,7 @@ where
     };
 
     // Prefer the originating failure over the other half's cancellation.
-    let (end, buffer, mut state) = match received {
+    let (end, buffer, state) = match received {
         Ok(result) => result,
         Err(error) => {
             return Err(match sent {
@@ -321,7 +382,7 @@ where
         }
     };
 
-    match end {
+    let response_end = match end {
         ReceiveEnd::Failed(error) => return Err(error),
         ReceiveEnd::Abandoned => {
             if let Err(error) = sent
@@ -329,37 +390,32 @@ where
             {
                 return Err(error);
             }
-            return Ok((buffer, Outcome::Close));
+            return Ok(SettledExchange {
+                buffer,
+                outcome: state.finish(ActivityEnd::Retired, ActivityEnd::Retired)?,
+                close_reason: CloseReason::BodyAbandonment,
+            });
         }
-        ReceiveEnd::Complete => {}
-    }
+        ReceiveEnd::Complete => ActivityEnd::Complete,
+    };
 
-    if let Err(error) = sent {
-        if !error.is_canceled() || !explicit_abort(control) {
-            return Err(error);
-        }
-        state.settle(Direction::Request, false)?;
-    } else {
-        state.settle(Direction::Request, true)?;
-    }
-
-    state.settle(Direction::Response, true)?;
-
-    // Cancellation can race with successful completion. The abort decision was
-    // made while upload was unfinished, so even a successful final completion
-    // must not reopen admission.
-    if explicit_abort(control) {
-        state.close_after_exchange();
-    }
-
-    Ok((
+    let request_end = match sent {
+        Err(error) if !error.is_canceled() || !explicit_abort(control) => return Err(error),
+        Err(_) => ActivityEnd::Retired,
+        // An abort can race with successful completion. Admission must still
+        // retire: the application requested abort while upload was unfinished.
+        Ok(()) if explicit_abort(control) => ActivityEnd::Retired,
+        Ok(()) => ActivityEnd::Complete,
+    };
+    Ok(SettledExchange {
         buffer,
-        if explicit_abort(control) {
-            Outcome::Close
+        outcome: state.finish(request_end, response_end)?,
+        close_reason: if explicit_abort(control) {
+            CloseReason::UploadAbort
         } else {
-            state.outcome()
+            CloseReason::MessagePolicy
         },
-    ))
+    })
 }
 
 fn explicit_abort(control: &Control) -> bool {
@@ -372,15 +428,16 @@ async fn receive<R, T: Receive<R>>(
     strategy: &mut T,
     parser: &mut HeadParser<ResponseRole>,
     mut buffer: RecvBuffer,
-    mut state: Exchange,
+    mut state: ExchangePolicy,
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
     config: &ClientConfig,
-) -> Result<(ReceiveEnd, RecvBuffer, Exchange), Error> {
+) -> Result<(ReceiveEnd, RecvBuffer, ExchangePolicy), Error> {
     let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
     let head = loop {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
+            return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded")
+                .with_detail(ErrorDetail::Timeout(TimeoutPhase::Head)));
         }
 
         match parser.head_len(buffer.bytes())? {
@@ -415,6 +472,7 @@ async fn receive<R, T: Receive<R>>(
                         match deadline {
                             Some(deadline) => karmaio::time::timeout_at(deadline, offer).await.map_err(|_| {
                                 Error::new(ErrorKind::Timeout, "final response head deadline exceeded")
+                                    .with_detail(ErrorDetail::Timeout(TimeoutPhase::Head))
                             })??,
                             None => offer.await?,
                         }

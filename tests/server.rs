@@ -601,7 +601,7 @@ fn request_limits_and_partial_head_eof_fail_before_service_admission() {
                 Ok::<_, Infallible>(Response::new(Empty::new()))
             });
             let mut builder = Builder::new();
-            builder.head_limits(128, 1).unwrap();
+            builder.incoming_head_limits(128, 1).unwrap();
             let error = builder
                 .auto_date(false)
                 .serve_connection((reader(wire), Writer::new([])), service)
@@ -638,7 +638,7 @@ fn illegal_request_heads_send_400_or_431_unless_disabled() {
 
         let (writer, bytes) = ObservedWriter::new();
         let mut builder = Builder::new();
-        builder.head_limits(128, 1).unwrap();
+        builder.incoming_head_limits(128, 1).unwrap();
         let error = builder
             .auto_date(false)
             .serve_connection(

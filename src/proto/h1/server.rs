@@ -3,14 +3,14 @@ use super::{
     bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_response_head},
-    exchange::{Direction, Exchange, Outcome},
+    exchange::{ActivityEnd, ExchangePolicy, Outcome},
     head::{HeadError, HeadParser, RequestHead, RequestRole, ValidatedRequestHead},
     header_case::HeaderCaseMap,
 };
 use crate::{
     body::{Body, Incoming, SizeHint, TrailerHint},
-    connection::ConnectionOutcome,
-    error::{Error, ErrorKind},
+    connection::{ConnectionOutcome, ConnectionParts},
+    error::{Error, ErrorDetail, ErrorKind, LimitKind, TimeoutPhase},
     future::{Race, WorkBudget, cancellable_wait, race},
     io::{
         recv::{ReadStatus, RecvBuffer},
@@ -94,6 +94,7 @@ where
     // Graceful idle-read cancellation must leave transport shutdown usable.
     let idle_read = CancellationSource::new();
 
+    let mut can_recover = true;
     let mut exchanges = crate::trace::Exchanges::default();
     'connection: loop {
         budget.step().await;
@@ -106,7 +107,8 @@ where
 
         let head = loop {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded"));
+                return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded")
+                    .with_detail(ErrorDetail::Timeout(TimeoutPhase::Head)));
             }
 
             match parser.head_len(buffer.bytes()) {
@@ -133,7 +135,8 @@ where
                     let (result, returned) = match race(stopped.as_mut(), read.as_mut()).await {
                         Race::First(()) => {
                             idle_read.cancel();
-                            let (result, _) = read.await;
+                            let (result, returned) = read.await;
+                            buffer = returned;
                             if let Err(error) = result
                                 && !error.is_canceled()
                             {
@@ -178,12 +181,15 @@ where
                 Outcome::Handoff(_) => "handoff",
                 Outcome::Close => "close",
                 Outcome::Reusable => "reusable",
-                Outcome::Active => "active",
             });
         } else if let Err(error) = &result {
             span.failure(error.kind());
         }
-        let ExchangeResult { outcome, upgrade } = result?;
+        let ExchangeResult {
+            outcome,
+            upgrade,
+            recoverable,
+        } = result?;
         match outcome {
             Outcome::Handoff(kind) => {
                 let upgraded = Upgraded::new(reader, writer.inner, buffer.take_all(), kind);
@@ -192,10 +198,19 @@ where
                     Err(upgraded) => ConnectionOutcome::Upgraded(upgraded),
                 });
             }
-            Outcome::Close => break,
+            Outcome::Close => {
+                can_recover = recoverable;
+                break;
+            }
             Outcome::Reusable => {}
-            Outcome::Active => return Err(Error::new(ErrorKind::Internal, "unsettled server exchange")),
         }
+    }
+    if connection.recovering() && can_recover {
+        return Ok(ConnectionOutcome::Recovered(ConnectionParts {
+            reader,
+            writer: writer.inner,
+            read_ahead: buffer.take_all(),
+        }));
     }
     writer.shutdown().with_cancellation(shutdown.token()).await?;
     Ok(ConnectionOutcome::Closed)
@@ -206,6 +221,7 @@ where
 struct ExchangeResult {
     outcome: Outcome,
     upgrade: PendingUpgrade,
+    recoverable: bool,
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit disjoint connection resources; no shared driver allocation.
@@ -228,7 +244,7 @@ where
     B: Body,
     B::Error: std::error::Error + 'static,
 {
-    let mut state = Exchange::new(&head, config.protocol.max_informational);
+    let mut state = ExchangePolicy::new(&head, config.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
     let (context, informationals, upgrade) = context::channel(head.persistence == Persistence::Close);
@@ -370,30 +386,22 @@ where
         Ok(_) => {}
         Err(error) => return (Err(error), buffer),
     };
-    match end {
+    let request_end = match end {
         ReceiveEnd::Failed(error) => return (Err(error), buffer),
-        ReceiveEnd::Abandoned => {
-            return (
-                Ok(ExchangeResult {
-                    outcome: Outcome::Close,
-                    upgrade,
-                }),
-                buffer,
-            );
-        }
-        ReceiveEnd::Complete => {}
+        ReceiveEnd::Abandoned => ActivityEnd::Retired,
+        ReceiveEnd::Complete => ActivityEnd::Complete,
+    };
+    if close.get() {
+        state.close_after_exchange();
     }
-    let result = (|| {
-        state.settle(Direction::Request, true)?;
-        state.settle(Direction::Response, true)?;
-        if close.get() {
-            state.close_after_exchange();
-        }
-        Ok(ExchangeResult {
-            outcome: state.outcome(),
+    let result = state
+        .finish(request_end, ActivityEnd::Complete)
+        .map(|outcome| ExchangeResult {
+            outcome,
             upgrade,
-        })
-    })();
+            recoverable: request_end == ActivityEnd::Complete,
+        });
+
     (result, buffer)
 }
 
@@ -472,7 +480,8 @@ async fn write_informationals<W: AsyncWrite>(
                 ));
             }
             if count == config.protocol.max_informational {
-                return Err(Error::new(ErrorKind::Limit, "too many informational responses"));
+                return Err(Error::new(ErrorKind::Limit, "too many informational responses")
+                    .with_detail(ErrorDetail::OutgoingLimit(LimitKind::InformationalResponses)));
             }
             let (parts, ()) = response.into_parts();
             let original_case = parts.extensions.get::<HeaderCaseMap>();
@@ -534,7 +543,7 @@ async fn write_response<W: AsyncWrite, B: Body>(
     date: &mut DateCache,
     config: &ServerConfig,
     source: &CancellationSource,
-    state: &mut Exchange,
+    state: &mut ExchangePolicy,
 ) -> Result<Persistence, Error>
 where
     B::Error: std::error::Error + 'static,
