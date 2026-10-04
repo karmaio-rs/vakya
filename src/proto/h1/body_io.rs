@@ -353,6 +353,19 @@ pub(super) enum SendBodyError<E> {
     Canceled,
 }
 
+pub(super) fn map_send_error<E: std::error::Error + 'static>(
+    error: SendBodyError<E>,
+    body: &'static str,
+    canceled: &'static str,
+) -> Error {
+    match error {
+        SendBodyError::Body(error) => Error::with_source(ErrorKind::Body, body, error),
+        SendBodyError::Encode(error) => error.into(),
+        SendBodyError::Io(error) => error.into(),
+        SendBodyError::Canceled => Error::new(ErrorKind::Canceled, canceled),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

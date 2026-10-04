@@ -2,7 +2,7 @@ use super::{Connection, config::Config};
 use crate::connection::{ConnectionControl, ConnectionOutcome};
 use crate::{
     body::{Body, Incoming},
-    error::{Error, ErrorKind},
+    error::Error,
     io::transport::{Portable, Tcp},
     proto::h1::server,
     server::RequestContext,
@@ -34,7 +34,7 @@ impl Builder {
     /// # Errors
     /// Returns `LocalMessage` for zero limits without changing configuration.
     pub fn incoming_head_limits(&mut self, bytes: usize, fields: usize) -> Result<&mut Self, Error> {
-        self.config.protocol.incoming_head_limits(bytes, fields)?;
+        self.config.settings.protocol.incoming_head_limits(bytes, fields)?;
         Ok(self)
     }
 
@@ -43,7 +43,7 @@ impl Builder {
     /// # Errors
     /// Returns `LocalMessage` for zero without changing configuration.
     pub fn outgoing_head_limit(&mut self, bytes: usize) -> Result<&mut Self, Error> {
-        self.config.protocol.outgoing_head_limit(bytes)?;
+        self.config.settings.protocol.outgoing_head_limit(bytes)?;
         Ok(self)
     }
 
@@ -60,6 +60,7 @@ impl Builder {
         trailer_fields: usize,
     ) -> Result<&mut Self, Error> {
         self.config
+            .settings
             .protocol
             .incoming_framing_limits(chunk_line, trailer_bytes, trailer_fields)?;
         Ok(self)
@@ -71,7 +72,7 @@ impl Builder {
     /// Other framing-limit setters preserve this setting. Payload bytes are
     /// unaffected; use [`crate::body::BodyExt::limit`] to bound consumption.
     pub fn incoming_chunk_extension_limit(&mut self, bytes: usize) -> &mut Self {
-        self.config.protocol.incoming_chunk_extension_limit(bytes);
+        self.config.settings.protocol.incoming_chunk_extension_limit(bytes);
         self
     }
 
@@ -80,14 +81,14 @@ impl Builder {
     /// # Errors
     /// Returns `LocalMessage` for zero without changing configuration.
     pub fn outgoing_trailer_limit(&mut self, bytes: usize) -> Result<&mut Self, Error> {
-        self.config.protocol.outgoing_trailer_limit(bytes)?;
+        self.config.settings.protocol.outgoing_trailer_limit(bytes)?;
         Ok(self)
     }
 
     /// Set the maximum informational heads per exchange, including automatic
     /// 100 Continue. Defaults to 16; zero disables informational responses.
     pub fn max_informational(&mut self, count: usize) -> &mut Self {
-        self.config.protocol.max_informational = count;
+        self.config.settings.protocol.max_informational = count;
         self
     }
 
@@ -99,8 +100,7 @@ impl Builder {
     /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn head_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
-        crate::io::deadline::configured_after(timeout)?;
-        self.config.head_timeout = timeout;
+        self.config.settings.set_head_timeout(timeout)?;
         Ok(self)
     }
 
@@ -111,8 +111,7 @@ impl Builder {
     /// # Errors
     /// Returns `LocalMessage` for an unrepresentable deadline without changing configuration.
     pub fn drain_timeout(&mut self, timeout: std::time::Duration) -> Result<&mut Self, Error> {
-        crate::io::deadline::configured_after(Some(timeout))?;
-        self.config.drain.timeout = timeout;
+        self.config.settings.set_drain_timeout(timeout)?;
         Ok(self)
     }
 
@@ -120,7 +119,7 @@ impl Builder {
     /// Defaults to 64 KiB. Zero is allowed; the combined wire budget saturates at `u64::MAX`.
     /// This bounds framing overhead without changing ordinary body decoding limits.
     pub fn drain_wire_allowance(&mut self, bytes: u64) -> &mut Self {
-        self.config.drain.wire_allowance = bytes;
+        self.config.settings.drain.wire_allowance = bytes;
         self
     }
 
@@ -131,8 +130,7 @@ impl Builder {
     /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn body_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
-        crate::io::deadline::configured_after(timeout)?;
-        self.config.body_progress_timeout = timeout;
+        self.config.settings.set_body_progress_timeout(timeout)?;
         Ok(self)
     }
 
@@ -144,8 +142,7 @@ impl Builder {
     /// Returns `LocalMessage` if the duration cannot be represented as a deadline.
     /// Rejection preserves the previous setting. Zero is an immediately expired budget.
     pub fn write_progress_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<&mut Self, Error> {
-        crate::io::deadline::configured_after(timeout)?;
-        self.config.write_progress_timeout = timeout;
+        self.config.settings.set_write_progress_timeout(timeout)?;
         Ok(self)
     }
 
@@ -156,14 +153,7 @@ impl Builder {
     /// # Errors
     /// Returns an error for zero or reversed limits.
     pub fn read_buffer_limits(&mut self, preferred: usize, retained: usize) -> Result<&mut Self, Error> {
-        if preferred == 0 || preferred > retained {
-            return Err(Error::new(
-                ErrorKind::LocalMessage,
-                "receive limits must be nonzero and ordered",
-            ));
-        }
-        self.config.preferred_read = preferred;
-        self.config.max_retained = retained;
+        self.config.settings.set_read_buffer_limits(preferred, retained)?;
         Ok(self)
     }
 
@@ -189,7 +179,7 @@ impl Builder {
     /// fields without recorded metadata continue to use lowercase names.
     /// Defaults to `false`.
     pub fn preserve_header_case(&mut self, enabled: bool) -> &mut Self {
-        self.config.protocol.preserve_header_case = enabled;
+        self.config.settings.protocol.preserve_header_case = enabled;
         self
     }
 
@@ -200,7 +190,7 @@ impl Builder {
     /// spelling takes precedence and title case is used only as a fallback.
     /// Defaults to `false`, which writes lowercase names.
     pub fn title_case_headers(&mut self, enabled: bool) -> &mut Self {
-        self.config.protocol.title_case_headers(enabled);
+        self.config.settings.protocol.title_case_headers(enabled);
         self
     }
 
@@ -241,10 +231,10 @@ impl Builder {
         B::Error: std::error::Error + 'static,
     {
         let control = ConnectionControl::new("server");
-        Connection {
-            future: server::run(io, service, Portable, self.config.clone(), control.clone()),
+        Connection::new(
+            server::run(io, service, Portable, self.config.clone(), control.clone()),
             control,
-        }
+        )
     }
 
     /// Create an HTTP/1 driver over an already-handshaken Karmaio TLS stream.
@@ -284,7 +274,7 @@ impl Builder {
         crate::tls::validate_alpn(io.alpn_protocol())?;
 
         let mut builder = self.clone();
-        builder.config.tls_info = Some(crate::tls::TlsInfo::new(
+        builder.config.settings.tls_info = Some(crate::tls::TlsInfo::new(
             io.alpn_protocol(),
             io.protocol_version(),
             io.negotiated_cipher_suite(),
@@ -319,45 +309,46 @@ impl Builder {
         B::Error: std::error::Error + 'static,
     {
         let control = ConnectionControl::new("server");
-        Connection {
-            future: server::run(io, service, Tcp, self.config.clone(), control.clone()),
+        Connection::new(
+            server::run(io, service, Tcp, self.config.clone(), control.clone()),
             control,
-        }
+        )
     }
 }
 
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+    use crate::error::ErrorKind;
     use std::time::Duration;
 
     #[test]
     fn timeout_validation_preserves_configuration_on_rejection() {
         let mut builder = Builder::new();
         macro_rules! check {
-            ($method:ident) => {{
-                let previous = builder.config.$method;
+            ($field:expr, $method:ident) => {{
+                let previous = $field;
                 assert_eq!(
                     builder.$method(Some(Duration::MAX)).unwrap_err().kind(),
                     ErrorKind::LocalMessage
                 );
-                assert_eq!(builder.config.$method, previous);
+                assert_eq!($field, previous);
                 for timeout in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
                     builder.$method(timeout).unwrap();
-                    assert_eq!(builder.config.$method, timeout);
+                    assert_eq!($field, timeout);
                 }
             }};
         }
-        let previous = builder.config.drain.timeout;
+        let previous = builder.config.settings.drain.timeout;
         assert_eq!(
             builder.drain_timeout(Duration::MAX).unwrap_err().kind(),
             ErrorKind::LocalMessage
         );
-        assert_eq!(builder.config.drain.timeout, previous);
+        assert_eq!(builder.config.settings.drain.timeout, previous);
         builder.drain_timeout(Duration::ZERO).unwrap();
-        assert_eq!(builder.config.drain.timeout, Duration::ZERO);
-        check!(head_timeout);
-        check!(body_progress_timeout);
-        check!(write_progress_timeout);
+        assert_eq!(builder.config.settings.drain.timeout, Duration::ZERO);
+        check!(builder.config.settings.head_timeout, head_timeout);
+        check!(builder.config.settings.body_progress_timeout, body_progress_timeout);
+        check!(builder.config.settings.write_progress_timeout, write_progress_timeout);
     }
 }

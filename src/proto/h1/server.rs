@@ -1,7 +1,7 @@
 use super::{
     BodyMode, Expectation, Persistence,
     activity::{ReceiveResources, TransmitResources},
-    body_io::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
+    body_io::{ReceiveEnd, incoming, map_send_error, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_response_head},
     exchange::{ActivityEnd, ExchangePolicy, Outcome},
@@ -85,11 +85,11 @@ where
     let (mut reader, writer) = io.into_split();
     let mut writer = crate::io::deadline::Write {
         inner: writer,
-        timeout: config.write_progress_timeout,
+        timeout: config.settings.write_progress_timeout,
     };
-    let mut buffer = RecvBuffer::new(config.preferred_read, config.max_retained)?;
-    let mut parser = HeadParser::<RequestRole>::request(config.protocol.head)
-        .with_preserved_header_case(config.protocol.preserve_header_case);
+    let mut buffer = RecvBuffer::new(config.settings.preferred_read, config.settings.max_retained)?;
+    let mut parser = HeadParser::<RequestRole>::request(config.settings.protocol.head)
+        .with_preserved_header_case(config.settings.protocol.preserve_header_case);
     let mut date = DateCache::default();
     let mut budget = WorkBudget::new();
     // Graceful idle-read cancellation must leave transport shutdown usable.
@@ -104,7 +104,7 @@ where
             break;
         }
 
-        let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
+        let deadline = crate::io::deadline::configured_after(config.settings.head_timeout)?;
 
         let head = loop {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -169,11 +169,11 @@ where
                     reader: &mut reader,
                     strategy: &mut strategy,
                     buffer,
-                    parser: BodyDecoder::with_limits(head.body, config.protocol.decode),
+                    parser: BodyDecoder::with_limits(head.body, config.settings.protocol.decode),
                 },
                 TransmitResources {
                     writer: &mut writer,
-                    encoding: config.protocol.encode,
+                    encoding: config.settings.protocol.encode,
                 },
                 head,
                 &service,
@@ -249,7 +249,7 @@ where
     B: Body,
     B::Error: std::error::Error + 'static,
 {
-    let mut state = ExchangePolicy::new(&head, config.protocol.max_informational);
+    let mut state = ExchangePolicy::new(&head, config.settings.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
     let expect_continue = head.expectation == Expectation::Continue && version == Version::HTTP_11;
@@ -359,9 +359,9 @@ where
 }
 
 fn request_message(head: RequestHead, body: Incoming, config: &ServerConfig) -> Request<Incoming> {
-    let mut request = Request::new(body.with_drain_config(config.drain));
+    let mut request = Request::new(body.with_drain_config(config.settings.drain));
     #[cfg(feature = "tls")]
-    if let Some(info) = &config.tls_info {
+    if let Some(info) = &config.settings.tls_info {
         request.extensions_mut().insert(info.clone());
     }
     if let Some(header_case) = head.header_case {
@@ -421,7 +421,7 @@ async fn receive_request<R, T: Receive<R>>(
         parser,
         producer,
         Some(source.token()),
-        config.body_progress_timeout,
+        config.settings.body_progress_timeout,
     )
     .await
 }
@@ -526,7 +526,7 @@ async fn write_informationals<W: AsyncWrite>(
                     "informational responses require HTTP/1.1",
                 ));
             }
-            if count == config.protocol.max_informational {
+            if count == config.settings.protocol.max_informational {
                 return Err(Error::new(ErrorKind::Limit, "too many informational responses")
                     .with_detail(ErrorDetail::OutgoingLimit(LimitKind::InformationalResponses)));
             }
@@ -647,12 +647,7 @@ where
     if mode != BodyMode::None {
         send_body(writer, &mut body, &mut encoder, Some(source.token()))
             .await
-            .map_err(|error| match error {
-                SendBodyError::Body(error) => Error::with_source(ErrorKind::Body, "response body failed", error),
-                SendBodyError::Encode(error) => error.into(),
-                SendBodyError::Io(error) => error.into(),
-                SendBodyError::Canceled => Error::new(ErrorKind::Canceled, "response production canceled"),
-            })?;
+            .map_err(|error| map_send_error(error, "response body failed", "response production canceled"))?;
     }
     // Custom buffered transports may need an explicit flush before the exchange
     // is considered sent. Apply the scope before this operation is first polled.
@@ -692,7 +687,7 @@ async fn reply_illegal_head<W: AsyncWrite>(
             trailers: TrailerHint::None,
         },
         &Method::GET,
-        config.protocol.encode,
+        config.settings.protocol.encode,
     ) else {
         return failure;
     };

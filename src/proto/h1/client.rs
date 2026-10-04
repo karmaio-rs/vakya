@@ -1,7 +1,7 @@
 use super::{
     BodyMode, Expectation,
     activity::{ReceiveResources, TransmitResources},
-    body_io::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
+    body_io::{ReceiveEnd, incoming, map_send_error, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, EncodeConfig, MessagePlan, prepare_request_head},
     exchange::{ActivityEnd, ExchangePolicy, HeadAction, Outcome},
@@ -103,12 +103,12 @@ where
     let (mut reader, writer) = io.into_split();
     let mut writer = crate::io::deadline::Write {
         inner: writer,
-        timeout: config.write_progress_timeout,
+        timeout: config.settings.write_progress_timeout,
     };
-    let mut buffer = RecvBuffer::new(config.preferred_read, config.max_retained)?;
+    let mut buffer = RecvBuffer::new(config.settings.preferred_read, config.settings.max_retained)?;
     let mut budget = WorkBudget::new();
-    let mut parser = HeadParser::<ResponseRole>::response(config.protocol.head)
-        .with_preserved_header_case(config.protocol.preserve_header_case);
+    let mut parser = HeadParser::<ResponseRole>::response(config.settings.protocol.head)
+        .with_preserved_header_case(config.settings.protocol.preserve_header_case);
 
     let mut can_recover = true;
     let mut exchanges = crate::trace::Exchanges::default();
@@ -133,7 +133,7 @@ where
                 },
                 TransmitResources {
                     writer: &mut writer,
-                    encoding: config.protocol.encode,
+                    encoding: config.settings.protocol.encode,
                 },
                 request,
                 response,
@@ -307,7 +307,7 @@ where
     if mode != BodyMode::None {
         send_body(writer, body, encoder, Some(control.upload.token()))
             .await
-            .map_err(map_send_error)?;
+            .map_err(|error| map_send_error(error, "request body failed", "request production canceled"))?;
     }
     writer.flush().with_cancellation(control.upload.token()).await?;
     control.upload_complete.set(true);
@@ -376,7 +376,7 @@ where
     T: Receive<R>,
 {
     let TransmitResources { writer, encoding } = transmit;
-    let (upload, policy) = RequestUpload::prepare(request, encoding, config.protocol.max_informational)?;
+    let (upload, policy) = RequestUpload::prepare(request, encoding, config.settings.protocol.max_informational)?;
     // Keep request-owned resources in their original scope and drop order.
     let _extensions = upload.extensions;
     let mut body = upload.body;
@@ -496,7 +496,7 @@ async fn receive<R, T: Receive<R>>(
         parser,
         mut buffer,
     } = resources;
-    let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
+    let deadline = crate::io::deadline::configured_after(config.settings.head_timeout)?;
     let head = loop {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(Error::new(ErrorKind::Timeout, "HTTP head deadline exceeded")
@@ -521,7 +521,7 @@ async fn receive<R, T: Receive<R>>(
 
                         let mut message = Response::new(());
                         #[cfg(feature = "tls")]
-                        if let Some(info) = &config.tls_info {
+                        if let Some(info) = &config.settings.tls_info {
                             message.extensions_mut().insert(info.clone());
                         }
                         if let Some(header_case) = head.head.header_case {
@@ -569,11 +569,11 @@ async fn receive<R, T: Receive<R>>(
     };
 
     let (producer, incoming) = incoming(head.body);
-    let incoming = incoming.with_drain_config(config.drain);
+    let incoming = incoming.with_drain_config(config.settings.drain);
 
     let mut message = Response::new(incoming);
     #[cfg(feature = "tls")]
-    if let Some(info) = &config.tls_info {
+    if let Some(info) = &config.settings.tls_info {
         message.extensions_mut().insert(info.clone());
     }
     if let Some(header_case) = head.head.header_case {
@@ -592,10 +592,10 @@ async fn receive<R, T: Receive<R>>(
                 reader,
                 strategy,
                 buffer,
-                BodyDecoder::with_limits(head.body, config.protocol.decode),
+                BodyDecoder::with_limits(head.body, config.settings.protocol.decode),
                 producer,
                 Some(control.exchange.token()),
-                config.body_progress_timeout,
+                config.settings.body_progress_timeout,
             )
             .await
         }
@@ -628,13 +628,4 @@ async fn offer_event(
     }
 
     Ok(())
-}
-
-fn map_send_error<E: std::error::Error + 'static>(error: SendBodyError<E>) -> Error {
-    match error {
-        SendBodyError::Body(error) => Error::with_source(ErrorKind::Body, "request body failed", error),
-        SendBodyError::Encode(error) => error.into(),
-        SendBodyError::Io(error) => error.into(),
-        SendBodyError::Canceled => Error::new(ErrorKind::Canceled, "request production canceled"),
-    }
 }
