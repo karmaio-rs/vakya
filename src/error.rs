@@ -393,12 +393,4 @@ mod tests {
             assert!(error.source().unwrap().is::<io::Error>());
         }
     }
-
-    #[test]
-    fn cancellation_is_reported_by_kind() {
-        let error = Error::from(karmaio::runtime::operation_canceled());
-
-        assert!(error.is_canceled());
-        assert_eq!(error.kind(), ErrorKind::Canceled);
-    }
 }

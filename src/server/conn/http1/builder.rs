@@ -319,36 +319,13 @@ impl Builder {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
-    use crate::error::ErrorKind;
     use std::time::Duration;
 
     #[test]
-    fn timeout_validation_preserves_configuration_on_rejection() {
-        let mut builder = Builder::new();
-        macro_rules! check {
-            ($field:expr, $method:ident) => {{
-                let previous = $field;
-                assert_eq!(
-                    builder.$method(Some(Duration::MAX)).unwrap_err().kind(),
-                    ErrorKind::LocalMessage
-                );
-                assert_eq!($field, previous);
-                for timeout in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
-                    builder.$method(timeout).unwrap();
-                    assert_eq!($field, timeout);
-                }
-            }};
-        }
-        let previous = builder.config.settings.drain.timeout;
+    fn head_timeout_defaults_to_thirty_seconds() {
         assert_eq!(
-            builder.drain_timeout(Duration::MAX).unwrap_err().kind(),
-            ErrorKind::LocalMessage
+            Builder::new().config.settings.head_timeout,
+            Some(Duration::from_secs(30))
         );
-        assert_eq!(builder.config.settings.drain.timeout, previous);
-        builder.drain_timeout(Duration::ZERO).unwrap();
-        assert_eq!(builder.config.settings.drain.timeout, Duration::ZERO);
-        check!(builder.config.settings.head_timeout, head_timeout);
-        check!(builder.config.settings.body_progress_timeout, body_progress_timeout);
-        check!(builder.config.settings.write_progress_timeout, write_progress_timeout);
     }
 }

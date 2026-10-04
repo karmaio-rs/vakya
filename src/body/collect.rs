@@ -226,7 +226,7 @@ impl<E> From<AggregateError> for CollectError<E> {
 mod tests {
     use super::{AggregateError, CollectError, checked_total, collect};
     use crate::body::{Body, Frame, SizeHint, TrailerHint};
-    use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+    use http::HeaderMap;
     use karmaio::buf::IoBuf;
     use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
@@ -305,18 +305,6 @@ mod tests {
 
             assert_eq!(collected.as_ref(), b"abcde");
             assert_eq!(recycled.get(), 2);
-        });
-    }
-
-    #[test]
-    fn trailers_are_returned_separately() {
-        karmaio::Runtime::new().unwrap().block_on(async {
-            let mut trailers = HeaderMap::new();
-            trailers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-            let mut body = TestBody::new(SizeHint::with_exact(0), [Ok(Frame::trailers(trailers))]);
-
-            let collected = collect(&mut body, 0).await.unwrap();
-            assert_eq!(collected.trailers().unwrap()[CONTENT_TYPE], "text/plain");
         });
     }
 

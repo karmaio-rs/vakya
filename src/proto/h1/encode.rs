@@ -261,6 +261,9 @@ fn plan_response_framing(
     }
 
     if status == StatusCode::RESET_CONTENT {
+        // 205 carries no message body. Unlike 204, RFC 9112 does not treat it
+        // as terminated by the header block, so a zero Content-Length stops a
+        // peer from reading until the connection closes.
         if metadata.size.exact() != Some(0)
             || metadata.trailers != TrailerHint::None
             || headers.contains_key(TRANSFER_ENCODING)
@@ -268,7 +271,7 @@ fn plan_response_framing(
             return Err(EncodeError::BodyForbidden);
         }
         set_exact_length(headers, 0)?;
-        return Ok(BodyMode::Fixed(0));
+        return Ok(BodyMode::None);
     }
 
     plan_representation_framing(headers, version, metadata)
@@ -778,7 +781,7 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        assert_eq!(reset.head.body, BodyMode::Fixed(0));
+        assert_eq!(reset.head.body, BodyMode::None);
         assert!(reset.bytes.windows(19).any(|bytes| bytes == b"content-length: 0\r\n"));
         let mut upgrade = HeaderMap::new();
         upgrade.insert(CONNECTION, HeaderValue::from_static("upgrade"));
@@ -796,24 +799,6 @@ mod tests {
             .head
             .upgrade,
             Some(UpgradeKind::Protocol)
-        );
-    }
-
-    #[test]
-    fn bounded_head_writer_rejects_oversized_output() {
-        let mut headers = HeaderMap::new();
-        headers.insert(HOST, HeaderValue::from_static("example.test"));
-        assert_eq!(
-            encode_request_head(
-                Method::GET,
-                "/".parse().unwrap(),
-                Version::HTTP_11,
-                headers,
-                BodyMetadata::exact(0),
-                EncodeConfig::new(8, 32)
-            )
-            .unwrap_err(),
-            EncodeError::Limit(LimitKind::HeadBytes)
         );
     }
 

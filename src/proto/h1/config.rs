@@ -191,4 +191,34 @@ mod tests {
             assert_eq!(config.decode, expected);
         }
     }
+
+    #[test]
+    fn timeout_validation_preserves_configuration_on_rejection() {
+        let mut settings = ConnectionSettings::default();
+        macro_rules! check {
+            ($method:ident, $field:ident) => {{
+                let previous = settings.$field;
+                assert_eq!(
+                    settings.$method(Some(Duration::MAX)).unwrap_err().kind(),
+                    ErrorKind::LocalMessage
+                );
+                assert_eq!(settings.$field, previous);
+                for timeout in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
+                    settings.$method(timeout).unwrap();
+                    assert_eq!(settings.$field, timeout);
+                }
+            }};
+        }
+        let previous = settings.drain.timeout;
+        assert_eq!(
+            settings.set_drain_timeout(Duration::MAX).unwrap_err().kind(),
+            ErrorKind::LocalMessage
+        );
+        assert_eq!(settings.drain.timeout, previous);
+        settings.set_drain_timeout(Duration::ZERO).unwrap();
+        assert_eq!(settings.drain.timeout, Duration::ZERO);
+        check!(set_head_timeout, head_timeout);
+        check!(set_body_progress_timeout, body_progress_timeout);
+        check!(set_write_progress_timeout, write_progress_timeout);
+    }
 }
