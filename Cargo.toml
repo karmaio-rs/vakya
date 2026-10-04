@@ -48,6 +48,10 @@ name = "file_server"
 required-features = ["server", "fs"]
 
 [[example]]
+name = "owned_echo"
+required-features = ["server"]
+
+[[example]]
 name = "echo"
 required-features = ["server"]
 

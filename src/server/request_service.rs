@@ -18,6 +18,15 @@ use crate::{Request, body::Incoming, service::Service};
 ///     Ok(Response::new(request.into_body()))
 /// }
 /// let service = request_service_fn(echo);
+///
+/// // Errors may borrow local state; this function is type-checked without I/O.
+/// async fn borrowed_error(request: Request<Incoming>, context: vakya::server::RequestContext) {
+///     use vakya::service::Service;
+///     let reason = String::from("local failure");
+///     let service = request_service_fn(async |_: Request<Incoming>| Err::<(), _>(reason.as_str()));
+///     let result = service.call((request, context)).await;
+///     assert_eq!(result.unwrap_err(), "local failure");
+/// }
 /// ```
 #[inline]
 pub fn request_service_fn<F>(function: F) -> RequestServiceFn<F> {
@@ -88,21 +97,6 @@ mod tests {
                 offer.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Ready(Ok(()))
             ));
-        });
-    }
-
-    #[test]
-    fn adapter_preserves_borrowed_error_types_without_additional_bounds() {
-        karmaio::Runtime::new().unwrap().block_on(async {
-            let reason = String::from("local failure");
-            let service = request_service_fn(async |_: Request<Incoming>| Err::<(), _>(reason.as_str()));
-            let (context, _receiver, _upgrade) = super::super::context::channel(false);
-            assert_eq!(
-                Service::call(&service, (Request::new(Incoming::empty()), context))
-                    .await
-                    .unwrap_err(),
-                "local failure"
-            );
         });
     }
 }

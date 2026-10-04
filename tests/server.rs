@@ -1,19 +1,18 @@
 #![cfg(feature = "server")]
 mod support;
 use bytes::Bytes;
-use karmaio::{
-    buf::{BufResult, IoBuf, IoVectoredBuf},
-    io::AsyncWrite,
-};
+use karmaio::buf::BufResult;
 use std::{
     cell::{Cell, RefCell},
     convert::Infallible,
     future::{Future, poll_fn},
     io,
-    pin::{Pin, pin},
+    pin::pin,
     rc::Rc,
-    task::{Context, Poll, Waker},
+    task::Poll,
 };
+use support::future::{pair, poll};
+use support::transport::{ObservedWriter, output};
 use support::transport::{ReadStep, Reader, Writer};
 use vakya::{
     Request, Response,
@@ -23,77 +22,8 @@ use vakya::{
     service::service_fn,
 };
 
-struct ObservedWriter {
-    writer: Writer,
-    output: Rc<RefCell<Vec<u8>>>,
-}
-impl ObservedWriter {
-    fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
-        let output = Rc::new(RefCell::new(Vec::new()));
-        (
-            Self {
-                writer: Writer::limited(3),
-                output: output.clone(),
-            },
-            output,
-        )
-    }
-    fn record(&self) {
-        let mut output = self.output.borrow_mut();
-        let start = output.len();
-        output.extend_from_slice(&self.writer.output[start..]);
-    }
-}
-impl AsyncWrite for ObservedWriter {
-    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
-        let result = self.writer.write(buffer).await;
-        self.record();
-        result
-    }
-    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
-        let result = self.writer.write_vectored(buffers).await;
-        self.record();
-        result
-    }
-    async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
-    }
-    async fn shutdown(&mut self) -> io::Result<()> {
-        self.writer.shutdown().await
-    }
-}
 fn reader(bytes: &'static [u8]) -> Reader {
     Reader::new([ReadStep::Data(Bytes::from_static(bytes))])
-}
-fn output(bytes: &Rc<RefCell<Vec<u8>>>) -> String {
-    String::from_utf8(bytes.borrow().clone()).unwrap()
-}
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let mut a = None;
-    let mut b = None;
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }
 
 #[test]
@@ -256,10 +186,22 @@ fn abandoning_request_body_finishes_response_and_retires_connection() {
         let calls = Cell::new(0);
         let service = service_fn(async |(_request, _context): (Request<Incoming>, RequestContext)| {
             calls.set(calls.get() + 1);
-            Ok::<_, Infallible>(Response::builder().status(400).body(Full::new(Bytes::from_static(b"rejected"))).unwrap())
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(400)
+                    .body(Full::new(Bytes::from_static(b"rejected")))
+                    .unwrap(),
+            )
         });
         let (writer, bytes) = ObservedWriter::new();
-        Builder::new().serve_connection((reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\nbodyGET / HTTP/1.1\r\nHost: test\r\n\r\n"), writer), service).run().await.unwrap();
+        let input = reader(
+            b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\nbodyGET / HTTP/1.1\r\nHost: test\r\n\r\n",
+        );
+        Builder::new()
+            .serve_connection((input, writer), service)
+            .run()
+            .await
+            .unwrap();
         assert_eq!(calls.get(), 1);
         let wire = output(&bytes);
         assert!(wire.contains("400 Bad Request"));
@@ -437,7 +379,7 @@ fn receive_failure_preserves_source_when_service_is_still_waiting() {
 }
 
 #[test]
-fn invalid_heads_and_local_framing_fail_before_response_bytes_are_written() {
+fn invalid_local_framing_fails_before_response_bytes_are_written() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let service = service_fn(async |_: (Request<Incoming>, RequestContext)| {
             Ok::<_, Infallible>(
@@ -455,30 +397,6 @@ fn invalid_heads_and_local_framing_fail_before_response_bytes_are_written() {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::LocalMessage);
         assert!(bytes.borrow().is_empty());
-        let calls = Cell::new(0);
-        let service = service_fn(async |_: (Request<Incoming>, RequestContext)| {
-            calls.set(1);
-            Ok::<_, Infallible>(Response::new(Empty::new()))
-        });
-        let (writer, bytes) = ObservedWriter::new();
-        let error = Builder::new()
-            .auto_date(false)
-            .serve_connection(
-                (
-                    reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n"),
-                    writer,
-                ),
-                service,
-            )
-            .run()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
-        assert_eq!(calls.get(), 0);
-        let wire = output(&bytes);
-        assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(wire.contains("connection: close\r\n"));
-        assert!(wire.contains("content-length: 0\r\n"));
     });
 }
 
@@ -586,94 +504,80 @@ fn response_write_failure_settles_an_already_submitted_request_read() {
 }
 
 #[test]
-fn request_limits_and_partial_head_eof_fail_before_service_admission() {
+fn illegal_request_heads_reject_admission_and_send_errors_unless_disabled() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        for (wire, expected) in [
+        for (wire, limit_headers, auto_response, expected, status) in [
             (
-                b"GET / HTTP/1.1\r\nHost: test\r\nX: one\r\n\r\n".as_slice(),
-                ErrorKind::Limit,
+                b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: foo\r\n\r\n".as_slice(),
+                false,
+                true,
+                ErrorKind::InvalidMessage,
+                Some("400 Bad Request"),
             ),
-            (b"GET / HTTP/1.1\r\nHost: test".as_slice(), ErrorKind::InvalidMessage),
+            (
+                b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n",
+                false,
+                true,
+                ErrorKind::InvalidMessage,
+                Some("400 Bad Request"),
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: test\r\nX: one\r\n\r\n",
+                true,
+                true,
+                ErrorKind::Limit,
+                Some("431 Request Header Fields Too Large"),
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: foo\r\n\r\n",
+                false,
+                false,
+                ErrorKind::InvalidMessage,
+                None,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: test",
+                false,
+                true,
+                ErrorKind::InvalidMessage,
+                None,
+            ),
         ] {
             let calls = Cell::new(0);
             let service = service_fn(async |_: (Request<Incoming>, RequestContext)| {
                 calls.set(calls.get() + 1);
                 Ok::<_, Infallible>(Response::new(Empty::new()))
             });
+            let (writer, bytes) = ObservedWriter::new();
             let mut builder = Builder::new();
-            builder.incoming_head_limits(128, 1).unwrap();
+            if limit_headers {
+                builder.incoming_head_limits(128, 1).unwrap();
+            }
             let error = builder
                 .auto_date(false)
-                .serve_connection((reader(wire), Writer::new([])), service)
+                .auto_error_response(auto_response)
+                .serve_connection((reader(wire), writer), service)
                 .run()
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), expected);
+            if limit_headers {
+                assert_eq!(
+                    error.detail(),
+                    Some(vakya::error::ErrorDetail::IncomingLimit(
+                        vakya::error::LimitKind::HeaderCount
+                    ))
+                );
+            }
             assert_eq!(calls.get(), 0);
+            if let Some(status) = status {
+                let wire = output(&bytes);
+                assert!(wire.starts_with(&format!("HTTP/1.1 {status}\r\n")));
+                assert!(wire.contains("connection: close\r\n"));
+                assert!(wire.contains("content-length: 0\r\n"));
+            } else {
+                assert!(bytes.borrow().is_empty());
+            }
         }
-    });
-}
-
-#[test]
-fn illegal_request_heads_send_400_or_431_unless_disabled() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        let service =
-            service_fn(async |_: (Request<Incoming>, RequestContext)| Ok::<_, Infallible>(Response::new(Empty::new())));
-
-        let (writer, bytes) = ObservedWriter::new();
-        let error = Builder::new()
-            .auto_date(false)
-            .serve_connection(
-                (
-                    reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: foo\r\n\r\n"),
-                    writer,
-                ),
-                service,
-            )
-            .run()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
-        assert!(output(&bytes).starts_with("HTTP/1.1 400 Bad Request\r\n"));
-
-        let (writer, bytes) = ObservedWriter::new();
-        let mut builder = Builder::new();
-        builder.incoming_head_limits(128, 1).unwrap();
-        let error = builder
-            .auto_date(false)
-            .serve_connection(
-                (reader(b"GET / HTTP/1.1\r\nHost: test\r\nX: one\r\n\r\n"), writer),
-                service,
-            )
-            .run()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Limit);
-        assert!(output(&bytes).starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
-
-        let (writer, bytes) = ObservedWriter::new();
-        let error = Builder::new()
-            .auto_error_response(false)
-            .serve_connection(
-                (
-                    reader(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: foo\r\n\r\n"),
-                    writer,
-                ),
-                service,
-            )
-            .run()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
-        assert!(bytes.borrow().is_empty());
-
-        let (writer, bytes) = ObservedWriter::new();
-        let error = Builder::new()
-            .serve_connection((reader(b"GET / HTTP/1.1\r\nHost: test"), writer), service)
-            .run()
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidMessage);
-        assert!(bytes.borrow().is_empty());
     });
 }

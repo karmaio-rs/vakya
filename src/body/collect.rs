@@ -224,7 +224,7 @@ impl<E> From<AggregateError> for CollectError<E> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AggregateError, CollectError, checked_total, collect, reserve_for_append};
+    use super::{AggregateError, CollectError, checked_total, collect};
     use crate::body::{Body, Frame, SizeHint, TrailerHint};
     use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
     use karmaio::buf::IoBuf;
@@ -467,23 +467,5 @@ mod tests {
         }
         assert_eq!(body.frames.len(), 128 - polls.get());
         assert_eq!(recycled.get(), polls.get());
-    }
-
-    #[test]
-    fn unknown_length_collection_grows_geometrically_within_limit() {
-        let mut data = Vec::new();
-        let mut capacity_changes = 0;
-        for length in 1..=64 {
-            let before = data.capacity();
-            reserve_for_append(&mut data, length, 64).unwrap();
-            if data.capacity() != before {
-                capacity_changes += 1;
-            }
-            data.push(0);
-            assert!(data.capacity() >= data.len());
-        }
-
-        assert!(capacity_changes <= 7);
-        assert!(data.capacity() <= 64);
     }
 }

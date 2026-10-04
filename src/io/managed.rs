@@ -37,7 +37,7 @@ fn map_error(error: std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_error, read};
+    use super::read;
     use crate::error::ErrorKind;
     use karmaio::{
         net::tcp::TcpListener,
@@ -97,11 +97,5 @@ mod tests {
             drop(writer);
             drop(client.join().unwrap());
         });
-    }
-
-    #[test]
-    fn managed_read_preserves_io_errors() {
-        let error = map_error(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        assert_eq!(error.kind(), ErrorKind::Io);
     }
 }

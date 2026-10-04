@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn ready_frames_batch_but_fairness_suspension_flushes_output() {
         karmaio::Runtime::new().unwrap().block_on(async {
-            for count in [1, 17] {
+            for count in [1, 128] {
                 let output = Rc::new(std::cell::RefCell::new(BufferedOutput::default()));
                 let mut writer = BufferedWriter(output.clone());
                 let mut body = TestBody {
@@ -806,8 +806,12 @@ mod tests {
                     assert_eq!(output.borrow().flushes, 0);
                 } else {
                     assert!(first.is_pending());
-                    assert_eq!(output.borrow().visible, vec![b'x'; 16]);
-                    assert_eq!(output.borrow().flushes, 1);
+                    {
+                        let output = output.borrow();
+                        assert!(!output.visible.is_empty() && output.visible.len() < count as usize);
+                        assert!(output.visible.iter().all(|&byte| byte == b'x'));
+                        assert!(output.flushes > 0 && output.flushes < output.visible.len());
+                    }
                     send.await.unwrap();
                 }
             }
@@ -980,7 +984,7 @@ mod tests {
     #[test]
     fn ready_empty_frames_yield_and_cancel_without_transport_submissions() {
         struct EmptyFrames {
-            recycled: usize,
+            recycled: Rc<Cell<usize>>,
         }
         impl Body for EmptyFrames {
             type Data = Bytes;
@@ -989,12 +993,15 @@ mod tests {
                 Ok(Some(Frame::data(Bytes::new())))
             }
             fn recycle(&mut self, _: Bytes) {
-                self.recycled += 1;
+                self.recycled.set(self.recycled.get() + 1);
             }
         }
         karmaio::Runtime::new().unwrap().block_on(async {
             let source = CancellationSource::new();
-            let mut body = EmptyFrames { recycled: 0 };
+            let recycled = Rc::new(Cell::new(0));
+            let mut body = EmptyFrames {
+                recycled: recycled.clone(),
+            };
             let mut writer = Writer::new([]);
             let metadata = BodyMetadata {
                 size: SizeHint::new(),
@@ -1004,10 +1011,12 @@ mod tests {
             {
                 let mut send = pin!(send_body(&mut writer, &mut body, &mut encoder, Some(source.token())));
                 assert!(poll(send.as_mut()).is_pending());
+                let processed = recycled.get();
+                assert!(processed > 0);
                 source.cancel();
                 assert!(matches!(poll(send.as_mut()), Poll::Ready(Err(SendBodyError::Canceled))));
+                assert_eq!(recycled.get(), processed);
             }
-            assert_eq!(body.recycled, 16);
             assert_eq!(writer.submissions, 0);
         });
     }

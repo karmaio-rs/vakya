@@ -1,7 +1,9 @@
 mod syntax;
 use syntax::trim_ows;
 
-pub(super) mod bridge;
+#[cfg(any(feature = "client", feature = "server"))]
+mod activity;
+pub(super) mod body_io;
 pub(crate) mod config;
 pub(super) mod decode;
 pub(super) mod encode;

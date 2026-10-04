@@ -24,6 +24,11 @@
 //! shutdown and timeout paths settle retained I/O. Dropping a driver preserves
 //! runtime buffer safety without promising graceful flush or recycling callbacks.
 //!
+//! A final response head can arrive before upload completion. Client receipts
+//! observe settled exchange disposition; transport recovery is an explicit
+//! driving mode. Neither receipt waits nor incoming-body drains replace driving
+//! the parent connection.
+//!
 //! HTTP/1 is implemented; HTTP/2 and HTTP/3 are outside the current API.
 
 #![warn(missing_docs)]
@@ -48,7 +53,8 @@ mod proto;
 #[cfg(feature = "http1")]
 mod io;
 
-#[cfg(all(test, feature = "http1"))]
+#[cfg(test)]
+#[allow(dead_code)] // Unit-test feature sets use different transport helpers.
 #[path = "../tests/support/transport.rs"]
 mod test_transport;
 

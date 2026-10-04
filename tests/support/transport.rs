@@ -237,3 +237,51 @@ impl IntoOwnedSplit for Transport {
         (self.reader, self.writer)
     }
 }
+
+pub struct ObservedWriter {
+    writer: Writer,
+    output: Rc<RefCell<Vec<u8>>>,
+}
+impl ObservedWriter {
+    pub fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
+        Self::limited(3)
+    }
+
+    pub fn limited(width: usize) -> (Self, Rc<RefCell<Vec<u8>>>) {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        (
+            Self {
+                writer: Writer::limited(width),
+                output: output.clone(),
+            },
+            output,
+        )
+    }
+    fn record(&self) {
+        let mut output = self.output.borrow_mut();
+        let start = output.len();
+        output.extend_from_slice(&self.writer.output[start..]);
+    }
+}
+impl AsyncWrite for ObservedWriter {
+    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
+        let result = self.writer.write(buffer).await;
+        self.record();
+        result
+    }
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
+        let result = self.writer.write_vectored(buffers).await;
+        self.record();
+        result
+    }
+    async fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush().await
+    }
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.writer.shutdown().await
+    }
+}
+
+pub fn output(bytes: &Rc<RefCell<Vec<u8>>>) -> String {
+    String::from_utf8(bytes.borrow().clone()).unwrap()
+}

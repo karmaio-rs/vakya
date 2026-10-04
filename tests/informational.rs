@@ -2,20 +2,21 @@
 mod support;
 use bytes::Bytes;
 use karmaio::{
-    buf::{BufResult, IoBuf, IoVectoredBuf},
+    buf::{BufResult, IoBuf},
     io::AsyncWrite,
 };
 use std::{
     cell::{Cell, RefCell},
     convert::Infallible,
-    future::{Future, poll_fn},
     io,
-    pin::{Pin, pin},
+    pin::pin,
     rc::Rc,
-    task::{Context, Poll, Waker},
+    task::Poll,
     time::Duration,
 };
+use support::future::{pair, poll};
 use support::transport::{Gate, ReadStep, Reader, Writer};
+use support::transport::{ObservedWriter, output};
 use vakya::{
     Request, Response,
     body::{Body, BodyExt, Either, Empty, Frame, Full, Incoming, SizeHint, TrailerHint},
@@ -24,77 +25,8 @@ use vakya::{
     server::{RequestContext, conn::http1::Builder as Server},
     service::service_fn,
 };
-struct ObservedWriter {
-    writer: Writer,
-    output: Rc<RefCell<Vec<u8>>>,
-}
-impl ObservedWriter {
-    fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
-        let output = Rc::new(RefCell::new(Vec::new()));
-        (
-            Self {
-                writer: Writer::limited(3),
-                output: output.clone(),
-            },
-            output,
-        )
-    }
-    fn record(&self) {
-        let mut output = self.output.borrow_mut();
-        let start = output.len();
-        output.extend_from_slice(&self.writer.output[start..]);
-    }
-}
-impl AsyncWrite for ObservedWriter {
-    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
-        let result = self.writer.write(buffer).await;
-        self.record();
-        result
-    }
-    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
-        let result = self.writer.write_vectored(buffers).await;
-        self.record();
-        result
-    }
-    async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
-    }
-    async fn shutdown(&mut self) -> io::Result<()> {
-        self.writer.shutdown().await
-    }
-}
 fn reader(bytes: &'static [u8]) -> Reader {
     Reader::new([ReadStep::Data(Bytes::from_static(bytes))])
-}
-fn output(bytes: &Rc<RefCell<Vec<u8>>>) -> String {
-    String::from_utf8(bytes.borrow().clone()).unwrap()
-}
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let mut a = None;
-    let mut b = None;
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }
 
 fn info(status: u16) -> Response<()> {
@@ -339,13 +271,31 @@ fn continue_timeout_sends_without_a_peer_permission() {
 #[test]
 fn expect_echo_survives_context_drop_and_buffered_payload_without_late_continue() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        for fragmented in [false,true] {
-            let steps = if fragmented { vec![ReadStep::Data(Bytes::from_static(b"POST / HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")),ReadStep::Data(Bytes::from_static(b"upload"))] }
-                else { vec![ReadStep::Data(Bytes::from_static(b"POST / HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: 6\r\nConnection: close\r\n\r\nupload"))] };
-            let service = vakya::server::request_service_fn(async |request: Request<Incoming>| { Ok::<_, Infallible>(Response::new(request.into_body())) });
+        let head =
+            b"POST / HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: 6\r\nConnection: close\r\n\r\n";
+        for fragmented in [false, true] {
+            let steps = if fragmented {
+                vec![
+                    ReadStep::Data(Bytes::from_static(head)),
+                    ReadStep::Data(Bytes::from_static(b"upload")),
+                ]
+            } else {
+                vec![ReadStep::Data(Bytes::from([head.as_slice(), b"upload"].concat()))]
+            };
+            let service = vakya::server::request_service_fn(async |request: Request<Incoming>| {
+                Ok::<_, Infallible>(Response::new(request.into_body()))
+            });
             let (writer, bytes) = ObservedWriter::new();
-            Server::new().auto_date(false).serve_connection((Reader::new(steps), writer), service).run().await.unwrap();
-            let wire = output(&bytes); assert!(wire.ends_with("upload")); assert_eq!(wire.matches("HTTP/1.1").count(), 1); assert!(!wire.contains("100 Continue"));
+            Server::new()
+                .auto_date(false)
+                .serve_connection((Reader::new(steps), writer), service)
+                .run()
+                .await
+                .unwrap();
+            let wire = output(&bytes);
+            assert!(wire.ends_with("upload"));
+            assert_eq!(wire.matches("HTTP/1.1").count(), 1);
+            assert!(!wire.contains("100 Continue"));
         }
     });
 }

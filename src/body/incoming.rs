@@ -11,7 +11,40 @@ use std::{
 };
 use std::{fmt, marker::PhantomData, ops::RangeBounds, rc::Rc};
 
-pub(crate) type IncomingProducer = pipe::Producer<Frame<IncomingData>, Error>;
+/// Incoming-only accounting, stored inline in the rendezvous allocation.
+#[derive(Default)]
+pub(crate) struct DrainPolicy {
+    remaining: std::cell::Cell<Option<(u64, u64)>>,
+}
+
+pub(crate) type IncomingProducer = pipe::Producer<Frame<IncomingData>, Error, DrainPolicy>;
+type IncomingConsumer = pipe::Consumer<Frame<IncomingData>, Error, DrainPolicy>;
+
+impl IncomingProducer {
+    /// Charge consumed framing bytes only after a consumer opts into draining.
+    #[cfg(feature = "http1")]
+    pub(crate) fn charge_drain(&self, bytes: usize, payload: usize) -> Result<(), crate::error::LimitKind> {
+        let Some((wire, data)) = self.policy().remaining.get() else {
+            return Ok(());
+        };
+        let data = data
+            .checked_sub(payload as u64)
+            .ok_or(crate::error::LimitKind::DrainPayload)?;
+        let wire = wire
+            .checked_sub(bytes as u64)
+            .ok_or(crate::error::LimitKind::DrainWire)?;
+        self.policy().remaining.set(Some((wire, data)));
+        Ok(())
+    }
+}
+
+impl IncomingConsumer {
+    pub(crate) fn drain_budget(&self, bytes: u64, wire_allowance: u64) {
+        self.policy()
+            .remaining
+            .set(Some((bytes.saturating_add(wire_allowance), bytes)));
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DrainConfig {
@@ -36,7 +69,7 @@ impl Default for DrainConfig {
 /// At most one frame awaits delivery. Retaining yielded data does not retain
 /// the body endpoint or prevent later portable reads.
 pub struct Incoming {
-    consumer: Option<pipe::Consumer<Frame<IncomingData>, Error>>,
+    consumer: Option<IncomingConsumer>,
     size: SizeHint,
     trailers: TrailerHint,
     trailers_seen: bool,
@@ -95,7 +128,7 @@ impl Incoming {
 
     /// Even exact zero retains its endpoint: metadata alone is not completion.
     pub(crate) fn channel(size: SizeHint, trailers: TrailerHint) -> (IncomingProducer, Self) {
-        let (producer, consumer) = pipe::channel();
+        let (producer, consumer) = pipe::channel_with_policy(DrainPolicy::default());
         (
             producer,
             Self {
@@ -457,6 +490,20 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
+    #[cfg(feature = "http1")]
+    #[test]
+    fn drain_limits_distinguish_payload_and_wire_without_partial_charging() {
+        use crate::error::LimitKind;
+        let (producer, consumer) = pipe::channel_with_policy::<Frame<IncomingData>, Error, _>(DrainPolicy::default());
+        assert!(std::ptr::eq(producer.policy(), consumer.policy()));
+        assert_eq!(producer.charge_drain(usize::MAX, usize::MAX), Ok(()));
+        consumer.drain_budget(2, 1);
+        assert_eq!(producer.charge_drain(3, 3), Err(LimitKind::DrainPayload));
+        assert_eq!(producer.charge_drain(4, 2), Err(LimitKind::DrainWire));
+        assert_eq!(producer.charge_drain(3, 2), Ok(()));
+        assert_eq!(producer.charge_drain(1, 0), Err(LimitKind::DrainWire));
+    }
+
     fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
@@ -554,8 +601,6 @@ mod tests {
     #[test]
     fn portable_conversion_moves_the_remaining_sliced_storage_without_copying() {
         use bytes::Buf;
-        fn portable<T: Send + Sync>() {}
-        portable::<Bytes>();
         let bytes = Bytes::from(b"payload".to_vec());
         let pointer = bytes.as_ptr();
         let original = IncomingData::from_bytes(bytes);

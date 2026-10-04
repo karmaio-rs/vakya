@@ -212,8 +212,12 @@ fn boxed_mapped_errors_retain_the_original_local_source() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let message: Rc<str> = Rc::from("local failure");
         let body = StreamBody::new(Frames(VecDeque::from([Err("source error")])))
-            .map_err(|_| LocalError(Rc::clone(&message)))
+            .map_err(|source| {
+                assert_eq!(source, "source error");
+                LocalError(Rc::clone(&message))
+            })
             .boxed();
+        assert_eq!(body.size_hint(), vakya::body::SizeHint::new());
         let error = body.collect(0).await.unwrap_err();
         let source = std::error::Error::source(&error)
             .unwrap()

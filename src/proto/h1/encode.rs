@@ -1,6 +1,5 @@
 use super::inline::InlineBuf;
 use super::{
-    UpgradeKind,
     decode::validate_trailers,
     head::{HeadError, RequestHead, ResponseHead, parse_content_length, parse_transfer_encoding},
     header_case::HeaderCaseMap,
@@ -99,11 +98,9 @@ impl From<EncodeError> for Error {
 use super::BodyMode;
 
 #[derive(Debug)]
-pub(super) struct EncodedHead {
+pub(super) struct MessagePlan<H> {
     pub(super) bytes: Bytes,
-    pub(super) mode: BodyMode,
-    pub(super) upgrade: Option<UpgradeKind>,
-    pub(super) persistence: super::Persistence,
+    pub(super) head: H,
 }
 
 #[cfg(test)]
@@ -114,8 +111,8 @@ pub(super) fn encode_request_head(
     headers: HeaderMap,
     metadata: BodyMetadata,
     config: EncodeConfig,
-) -> Result<EncodedHead, EncodeError> {
-    prepare_request_head(method, target, version, headers, None, metadata, config).map(|(head, _)| head)
+) -> Result<MessagePlan<super::head::ValidatedRequestHead>, EncodeError> {
+    prepare_request_head(method, target, version, headers, None, metadata, config)
 }
 
 pub(super) fn prepare_request_head(
@@ -126,7 +123,7 @@ pub(super) fn prepare_request_head(
     original_case: Option<&HeaderCaseMap>,
     metadata: BodyMetadata,
     config: EncodeConfig,
-) -> Result<(EncodedHead, super::head::ValidatedRequestHead), EncodeError> {
+) -> Result<MessagePlan<super::head::ValidatedRequestHead>, EncodeError> {
     let mode = plan_request_framing(&mut headers, version, metadata)?;
     let validated = RequestHead {
         method,
@@ -156,15 +153,10 @@ pub(super) fn prepare_request_head(
         config.title_case_headers,
     )?;
     writer.push(b"\r\n")?;
-    Ok((
-        EncodedHead {
-            bytes: writer.finish(),
-            mode,
-            persistence: validated.persistence,
-            upgrade: None,
-        },
-        validated,
-    ))
+    Ok(MessagePlan {
+        bytes: writer.finish(),
+        head: validated,
+    })
 }
 
 #[cfg(test)]
@@ -175,8 +167,8 @@ pub(super) fn encode_response_head(
     metadata: BodyMetadata,
     request_method: &Method,
     config: EncodeConfig,
-) -> Result<EncodedHead, EncodeError> {
-    prepare_response_head(status, version, headers, None, metadata, request_method, config).map(|(head, _)| head)
+) -> Result<MessagePlan<super::head::ValidatedResponseHead>, EncodeError> {
+    prepare_response_head(status, version, headers, None, metadata, request_method, config)
 }
 
 pub(super) fn prepare_response_head(
@@ -187,7 +179,7 @@ pub(super) fn prepare_response_head(
     metadata: BodyMetadata,
     request_method: &Method,
     config: EncodeConfig,
-) -> Result<(EncodedHead, super::head::ValidatedResponseHead), EncodeError> {
+) -> Result<MessagePlan<super::head::ValidatedResponseHead>, EncodeError> {
     let mode = plan_response_framing(&mut headers, version, status, metadata, request_method)?;
     let validated = ResponseHead {
         version,
@@ -216,15 +208,10 @@ pub(super) fn prepare_response_head(
     )?;
     writer.push(b"\r\n")?;
 
-    Ok((
-        EncodedHead {
-            bytes: writer.finish(),
-            mode,
-            persistence: validated.persistence,
-            upgrade: validated.upgrade,
-        },
-        validated,
-    ))
+    Ok(MessagePlan {
+        bytes: writer.finish(),
+        head: validated,
+    })
 }
 
 fn plan_request_framing(
@@ -647,6 +634,7 @@ fn chunk_prefix(mut length: usize) -> InlineBuf<CHUNK_PREFIX_CAPACITY> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::UpgradeKind;
     use super::*;
     use crate::proto::h1::{
         decode::{BodyDecoder, DecodeOutcome},
@@ -700,7 +688,7 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        assert_eq!(request.mode, BodyMode::Fixed(4));
+        assert_eq!(request.head.body, BodyMode::Fixed(4));
         let mut parser = HeadParser::<RequestRole>::request(HeadLimits::new(4096, 16));
         let consumed = parser
             .head_len(&request.bytes)
@@ -720,7 +708,7 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        assert_eq!(response.mode, BodyMode::Chunked);
+        assert_eq!(response.head.body, BodyMode::Chunked);
         let mut parser = HeadParser::<ResponseRole>::response(HeadLimits::new(4096, 16));
         let consumed = parser
             .head_len(&response.bytes)
@@ -777,7 +765,8 @@ mod tests {
                 LIMITS
             )
             .unwrap()
-            .mode,
+            .head
+            .body,
             BodyMode::None
         );
         let reset = encode_response_head(
@@ -789,7 +778,7 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        assert_eq!(reset.mode, BodyMode::Fixed(0));
+        assert_eq!(reset.head.body, BodyMode::Fixed(0));
         assert!(reset.bytes.windows(19).any(|bytes| bytes == b"content-length: 0\r\n"));
         let mut upgrade = HeaderMap::new();
         upgrade.insert(CONNECTION, HeaderValue::from_static("upgrade"));
@@ -804,6 +793,7 @@ mod tests {
                 LIMITS
             )
             .unwrap()
+            .head
             .upgrade,
             Some(UpgradeKind::Protocol)
         );
@@ -877,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_prefix_covers_platform_length_width_without_allocation() {
+    fn chunk_prefix_encodes_platform_length_boundaries() {
         assert_eq!(chunk_prefix(1).as_init(), b"1\r\n");
         assert_eq!(chunk_prefix(0x1234_abcd).as_init(), b"1234abcd\r\n");
         assert_eq!(
@@ -926,10 +916,10 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        for head in [request, response] {
-            assert_eq!(head.mode, BodyMode::Chunked);
-            assert!(head.bytes.windows(28).any(|b| b == b"transfer-encoding: chunked\r\n"));
-            let mut encoder = BodyEncoder::new(head.mode, metadata, LIMITS).unwrap();
+        for (bytes, mode) in [(request.bytes, request.head.body), (response.bytes, response.head.body)] {
+            assert_eq!(mode, BodyMode::Chunked);
+            assert!(bytes.windows(28).any(|b| b == b"transfer-encoding: chunked\r\n"));
+            let mut encoder = BodyEncoder::new(mode, metadata, LIMITS).unwrap();
             encoder.data(4).unwrap();
             let mut trailers = HeaderMap::new();
             trailers.insert("x-checksum", HeaderValue::from_static("good"));
@@ -996,9 +986,9 @@ mod tests {
             let metadata = BodyMetadata::exact(123);
             let head =
                 encode_response_head(status, Version::HTTP_11, HeaderMap::new(), metadata, &method, LIMITS).unwrap();
-            assert_eq!(head.mode, BodyMode::None);
+            assert_eq!(head.head.body, BodyMode::None);
             assert!(head.bytes.windows(21).any(|b| b == b"content-length: 123\r\n"));
-            let mut encoder = BodyEncoder::new(head.mode, metadata, LIMITS).unwrap();
+            let mut encoder = BodyEncoder::new(head.head.body, metadata, LIMITS).unwrap();
             assert!(encoder.finish().unwrap().is_empty());
         }
         let metadata = BodyMetadata::unknown();
@@ -1027,8 +1017,8 @@ mod tests {
             LIMITS,
         )
         .unwrap();
-        assert_eq!(head.mode, BodyMode::UntilEof);
-        assert_eq!(head.persistence, super::super::Persistence::Close);
+        assert_eq!(head.head.body, BodyMode::UntilEof);
+        assert_eq!(head.head.persistence, super::super::Persistence::Close);
     }
 
     #[test]

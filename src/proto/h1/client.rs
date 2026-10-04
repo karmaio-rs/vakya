@@ -1,10 +1,11 @@
 use super::{
     BodyMode, Expectation,
-    bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
+    activity::{ReceiveResources, TransmitResources},
+    body_io::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
-    encode::{BodyEncoder, BodyMetadata, prepare_request_head},
+    encode::{BodyEncoder, BodyMetadata, EncodeConfig, MessagePlan, prepare_request_head},
     exchange::{ActivityEnd, ExchangePolicy, HeadAction, Outcome},
-    head::{HeadParser, ResponseRole},
+    head::{HeadParser, ResponseRole, ValidatedRequestHead},
     header_case::HeaderCaseMap,
 };
 use crate::{
@@ -124,11 +125,16 @@ where
         let span = exchanges.next();
         let settled = span
             .instrument(exchange(
-                &mut reader,
-                &mut writer,
-                &mut strategy,
-                &mut parser,
-                buffer,
+                ReceiveResources {
+                    reader: &mut reader,
+                    strategy: &mut strategy,
+                    parser: &mut parser,
+                    buffer,
+                },
+                TransmitResources {
+                    writer: &mut writer,
+                    encoding: config.protocol.encode,
+                },
                 request,
                 response,
                 control,
@@ -209,13 +215,109 @@ struct SettledExchange {
     close_reason: CloseReason,
 }
 
+/// Receive returns policy with its recovered input only after body I/O settles.
+struct ReceivedResponse {
+    end: ReceiveEnd,
+    buffer: RecvBuffer,
+    policy: ExchangePolicy,
+}
+
+/// Prepared before either direction is polled. Preparation errors are local.
+struct RequestUpload<B> {
+    plan: MessagePlan<ValidatedRequestHead>,
+    body: B,
+    encoder: BodyEncoder,
+    // Preserve application extensions until the complete exchange scope exits.
+    extensions: http::Extensions,
+}
+
+impl<B: Body> RequestUpload<B> {
+    fn prepare(
+        request: http::Request<B>,
+        encoding: EncodeConfig,
+        max_informational: usize,
+    ) -> Result<(Self, ExchangePolicy), Error> {
+        let (parts, body) = request.into_parts();
+        let metadata = BodyMetadata {
+            size: body.size_hint(),
+            trailers: body.trailer_hint(),
+        };
+        let plan = prepare_request_head(
+            parts.method,
+            parts.uri,
+            parts.version,
+            parts.headers,
+            parts.extensions.get::<HeaderCaseMap>(),
+            metadata,
+            encoding,
+        )?;
+        let policy = ExchangePolicy::new(&plan.head, max_informational);
+        let encoder = BodyEncoder::new(plan.head.body, metadata, encoding)?;
+        Ok((
+            Self {
+                plan,
+                body,
+                encoder,
+                extensions: parts.extensions,
+            },
+            policy,
+        ))
+    }
+}
+
+/// Borrow the producer from the exchange scope so it outlives both activities.
+async fn send_request<W: AsyncWrite, B: Body>(
+    writer: &mut W,
+    bytes: bytes::Bytes,
+    head: &ValidatedRequestHead,
+    body: &mut B,
+    encoder: &mut BodyEncoder,
+    control: &Control,
+    continue_wait: Option<std::time::Duration>,
+) -> Result<(), Error>
+where
+    B::Error: std::error::Error + 'static,
+{
+    let mode = head.body;
+    let (result, _) = write_all(writer, bytes, Some(control.upload.token()))
+        .await
+        .into_parts();
+    result?;
+    if head.expectation == Expectation::Continue
+        && !matches!(mode, BodyMode::None | BodyMode::Fixed(0))
+        && let Some(timeout) = continue_wait
+    {
+        writer.flush().with_cancellation(control.upload.token()).await?;
+
+        // Receive releases permission before offering a 100 or final event;
+        // an application pause cannot hold the upload's permission.
+        let waited = cancellable_wait(
+            karmaio::time::timeout_at(
+                crate::io::deadline::configured_after(Some(timeout))?.expect("configured Continue duration"),
+                control.wait_continue(),
+            ),
+            Some(control.upload.token()),
+        )
+        .await;
+        if waited.is_none() {
+            return Err(Error::new(ErrorKind::Canceled, "Continue wait canceled"));
+        }
+    }
+
+    if mode != BodyMode::None {
+        send_body(writer, body, encoder, Some(control.upload.token()))
+            .await
+            .map_err(map_send_error)?;
+    }
+    writer.flush().with_cancellation(control.upload.token()).await?;
+    control.upload_complete.set(true);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Disjoint exchange resources and connection cancellation.
 async fn exchange<R, W, B, T>(
-    reader: &mut R,
-    writer: &mut W,
-    strategy: &mut T,
-    parser: &mut HeadParser<ResponseRole>,
-    buffer: RecvBuffer,
+    receive_resources: ReceiveResources<'_, R, T, &mut HeadParser<ResponseRole>>,
+    transmit: TransmitResources<'_, W>,
     request: crate::Request<B>,
     response: Producer<ResponseEvent, Error>,
     control: std::rc::Rc<Control>,
@@ -230,17 +332,7 @@ where
 {
     let mut response = Some(response);
 
-    let work = exchange_inner(
-        reader,
-        writer,
-        strategy,
-        parser,
-        buffer,
-        request,
-        &mut response,
-        &control,
-        config,
-    );
+    let work = exchange_inner(receive_resources, transmit, request, &mut response, &control, config);
     let result = {
         let mut work = pin!(work);
         let mut canceled = pin!(shutdown.token().cancelled());
@@ -270,11 +362,8 @@ where
 
 #[allow(clippy::too_many_arguments)] // Disjoint scoped halves and observation ownership.
 async fn exchange_inner<R, W, B, T>(
-    reader: &mut R,
-    writer: &mut W,
-    strategy: &mut T,
-    parser: &mut HeadParser<ResponseRole>,
-    buffer: RecvBuffer,
+    receive_resources: ReceiveResources<'_, R, T, &mut HeadParser<ResponseRole>>,
+    transmit: TransmitResources<'_, W>,
     request: http::Request<B>,
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
@@ -286,74 +375,36 @@ where
     B::Error: std::error::Error + 'static,
     T: Receive<R>,
 {
-    let (parts, mut body) = request.into_parts();
-    let original_case = parts.extensions.get::<HeaderCaseMap>();
-
-    let metadata = BodyMetadata {
-        size: body.size_hint(),
-        trailers: body.trailer_hint(),
-    };
-
-    let (head, request) = prepare_request_head(
-        parts.method,
-        parts.uri,
-        parts.version,
-        parts.headers,
-        original_case,
-        metadata,
-        config.protocol.encode,
-    )?;
-
-    let state = ExchangePolicy::new(&request, config.protocol.max_informational);
-    let mut encoder = BodyEncoder::new(head.mode, metadata, config.protocol.encode)?;
-
-    let send = async {
-        let (result, _) = write_all(writer, head.bytes, Some(control.upload.token()))
-            .await
-            .into_parts();
-        result?;
-        if request.expectation == Expectation::Continue
-            && !matches!(head.mode, BodyMode::None | BodyMode::Fixed(0))
-            && let Some(timeout) = config.continue_wait
-        {
-            writer.flush().with_cancellation(control.upload.token()).await?;
-
-            // The read half releases permission before offering an observed 100
-            // or final event; an application pause cannot hold that permission.
-            let waited = cancellable_wait(
-                karmaio::time::timeout_at(
-                    crate::io::deadline::configured_after(Some(timeout))?.expect("configured Continue duration"),
-                    control.wait_continue(),
-                ),
-                Some(control.upload.token()),
-            )
-            .await;
-
-            if waited.is_none() {
-                return Err(Error::new(ErrorKind::Canceled, "Continue wait canceled"));
-            }
-        }
-
-        if head.mode != BodyMode::None {
-            send_body(writer, &mut body, &mut encoder, Some(control.upload.token()))
-                .await
-                .map_err(map_send_error)?;
-        }
-
-        writer.flush().with_cancellation(control.upload.token()).await?;
-        control.upload_complete.set(true);
-
-        Ok::<(), Error>(())
-    }
+    let TransmitResources { writer, encoding } = transmit;
+    let (upload, policy) = RequestUpload::prepare(request, encoding, config.protocol.max_informational)?;
+    // Keep request-owned resources in their original scope and drop order.
+    let _extensions = upload.extensions;
+    let mut body = upload.body;
+    let plan = upload.plan;
+    let mut encoder = upload.encoder;
+    let send = send_request(
+        writer,
+        plan.bytes,
+        &plan.head,
+        &mut body,
+        &mut encoder,
+        control,
+        config.continue_wait,
+    )
     .with_cancellation(control.exchange.token());
-
-    let receive = receive(reader, strategy, parser, buffer, state, response, control, config);
+    let receive = receive(receive_resources, policy, response, control, config);
     let mut send = pin!(send);
     let mut receive = pin!(receive);
 
+    // The first terminal direction may request cancellation of its peer. Retain
+    // and await that peer here before interpreting either result or reusing I/O.
     let (sent, received) = match race(receive.as_mut(), send.as_mut()).await {
         Race::First(received) => {
-            if received.is_err() || matches!(received, Ok((ReceiveEnd::Abandoned, _, _))) {
+            if received.is_err()
+                || received
+                    .as_ref()
+                    .is_ok_and(|received| matches!(received.end, ReceiveEnd::Abandoned))
+            {
                 control.cancel();
             }
             (send.await, received)
@@ -371,8 +422,17 @@ where
         }
     };
 
+    finish_exchange(sent, received, explicit_abort(control))
+}
+
+/// Pure composition of already-settled results; cancellation happens above.
+fn finish_exchange(
+    sent: Result<(), Error>,
+    received: Result<ReceivedResponse, Error>,
+    upload_aborted: bool,
+) -> Result<SettledExchange, Error> {
     // Prefer the originating failure over the other half's cancellation.
-    let (end, buffer, state) = match received {
+    let ReceivedResponse { end, buffer, policy } = match received {
         Ok(result) => result,
         Err(error) => {
             return Err(match sent {
@@ -392,7 +452,7 @@ where
             }
             return Ok(SettledExchange {
                 buffer,
-                outcome: state.finish(ActivityEnd::Retired, ActivityEnd::Retired)?,
+                outcome: policy.finish(ActivityEnd::Retired, ActivityEnd::Retired)?,
                 close_reason: CloseReason::BodyAbandonment,
             });
         }
@@ -400,17 +460,17 @@ where
     };
 
     let request_end = match sent {
-        Err(error) if !error.is_canceled() || !explicit_abort(control) => return Err(error),
+        Err(error) if !error.is_canceled() || !upload_aborted => return Err(error),
         Err(_) => ActivityEnd::Retired,
         // An abort can race with successful completion. Admission must still
         // retire: the application requested abort while upload was unfinished.
-        Ok(()) if explicit_abort(control) => ActivityEnd::Retired,
+        Ok(()) if upload_aborted => ActivityEnd::Retired,
         Ok(()) => ActivityEnd::Complete,
     };
     Ok(SettledExchange {
         buffer,
-        outcome: state.finish(request_end, response_end)?,
-        close_reason: if explicit_abort(control) {
+        outcome: policy.finish(request_end, response_end)?,
+        close_reason: if upload_aborted {
             CloseReason::UploadAbort
         } else {
             CloseReason::MessagePolicy
@@ -424,15 +484,18 @@ fn explicit_abort(control: &Control) -> bool {
 
 #[allow(clippy::too_many_arguments)] // Reuse the connection parser workspace across exchanges.
 async fn receive<R, T: Receive<R>>(
-    reader: &mut R,
-    strategy: &mut T,
-    parser: &mut HeadParser<ResponseRole>,
-    mut buffer: RecvBuffer,
+    resources: ReceiveResources<'_, R, T, &mut HeadParser<ResponseRole>>,
     mut state: ExchangePolicy,
     response: &mut Option<Producer<ResponseEvent, Error>>,
     control: &Control,
     config: &ClientConfig,
-) -> Result<(ReceiveEnd, RecvBuffer, ExchangePolicy), Error> {
+) -> Result<ReceivedResponse, Error> {
+    let ReceiveResources {
+        reader,
+        strategy,
+        parser,
+        mut buffer,
+    } = resources;
     let deadline = crate::io::deadline::configured_after(config.head_timeout)?;
     let head = loop {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -541,7 +604,11 @@ async fn receive<R, T: Receive<R>>(
 
     match end {
         ReceiveEnd::Failed(error) => Err(error),
-        end => Ok((end, buffer, state)),
+        end => Ok(ReceivedResponse {
+            end,
+            buffer,
+            policy: state,
+        }),
     }
 }
 

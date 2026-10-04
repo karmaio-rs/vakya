@@ -5,16 +5,10 @@ use karmaio::{
     buf::{BufResult, IoBuf, IoVectoredBuf},
     io::AsyncWrite,
 };
-use std::{
-    cell::{Cell, RefCell},
-    convert::Infallible,
-    future::{Future, poll_fn},
-    io,
-    pin::{Pin, pin},
-    rc::Rc,
-    task::{Context, Poll, Waker},
-};
+use std::{cell::Cell, convert::Infallible, io, pin::pin, rc::Rc, task::Poll};
+use support::future::{pair, poll};
 use support::transport::{Gate, ReadStep, Reader, Writer};
+use support::transport::{ObservedWriter, output};
 #[cfg(feature = "server")]
 use vakya::Response;
 use vakya::{
@@ -24,77 +18,8 @@ use vakya::{
     error::ErrorKind,
 };
 
-struct ObservedWriter {
-    writer: Writer,
-    output: Rc<RefCell<Vec<u8>>>,
-}
-impl ObservedWriter {
-    fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
-        let output = Rc::new(RefCell::new(Vec::new()));
-        (
-            Self {
-                writer: Writer::limited(3),
-                output: output.clone(),
-            },
-            output,
-        )
-    }
-    fn record(&self) {
-        let mut output = self.output.borrow_mut();
-        let start = output.len();
-        output.extend_from_slice(&self.writer.output[start..]);
-    }
-}
-impl AsyncWrite for ObservedWriter {
-    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
-        let result = self.writer.write(buffer).await;
-        self.record();
-        result
-    }
-    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
-        let result = self.writer.write_vectored(buffers).await;
-        self.record();
-        result
-    }
-    async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
-    }
-    async fn shutdown(&mut self) -> io::Result<()> {
-        self.writer.shutdown().await
-    }
-}
 fn reader(bytes: &'static [u8]) -> Reader {
     Reader::new([ReadStep::Data(Bytes::from_static(bytes))])
-}
-fn output(bytes: &Rc<RefCell<Vec<u8>>>) -> String {
-    String::from_utf8(bytes.borrow().clone()).unwrap()
-}
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let mut a = None;
-    let mut b = None;
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }
 
 fn request<B>(body: B) -> Request<B> {
@@ -120,9 +45,12 @@ fn unsolicited_read_ahead_never_becomes_a_later_response() {
             let (writer, output) = ObservedWriter::new();
             let (sender, driver) = Builder::new().handshake((Reader::new([ReadStep::Data(wire)]), writer));
             let app = async {
-                let response = sender.send_request(request(Empty::new())).await.unwrap();
+                let mut pending = sender.start_request(request(Empty::new())).await.unwrap();
+                let completion = pending.take_completion().unwrap();
+                let response = pending.response().await.unwrap();
                 assert_eq!(response.status(), 200);
                 response.into_body().collect(1).await.unwrap();
+                assert_eq!(completion.await.unwrap_err().kind(), ErrorKind::InvalidMessage);
                 assert!(sender.send_request(request(Empty::new())).await.is_err());
             };
             let (result, ()) = pair(driver.run(), app).await;
@@ -417,6 +345,93 @@ fn early_finals_preserve_borrowed_uploads_and_reuse_waits_for_both_directions() 
 }
 
 #[test]
+fn request_resources_outlive_completed_upload_until_receive_settles() {
+    struct RetainedBody<'a> {
+        body: Full<Bytes>,
+        finished: &'a Cell<bool>,
+        dropped: &'a Cell<bool>,
+        extension_dropped: &'a std::sync::atomic::AtomicBool,
+    }
+    impl Body for RetainedBody<'_> {
+        type Data = Bytes;
+        type Error = Infallible;
+        async fn next_frame(&mut self) -> Result<Option<Frame<Bytes>>, Infallible> {
+            let frame = self.body.next_frame().await?;
+            self.finished.set(frame.is_none());
+            Ok(frame)
+        }
+        fn size_hint(&self) -> SizeHint {
+            self.body.size_hint()
+        }
+        fn trailer_hint(&self) -> TrailerHint {
+            TrailerHint::None
+        }
+    }
+    impl Drop for RetainedBody<'_> {
+        fn drop(&mut self) {
+            assert!(!self.extension_dropped.load(std::sync::atomic::Ordering::Relaxed));
+            self.dropped.set(true);
+        }
+    }
+    #[derive(Clone)]
+    struct RetainedExtension(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for RetainedExtension {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    karmaio::Runtime::new().unwrap().block_on(async {
+        let finished = Cell::new(false);
+        let dropped = Cell::new(false);
+        let extension_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Gate::default();
+        let (sender, driver) = Builder::new().handshake((
+            Reader::new([
+                ReadStep::Data(Bytes::from_static(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")),
+                ReadStep::Wait(gate.clone()),
+                ReadStep::Data(Bytes::from_static(b"y")),
+            ]),
+            Writer::new([]),
+        ));
+        let shutdown = driver.control();
+        let mut request = request(RetainedBody {
+            body: Full::new(Bytes::from_static(b"x")),
+            finished: &finished,
+            dropped: &dropped,
+            extension_dropped: &extension_dropped,
+        });
+        request
+            .extensions_mut()
+            .insert(RetainedExtension(extension_dropped.clone()));
+        let mut pending = sender.start_request(request).await.unwrap();
+        let mut completion = pin!(pending.take_completion().unwrap());
+        let mut driver = pin!(driver.run());
+        assert!(poll(driver.as_mut()).is_pending());
+        let response = pending.response().await.unwrap();
+        let mut collect = pin!(response.into_body().collect(1));
+        assert!(poll(collect.as_mut()).is_pending());
+        assert!(poll(driver.as_mut()).is_pending());
+
+        assert!(finished.get());
+        assert!(!dropped.get());
+        assert!(!extension_dropped.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(poll(completion.as_mut()).is_pending());
+        assert!(!sender.is_ready());
+
+        gate.open();
+        let observe = async {
+            assert_eq!(collect.await.unwrap().bytes().as_ref(), b"y");
+            assert_eq!(completion.await.unwrap(), ExchangeOutcome::Reusable);
+            assert!(dropped.get());
+            assert!(extension_dropped.load(std::sync::atomic::Ordering::Relaxed));
+            shutdown.graceful_shutdown();
+        };
+        pair(driver, observe).await.0.unwrap();
+    });
+}
+
+#[test]
 fn explicit_upload_abort_after_final_delivery_retires_connection() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let produced = Cell::new(false);
@@ -526,13 +541,27 @@ fn encoding_peer_and_transport_failures_reach_driver_and_waiter() {
             if case == 0 {
                 request.headers_mut().insert("content-length", "5".parse().unwrap());
             }
-            let pending = sender.start_request(request).await.unwrap();
+            let mut pending = sender.start_request(request).await.unwrap();
+            let completion = pending.take_completion().unwrap();
             let (driver, response) = pair(driver.run(), pending.response()).await;
             let expected = [ErrorKind::LocalMessage, ErrorKind::InvalidMessage, ErrorKind::Io][case];
-            assert_eq!(driver.unwrap_err().kind(), expected);
+            let driver_error = driver.unwrap_err();
+            let receipt_error = completion.await.unwrap_err();
+            assert_eq!(driver_error.kind(), expected);
+            assert_eq!(receipt_error.kind(), expected);
+            assert_eq!(receipt_error.detail(), driver_error.detail());
             let error = response.unwrap_err();
+            assert_eq!(error.detail(), driver_error.detail());
             assert_eq!(error.kind(), expected);
             if case == 2 {
+                let source = |error: &vakya::error::Error| {
+                    std::error::Error::source(error)
+                        .unwrap()
+                        .downcast_ref::<io::Error>()
+                        .unwrap() as *const io::Error
+                };
+                assert_eq!(source(&driver_error), source(&error));
+                assert_eq!(source(&receipt_error), source(&error));
                 assert_eq!(
                     std::error::Error::source(&error)
                         .unwrap()

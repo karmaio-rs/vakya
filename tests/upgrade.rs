@@ -2,19 +2,19 @@
 mod support;
 use bytes::Bytes;
 use karmaio::{
-    buf::{BufResult, IoBuf, IoVectoredBuf},
+    buf::{BufResult, IoBuf},
     io::{AsyncRead, AsyncWrite},
 };
 use std::{
     cell::{Cell, RefCell},
     convert::Infallible,
-    future::{Future, poll_fn},
     io,
-    pin::{Pin, pin},
+    pin::pin,
     rc::Rc,
-    task::{Context, Poll, Waker},
 };
+use support::future::{pair, poll};
 use support::transport::{Gate, ReadStep, Reader, Writer};
+use support::transport::{ObservedWriter, output};
 use vakya::{
     Request, Response,
     body::{Body, BodyExt, Empty, Frame, Incoming, SizeHint, TrailerHint},
@@ -25,77 +25,8 @@ use vakya::{
     service::service_fn,
     upgrade::UpgradeKind,
 };
-struct ObservedWriter {
-    writer: Writer,
-    output: Rc<RefCell<Vec<u8>>>,
-}
-impl ObservedWriter {
-    fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
-        let output = Rc::new(RefCell::new(Vec::new()));
-        (
-            Self {
-                writer: Writer::limited(3),
-                output: output.clone(),
-            },
-            output,
-        )
-    }
-    fn record(&self) {
-        let mut output = self.output.borrow_mut();
-        let start = output.len();
-        output.extend_from_slice(&self.writer.output[start..]);
-    }
-}
-impl AsyncWrite for ObservedWriter {
-    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
-        let result = self.writer.write(buffer).await;
-        self.record();
-        result
-    }
-    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
-        let result = self.writer.write_vectored(buffers).await;
-        self.record();
-        result
-    }
-    async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
-    }
-    async fn shutdown(&mut self) -> io::Result<()> {
-        self.writer.shutdown().await
-    }
-}
 fn reader(bytes: &'static [u8]) -> Reader {
     Reader::new([ReadStep::Data(Bytes::from_static(bytes))])
-}
-fn output(bytes: &Rc<RefCell<Vec<u8>>>) -> String {
-    String::from_utf8(bytes.borrow().clone()).unwrap()
-}
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let mut a = None;
-    let mut b = None;
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }
 
 fn request<B>(body: B, tunnel: bool) -> Request<B> {
@@ -130,6 +61,20 @@ fn response_wire(tunnel: bool) -> &'static [u8] {
         b"HTTP/1.1 200 OK\r\n\r\nraw"
     } else {
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: test/1\r\n\r\nraw"
+    }
+}
+
+// Preserve the public typed and erased claim paths in the same wire scenario.
+enum UpgradeClaim {
+    Typed(vakya::upgrade::OnUpgrade<Reader, Writer>),
+    Boxed(vakya::upgrade::BoxedOnUpgrade),
+}
+impl UpgradeClaim {
+    async fn receive(self) -> vakya::upgrade::Upgraded<Reader, Writer> {
+        match self {
+            Self::Typed(claim) => claim.await.unwrap(),
+            Self::Boxed(claim) => claim.await.unwrap().downcast::<Reader, Writer>().unwrap(),
+        }
     }
 }
 
@@ -253,98 +198,95 @@ fn retained_pending_response_cannot_claim_after_transport_transfer() {
 }
 
 #[test]
-fn server_request_can_claim_upgrade_without_transport_parameters() {
+fn server_typed_and_boxed_claims_preserve_transport() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let claimed = RefCell::new(None);
-        let service = service_fn(async |(_, mut context): (Request<Incoming>, RequestContext)| {
-            claimed.replace(Some(context.on_upgrade()));
-            Ok::<_, Infallible>(response(false))
-        });
-        let outcome = Server::new()
-            .auto_date(false)
-            .serve_connection(
-                (
-                    reader(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\n\r\nraw"),
-                    Writer::limited(128),
-                ),
-                service,
-            )
-            .run()
-            .await
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
-        ));
-        let upgraded = claimed.into_inner().unwrap().await.unwrap();
-        assert_eq!(upgraded.read_ahead(), b"raw");
-        let (_, writer, _, _) = upgraded.downcast::<Reader, Writer>().unwrap().into_parts();
-        assert!(writer.output.ends_with(b"\r\n\r\n"));
+        for boxed in [false, true] {
+            let claimed = RefCell::new(None);
+            let service = service_fn(async |(_, mut context): (Request<Incoming>, RequestContext)| {
+                let claim = if boxed {
+                    UpgradeClaim::Boxed(context.on_upgrade())
+                } else {
+                    UpgradeClaim::Typed(context.on_upgrade_typed::<Reader, Writer>())
+                };
+                claimed.replace(Some(claim));
+                Ok::<_, Infallible>(response(false))
+            });
+            let outcome = Server::new()
+                .auto_date(false)
+                .serve_connection(
+                    (
+                        reader(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\n\r\nraw"),
+                        Writer::limited(128),
+                    ),
+                    service,
+                )
+                .run()
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
+            ));
+            let upgraded = claimed.into_inner().unwrap().receive().await;
+            assert_eq!(upgraded.kind(), UpgradeKind::Protocol);
+            assert_eq!(upgraded.read_ahead(), b"raw");
+            let (_, writer, _, _) = upgraded.into_parts();
+            assert!(writer.output.ends_with(b"\r\n\r\n"));
+        }
     });
 }
 
 #[test]
-fn client_can_claim_upgrade_without_transport_parameters() {
+fn client_pending_and_sender_claims_preserve_typed_and_boxed_transport() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        for use_sender_convenience in [false, true] {
+        enum ClaimSource {
+            Pending,
+            BoxedSender,
+            TypedSender,
+        }
+        for claim_source in [ClaimSource::Pending, ClaimSource::BoxedSender, ClaimSource::TypedSender] {
             let (sender, driver) = Client::new().handshake((reader(response_wire(false)), Writer::limited(128)));
-            let (outcome, response, upgrade) = if use_sender_convenience {
-                let (outcome, result) = pair(
-                    driver.run(),
-                    sender.send_request_with_upgrade(request(Empty::new(), false)),
-                )
-                .await;
-                let (response, upgrade) = result.unwrap();
-                (outcome, response, upgrade)
-            } else {
-                let mut pending = sender.start_request(request(Empty::new(), false)).await.unwrap();
-                let upgrade = pending.on_upgrade();
-                assert_eq!(
-                    pending.on_upgrade_typed::<Reader, Writer>().await.unwrap_err().kind(),
-                    ErrorKind::Upgrade
-                );
-                let (outcome, response) = pair(driver.run(), pending.response()).await;
-                (outcome, response.unwrap(), upgrade)
+            let (outcome, response, claim) = match claim_source {
+                ClaimSource::BoxedSender => {
+                    let (outcome, result) = pair(
+                        driver.run(),
+                        sender.send_request_with_upgrade(request(Empty::new(), false)),
+                    )
+                    .await;
+                    let (response, claim) = result.unwrap();
+                    (outcome, response, UpgradeClaim::Boxed(claim))
+                }
+                ClaimSource::TypedSender => {
+                    let (outcome, result) = pair(
+                        driver.run(),
+                        sender.send_request_with_typed_upgrade::<Reader, Writer>(request(Empty::new(), false)),
+                    )
+                    .await;
+                    let (response, claim) = result.unwrap();
+                    (outcome, response, UpgradeClaim::Typed(claim))
+                }
+                ClaimSource::Pending => {
+                    let mut pending = sender.start_request(request(Empty::new(), false)).await.unwrap();
+                    let claim = pending.on_upgrade();
+                    assert_eq!(
+                        pending.on_upgrade_typed::<Reader, Writer>().await.unwrap_err().kind(),
+                        ErrorKind::Upgrade
+                    );
+                    let (outcome, response) = pair(driver.run(), pending.response()).await;
+                    (outcome, response.unwrap(), UpgradeClaim::Boxed(claim))
+                }
             };
             assert_eq!(response.status(), 101);
             assert!(matches!(
                 outcome.unwrap(),
                 ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
             ));
-            let upgraded = upgrade.await.unwrap().downcast::<Reader, Writer>().unwrap();
+            let upgraded = claim.receive().await;
+            assert_eq!(upgraded.kind(), UpgradeKind::Protocol);
             assert_eq!(upgraded.read_ahead(), b"raw");
+            let (_, writer, _, _) = upgraded.into_parts();
+            assert!(writer.output.ends_with(b"\r\n\r\n"));
         }
-    });
-}
-
-#[test]
-fn server_request_upgrade_future_receives_settled_typed_transport() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        let claimed = RefCell::new(None);
-        let service = service_fn(async |(_, mut context): (Request<Incoming>, RequestContext)| {
-            claimed.replace(Some(context.on_upgrade_typed::<Reader, Writer>()));
-            Ok::<_, Infallible>(response(false))
-        });
-        let outcome = Server::new()
-            .auto_date(false)
-            .serve_connection(
-                (
-                    reader(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\n\r\nraw"),
-                    Writer::limited(128),
-                ),
-                service,
-            )
-            .run()
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            outcome,
-            ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
-        ));
-        let upgraded = claimed.into_inner().expect("service claimed upgrade").await.unwrap();
-        assert_eq!(upgraded.kind(), UpgradeKind::Protocol);
-        assert_eq!(upgraded.read_ahead(), b"raw");
     });
 }
 
@@ -377,41 +319,26 @@ fn client_delivers_final_head_and_retires_admission_on_handoff() {
 }
 
 #[test]
-fn client_response_upgrade_future_receives_settled_typed_transport() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        let (sender, driver) = Client::new().handshake((reader(response_wire(false)), Writer::limited(128)));
-        let (outcome, response) = pair(
-            driver.run(),
-            sender.send_request_with_typed_upgrade::<Reader, Writer>(request(Empty::new(), false)),
-        )
-        .await;
-        let (response, upgrade) = response.unwrap();
-        assert_eq!(response.status(), 101);
-        assert!(matches!(
-            outcome.unwrap(),
-            ConnectionOutcome::UpgradeClaimed(UpgradeKind::Protocol)
-        ));
-        let upgraded = upgrade.await.unwrap();
-        assert_eq!(upgraded.read_ahead(), b"raw");
-    });
-}
-
-#[test]
 fn upgrade_future_fails_when_the_response_does_not_upgrade() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let (sender, driver) = Client::new().handshake((
-            reader(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"),
-            Writer::limited(128),
-        ));
-        let (outcome, response) = pair(
-            driver.run(),
-            sender.send_request_with_typed_upgrade::<Reader, Writer>(request(Empty::new(), false)),
-        )
-        .await;
-        assert!(matches!(outcome.unwrap(), ConnectionOutcome::Closed));
-        let (response, upgrade) = response.unwrap();
-        assert_eq!(response.status(), 204);
-        assert_eq!(upgrade.await.unwrap_err().kind(), ErrorKind::Upgrade);
+        for (wire, status) in [
+            (b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".as_slice(), 204),
+            (
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                403,
+            ),
+        ] {
+            let (sender, driver) = Client::new().handshake((reader(wire), Writer::limited(128)));
+            let (outcome, response) = pair(
+                driver.run(),
+                sender.send_request_with_typed_upgrade::<Reader, Writer>(request(Empty::new(), false)),
+            )
+            .await;
+            assert!(matches!(outcome.unwrap(), ConnectionOutcome::Closed));
+            let (response, claim) = response.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(claim.await.unwrap_err().kind(), ErrorKind::Upgrade);
+        }
     });
 }
 
@@ -522,17 +449,22 @@ fn early_switch_waits_for_upload_and_failure_never_transfers_io() {
 #[test]
 fn server_switch_waits_for_retained_request_body_to_finish() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let held=RefCell::new(None);
-        let service=service_fn(async |(request,_): (Request<Incoming>, RequestContext)| {held.replace(Some(request.into_body()));Ok::<_,Infallible>(response(false))});
-        let (writer,bytes)=ObservedWriter::new();
-        let mut driver=pin!(Server::new().auto_date(false).serve_connection((reader(b"POST / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\nContent-Length: 4\r\n\r\nbodyraw"),writer),service).run());
-        for _ in 0..5 {assert!(poll(driver.as_mut()).is_pending());}
+        let held = RefCell::new(None);
+        let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
+            held.replace(Some(request.into_body()));
+            Ok::<_, Infallible>(response(false))
+        });
+        let (writer, bytes) = ObservedWriter::new();
+        let input = reader(b"POST / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test/1\r\nContent-Length: 4\r\n\r\nbodyraw");
+        let connection = Server::new().auto_date(false).serve_connection((input, writer), service);
+        let mut driver = pin!(connection.run());
+        for _ in 0..5 { assert!(poll(driver.as_mut()).is_pending()); }
         assert!(output(&bytes).contains("101 Switching Protocols"));
-        let incoming=held.borrow_mut().take().unwrap();
-        let (outcome,body)=pair(driver,incoming.collect(4)).await;
-        assert_eq!(body.unwrap().bytes().as_ref(),b"body");
-        let ConnectionOutcome::Upgraded(upgraded)=outcome.unwrap() else {panic!("missing handoff")};
-        assert_eq!(upgraded.read_ahead(),b"raw");
+        let incoming = held.borrow_mut().take().unwrap();
+        let (outcome, body) = pair(driver, incoming.collect(4)).await;
+        assert_eq!(body.unwrap().bytes().as_ref(), b"body");
+        let ConnectionOutcome::Upgraded(upgraded) = outcome.unwrap() else { panic!("missing handoff") };
+        assert_eq!(upgraded.read_ahead(), b"raw");
     });
 }
 
@@ -591,16 +523,8 @@ fn supplied_tcp_handoff_leaves_both_transports_open_for_application_io() {
 }
 
 #[test]
-fn normal_responses_close_without_transferring_and_abandoned_uploads_cannot_upgrade() {
+fn aborted_upload_cannot_handoff_a_selected_upgrade() {
     karmaio::Runtime::new().unwrap().block_on(async {
-        let (sender, driver) = Client::new().handshake((
-            reader(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-            Writer::limited(128),
-        ));
-        let pending = sender.start_request(request(Empty::new(), false)).await.unwrap();
-        let (outcome, response) = pair(driver.run(), pending.response()).await;
-        assert_eq!(response.unwrap().status(), 403);
-        assert!(matches!(outcome.unwrap(), ConnectionOutcome::Closed));
         let (sender, driver) = Client::new().handshake((reader(response_wire(false)), Writer::limited(128)));
         let pending = sender
             .start_request(request(

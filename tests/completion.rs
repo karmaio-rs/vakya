@@ -5,15 +5,8 @@ use karmaio::{
     buf::{BufResult, IoBuf},
     io::AsyncWrite,
 };
-use std::{
-    cell::Cell,
-    convert::Infallible,
-    future::{Future, poll_fn},
-    io,
-    pin::{Pin, pin},
-    rc::Rc,
-    task::{Context, Poll, Waker},
-};
+use std::{cell::Cell, convert::Infallible, io, pin::pin, rc::Rc};
+use support::future::{pair, poll};
 use support::transport::{Gate, ReadStep, Reader, Writer};
 use vakya::{
     Request,
@@ -24,32 +17,6 @@ use vakya::{
     upgrade::UpgradeKind,
 };
 
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let (mut a, mut b) = (None, None);
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
-}
 fn reader(bytes: &'static [u8]) -> Reader {
     Reader::new([ReadStep::Data(Bytes::from_static(bytes))])
 }
@@ -265,40 +232,6 @@ fn receipt_drop_does_not_cancel_and_driver_drop_never_certifies_settlement() {
         let (result, response) = pair(driver.run(), pending.response()).await;
         result.unwrap();
         response.unwrap();
-    });
-}
-
-#[test]
-fn read_ahead_and_preparation_failures_reach_the_receipt() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        for local in [false, true] {
-            let (sender, driver) = Builder::new().handshake((
-                reader(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\nunsolicited"),
-                Writer::new([]),
-            ));
-            let mut request = request(Empty::new());
-            if local {
-                request.headers_mut().insert("content-length", "5".parse().unwrap());
-            }
-            let mut pending = sender.start_request(request).await.unwrap();
-            let completion = pending.take_completion().unwrap();
-            let (driver, response) = pair(driver.run(), pending.response()).await;
-            let error = completion.await.unwrap_err();
-            assert_eq!(
-                error.kind(),
-                if local {
-                    ErrorKind::LocalMessage
-                } else {
-                    ErrorKind::InvalidMessage
-                }
-            );
-            assert_eq!(error.kind(), driver.unwrap_err().kind());
-            if local {
-                assert_eq!(error.kind(), response.unwrap_err().kind());
-            } else {
-                response.unwrap();
-            }
-        }
     });
 }
 

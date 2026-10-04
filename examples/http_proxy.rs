@@ -19,7 +19,7 @@ use karmaio::{
 };
 use vakya::{
     Method, Request, Response, StatusCode,
-    body::{BodyExt, BoxBody, Empty, Full, Incoming},
+    body::{BodyExt, BoxBody, Empty, Full, Incoming, IncomingData},
     client::conn::http1::Builder as ClientBuilder,
     error::Error,
     server::{RequestContext, conn::http1::Builder as ServerBuilder},
@@ -88,7 +88,7 @@ fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
 }
 
 fn map_bytes(body: Incoming) -> impl vakya::body::Body<Data = Bytes, Error = Error> {
-    body.map_frame(|frame| frame.map_data(|data| Bytes::copy_from_slice(data.as_ref())))
+    body.map_data(IncomingData::into_bytes)
 }
 
 fn empty() -> BoxBody<'static, Bytes, Error> {

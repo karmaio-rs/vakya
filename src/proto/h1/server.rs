@@ -1,6 +1,7 @@
 use super::{
     BodyMode, Expectation, Persistence,
-    bridge::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
+    activity::{ReceiveResources, TransmitResources},
+    body_io::{ReceiveEnd, SendBodyError, incoming, receive_body_configured, send_body},
     decode::BodyDecoder,
     encode::{BodyEncoder, BodyMetadata, prepare_response_head},
     exchange::{ActivityEnd, ExchangePolicy, Outcome},
@@ -8,7 +9,7 @@ use super::{
     header_case::HeaderCaseMap,
 };
 use crate::{
-    body::{Body, Incoming, SizeHint, TrailerHint},
+    body::{Body, Incoming, SizeHint, TrailerHint, incoming::IncomingProducer},
     connection::{ConnectionOutcome, ConnectionParts},
     error::{Error, ErrorDetail, ErrorKind, LimitKind, TimeoutPhase},
     future::{Race, WorkBudget, cancellable_wait, race},
@@ -164,10 +165,16 @@ where
         let span = exchanges.next();
         let (result, returned) = span
             .instrument(exchange(
-                &mut reader,
-                &mut writer,
-                &mut strategy,
-                buffer,
+                ReceiveResources {
+                    reader: &mut reader,
+                    strategy: &mut strategy,
+                    buffer,
+                    parser: BodyDecoder::with_limits(head.body, config.protocol.decode),
+                },
+                TransmitResources {
+                    writer: &mut writer,
+                    encoding: config.protocol.encode,
+                },
                 head,
                 &service,
                 &config,
@@ -226,10 +233,8 @@ struct ExchangeResult {
 
 #[allow(clippy::too_many_arguments)] // Explicit disjoint connection resources; no shared driver allocation.
 async fn exchange<R, W, S, B, T>(
-    reader: &mut R,
-    writer: &mut W,
-    strategy: &mut T,
-    buffer: RecvBuffer,
+    resources: ReceiveResources<'_, R, T, BodyDecoder>,
+    mut transmit: TransmitResources<'_, W>,
     head: ValidatedRequestHead,
     service: &S,
     config: &ServerConfig,
@@ -247,66 +252,20 @@ where
     let mut state = ExchangePolicy::new(&head, config.protocol.max_informational);
     let method = head.head.method.clone();
     let version = head.head.version;
+    let expect_continue = head.expectation == Expectation::Continue && version == Version::HTTP_11;
     let (context, informationals, upgrade) = context::channel(head.persistence == Persistence::Close);
     let close = informationals.close_flag();
     let (producer, body) = incoming(head.body);
-    let body = body.with_drain_config(config.drain);
-    let mut request = Request::new(body);
-    #[cfg(feature = "tls")]
-    if let Some(info) = &config.tls_info {
-        request.extensions_mut().insert(info.clone());
-    }
-    if let Some(header_case) = head.head.header_case {
-        request.extensions_mut().insert(header_case);
-    }
-    *request.method_mut() = head.head.method;
-    *request.uri_mut() = head.head.target;
-    *request.version_mut() = version;
-    *request.headers_mut() = head.head.headers;
-    let receive = async {
-        match producer {
-            Some(mut producer) => {
-                if head.expectation == Expectation::Continue && version == Version::HTTP_11 {
-                    match cancellable_wait(producer.demand(), Some(source.token())).await {
-                        Some(Ok(())) => {}
-                        Some(Err(_)) => return (ReceiveEnd::Abandoned, buffer),
-                        None => {
-                            return (
-                                ReceiveEnd::fail(producer, Error::new(ErrorKind::Canceled, "request receive canceled")),
-                                buffer,
-                            );
-                        }
-                    }
-                    match cancellable_wait(informationals.continue_permission(), Some(source.token())).await {
-                        Some(Ok(())) => {}
-                        Some(Err(error)) => return (ReceiveEnd::fail(producer, error), buffer),
-                        None => {
-                            return (
-                                ReceiveEnd::fail(producer, Error::new(ErrorKind::Canceled, "Continue demand canceled")),
-                                buffer,
-                            );
-                        }
-                    }
-                }
-                receive_body_configured(
-                    reader,
-                    strategy,
-                    buffer,
-                    BodyDecoder::with_limits(head.body, config.protocol.decode),
-                    producer,
-                    Some(source.token()),
-                    config.body_progress_timeout,
-                )
-                .await
-            }
-            None => (ReceiveEnd::Complete, buffer),
-        }
-    };
+    let request = request_message(head.head, body, config);
+    let receive = receive_request(resources, producer, expect_continue, &informationals, config, source);
     let mut receive = pin!(receive);
     let mut received = None;
+
+    // Select a final response while receive, the service, and the sole
+    // informational writer progress. A service failure still settles receive.
     let response = {
         let mut call = pin!(call_service(
-            writer,
+            &mut transmit,
             service,
             request,
             context,
@@ -353,9 +312,20 @@ where
     if matches!(received, Some((ReceiveEnd::Abandoned, _))) {
         close.set(true);
     }
+
+    // Continue request reception during final transmission. Every path awaits
+    // both retained directions before composing policy or returning the buffer.
     let sent = {
         let send = write_response(
-            writer, response, &method, version, close, date, config, source, &mut state,
+            &mut transmit,
+            response,
+            &method,
+            version,
+            close,
+            date,
+            config,
+            source,
+            &mut state,
         );
         let mut send = pin!(send);
         if received.is_some() {
@@ -382,32 +352,107 @@ where
         Some(result) => result,
         None => receive.await,
     };
-    match sent {
-        Ok(_) => {}
-        Err(error) => return (Err(error), buffer),
+    if let Err(error) = sent {
+        return (Err(error), buffer);
+    }
+    (finish_exchange(end, state, close.get(), upgrade), buffer)
+}
+
+fn request_message(head: RequestHead, body: Incoming, config: &ServerConfig) -> Request<Incoming> {
+    let mut request = Request::new(body.with_drain_config(config.drain));
+    #[cfg(feature = "tls")]
+    if let Some(info) = &config.tls_info {
+        request.extensions_mut().insert(info.clone());
+    }
+    if let Some(header_case) = head.header_case {
+        request.extensions_mut().insert(header_case);
+    }
+    *request.method_mut() = head.method;
+    *request.uri_mut() = head.target;
+    *request.version_mut() = head.version;
+    *request.headers_mut() = head.headers;
+    request
+}
+
+/// Owns only receive resources; Continue permission precedes transport reads.
+async fn receive_request<R, T: Receive<R>>(
+    resources: ReceiveResources<'_, R, T, BodyDecoder>,
+    producer: Option<IncomingProducer>,
+    expect_continue: bool,
+    informationals: &InformationalReceiver,
+    config: &ServerConfig,
+    source: &CancellationSource,
+) -> (ReceiveEnd, RecvBuffer) {
+    let ReceiveResources {
+        reader,
+        strategy,
+        buffer,
+        parser,
+    } = resources;
+    let Some(mut producer) = producer else {
+        return (ReceiveEnd::Complete, buffer);
     };
+    if expect_continue {
+        match cancellable_wait(producer.demand(), Some(source.token())).await {
+            Some(Ok(())) => {}
+            Some(Err(_)) => return (ReceiveEnd::Abandoned, buffer),
+            None => {
+                return (
+                    ReceiveEnd::fail(producer, Error::new(ErrorKind::Canceled, "request receive canceled")),
+                    buffer,
+                );
+            }
+        }
+        match cancellable_wait(informationals.continue_permission(), Some(source.token())).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return (ReceiveEnd::fail(producer, error), buffer),
+            None => {
+                return (
+                    ReceiveEnd::fail(producer, Error::new(ErrorKind::Canceled, "Continue demand canceled")),
+                    buffer,
+                );
+            }
+        }
+    }
+    receive_body_configured(
+        reader,
+        strategy,
+        buffer,
+        parser,
+        producer,
+        Some(source.token()),
+        config.body_progress_timeout,
+    )
+    .await
+}
+
+/// Called only after final transmission and request reception have settled.
+fn finish_exchange(
+    end: ReceiveEnd,
+    mut state: ExchangePolicy,
+    close: bool,
+    upgrade: PendingUpgrade,
+) -> Result<ExchangeResult, Error> {
     let request_end = match end {
-        ReceiveEnd::Failed(error) => return (Err(error), buffer),
+        ReceiveEnd::Failed(error) => return Err(error),
         ReceiveEnd::Abandoned => ActivityEnd::Retired,
         ReceiveEnd::Complete => ActivityEnd::Complete,
     };
-    if close.get() {
+    if close {
         state.close_after_exchange();
     }
-    let result = state
+    state
         .finish(request_end, ActivityEnd::Complete)
         .map(|outcome| ExchangeResult {
             outcome,
             upgrade,
             recoverable: request_end == ActivityEnd::Complete,
-        });
-
-    (result, buffer)
+        })
 }
 
 #[allow(clippy::too_many_arguments)] // Service and the sole head writer progress in the same scope.
 async fn call_service<W, S, B>(
-    writer: &mut W,
+    transmit: &mut TransmitResources<'_, W>,
     service: &S,
     request: Request<Incoming>,
     context: RequestContext,
@@ -422,7 +467,7 @@ where
     S::Error: std::error::Error + 'static,
 {
     let mut call = pin!(cancellable_wait(service.call((request, context)), Some(source.token())));
-    let mut heads = pin!(write_informationals(writer, informationals, version, config, source));
+    let mut heads = pin!(write_informationals(transmit, informationals, version, config, source));
     match race(call.as_mut(), heads.as_mut()).await {
         Race::First(result) => {
             informationals.select_final();
@@ -450,13 +495,15 @@ where
 }
 
 async fn write_informationals<W: AsyncWrite>(
-    writer: &mut W,
+    transmit: &mut TransmitResources<'_, W>,
     receiver: &InformationalReceiver,
     version: Version,
     config: &ServerConfig,
     source: &CancellationSource,
 ) -> Result<(), Error> {
     use karmaio::runtime::FutureExt;
+    let encoding = transmit.encoding;
+    let writer = &mut *transmit.writer;
     let mut count = 0;
     loop {
         let command = match cancellable_wait(receiver.next(), Some(source.token())).await {
@@ -485,7 +532,7 @@ async fn write_informationals<W: AsyncWrite>(
             }
             let (parts, ()) = response.into_parts();
             let original_case = parts.extensions.get::<HeaderCaseMap>();
-            let (head, _) = prepare_response_head(
+            let head = prepare_response_head(
                 parts.status,
                 parts.version,
                 parts.headers,
@@ -495,7 +542,7 @@ async fn write_informationals<W: AsyncWrite>(
                     trailers: TrailerHint::None,
                 },
                 &Method::GET,
-                config.protocol.encode,
+                encoding,
             )?;
             Ok(head)
         })();
@@ -535,7 +582,7 @@ async fn write_informationals<W: AsyncWrite>(
 
 #[allow(clippy::too_many_arguments)] // Scoped writer state, all borrowed rather than cloned or shared.
 async fn write_response<W: AsyncWrite, B: Body>(
-    writer: &mut W,
+    transmit: &mut TransmitResources<'_, W>,
     response: Response<B>,
     method: &Method,
     request_version: Version,
@@ -548,6 +595,8 @@ async fn write_response<W: AsyncWrite, B: Body>(
 where
     B::Error: std::error::Error + 'static,
 {
+    let encoding = transmit.encoding;
+    let writer = &mut *transmit.writer;
     let (mut parts, mut body) = response.into_parts();
     if parts.status.is_informational() && parts.status != http::StatusCode::SWITCHING_PROTOCOLS {
         return Err(Error::new(
@@ -571,29 +620,31 @@ where
         trailers: body.trailer_hint(),
     };
     let original_case = parts.extensions.get::<HeaderCaseMap>();
-    let (head, validated) = prepare_response_head(
+    let plan = prepare_response_head(
         parts.status,
         version,
         parts.headers,
         original_case,
         metadata,
         method,
-        config.protocol.encode,
+        encoding,
     )?;
-    if head.upgrade.is_some() && close.get() {
+    let mode = plan.head.body;
+    let persistence = plan.head.persistence;
+    if plan.head.upgrade.is_some() && close.get() {
         return Err(Error::new(
             ErrorKind::Upgrade,
             "closing exchange cannot transfer transport ownership",
         ));
     }
-    state.sent_response(&validated)?;
-    crate::trace::response_head(validated.head.status.as_u16());
-    drop(validated); // The encoded bytes and exchange decisions now own what is needed.
-    let mut encoder = BodyEncoder::new(head.mode, metadata, config.protocol.encode)?;
-    let (result, _) = write_all(writer, head.bytes, Some(source.token())).await.into_parts();
+    state.sent_response(&plan.head)?;
+    crate::trace::response_head(plan.head.head.status.as_u16());
+    drop(plan.head); // The wire bytes and exchange policy now own what is needed.
+    let mut encoder = BodyEncoder::new(mode, metadata, encoding)?;
+    let (result, _) = write_all(writer, plan.bytes, Some(source.token())).await.into_parts();
     result?;
     // HEAD and 304 metadata describes a representation, not a producer to poll.
-    if head.mode != BodyMode::None {
+    if mode != BodyMode::None {
         send_body(writer, &mut body, &mut encoder, Some(source.token()))
             .await
             .map_err(|error| match error {
@@ -607,7 +658,7 @@ where
     // is considered sent. Apply the scope before this operation is first polled.
     use karmaio::runtime::FutureExt;
     writer.flush().with_cancellation(source.token()).await?;
-    Ok(head.persistence)
+    Ok(persistence)
 }
 
 async fn reply_illegal_head<W: AsyncWrite>(
@@ -631,7 +682,7 @@ async fn reply_illegal_head<W: AsyncWrite>(
     if config.auto_date {
         headers.insert(DATE, date.value());
     }
-    let Ok((head, _)) = prepare_response_head(
+    let Ok(head) = prepare_response_head(
         status,
         Version::HTTP_11,
         headers,

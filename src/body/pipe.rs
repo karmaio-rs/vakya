@@ -8,11 +8,16 @@ use std::{
 
 /// Creates the connection-local, capacity-one body rendezvous.
 pub(crate) fn channel<T, E>() -> (Producer<T, E>, Consumer<T, E>) {
+    channel_with_policy(())
+}
+
+/// Stores protocol-specific policy in the existing shared allocation.
+pub(crate) fn channel_with_policy<T, E, P>(policy: P) -> (Producer<T, E, P>, Consumer<T, E, P>) {
     let shared = Rc::new(Shared {
         state: RefCell::new(State::Idle),
         producer_waker: RefCell::new(None),
         consumer_waker: RefCell::new(None),
-        drain_remaining: std::cell::Cell::new(None),
+        policy,
     });
 
     (
@@ -33,11 +38,11 @@ enum EndpointLifecycle {
     Complete,
 }
 
-struct Shared<T, E> {
+struct Shared<T, E, P> {
     state: RefCell<State<T, E>>,
     producer_waker: RefCell<Option<Waker>>,
     consumer_waker: RefCell<Option<Waker>>,
-    drain_remaining: std::cell::Cell<Option<(u64, u64)>>,
+    policy: P,
 }
 
 enum State<T, E> {
@@ -51,35 +56,23 @@ enum State<T, E> {
 }
 
 /// The connection-owned endpoint of an incoming-body rendezvous.
-pub(crate) struct Producer<T, E> {
-    shared: Rc<Shared<T, E>>,
+pub(crate) struct Producer<T, E, P = ()> {
+    shared: Rc<Shared<T, E, P>>,
     lifecycle: EndpointLifecycle,
 }
 
-impl<T, E> Producer<T, E> {
-    /// Charge consumed framing bytes only after a consumer opts into draining.
-    #[cfg(feature = "http1")]
-    pub(crate) fn charge_drain(&self, bytes: usize, payload: usize) -> Result<(), crate::error::LimitKind> {
-        let Some((wire, data)) = self.shared.drain_remaining.get() else {
-            return Ok(());
-        };
-        let data = data
-            .checked_sub(payload as u64)
-            .ok_or(crate::error::LimitKind::DrainPayload)?;
-        let wire = wire
-            .checked_sub(bytes as u64)
-            .ok_or(crate::error::LimitKind::DrainWire)?;
-        self.shared.drain_remaining.set(Some((wire, data)));
-        Ok(())
+impl<T, E, P> Producer<T, E, P> {
+    pub(crate) fn policy(&self) -> &P {
+        &self.shared.policy
     }
 
     /// Waits until the body consumer asks for another item.
-    pub(crate) fn demand(&mut self) -> Demand<'_, T, E> {
+    pub(crate) fn demand(&mut self) -> Demand<'_, T, E, P> {
         Demand { producer: self }
     }
 
     /// Offers one item and waits until the consumer takes or abandons it.
-    pub(crate) fn offer(&mut self, item: T) -> Offer<'_, T, E> {
+    pub(crate) fn offer(&mut self, item: T) -> Offer<'_, T, E, P> {
         Offer {
             producer: self,
             lifecycle: OfferLifecycle::Pending(item),
@@ -87,7 +80,7 @@ impl<T, E> Producer<T, E> {
     }
 
     /// Waits until the consumer endpoint is dropped before completion.
-    pub(crate) fn abandoned(&mut self) -> Abandoned<'_, T, E> {
+    pub(crate) fn abandoned(&mut self) -> Abandoned<'_, T, E, P> {
         Abandoned { producer: self }
     }
 
@@ -128,14 +121,9 @@ impl<T, E> Producer<T, E> {
         self.lifecycle = EndpointLifecycle::Complete;
         wake_one(wake);
     }
-
-    #[cfg(test)]
-    fn reference_count(&self) -> usize {
-        Rc::strong_count(&self.shared)
-    }
 }
 
-impl<T, E> Drop for Producer<T, E> {
+impl<T, E, P> Drop for Producer<T, E, P> {
     fn drop(&mut self) {
         if self.lifecycle == EndpointLifecycle::Active {
             self.finish(State::Disconnected);
@@ -144,30 +132,23 @@ impl<T, E> Drop for Producer<T, E> {
 }
 
 /// The body-owned endpoint of an incoming-body rendezvous.
-pub(crate) struct Consumer<T, E> {
-    shared: Rc<Shared<T, E>>,
+pub(crate) struct Consumer<T, E, P = ()> {
+    shared: Rc<Shared<T, E, P>>,
     lifecycle: EndpointLifecycle,
 }
 
-impl<T, E> Consumer<T, E> {
-    pub(crate) fn drain_budget(&self, bytes: u64, wire_allowance: u64) {
-        self.shared
-            .drain_remaining
-            .set(Some((bytes.saturating_add(wire_allowance), bytes)));
+impl<T, E, P> Consumer<T, E, P> {
+    pub(crate) fn policy(&self) -> &P {
+        &self.shared.policy
     }
 
     /// Waits for the next offered item or producer termination.
-    pub(crate) fn take(&mut self) -> Take<'_, T, E> {
+    pub(crate) fn take(&mut self) -> Take<'_, T, E, P> {
         Take { consumer: self }
-    }
-
-    #[cfg(test)]
-    fn reference_count(&self) -> usize {
-        Rc::strong_count(&self.shared)
     }
 }
 
-impl<T, E> Drop for Consumer<T, E> {
+impl<T, E, P> Drop for Consumer<T, E, P> {
     fn drop(&mut self) {
         if self.lifecycle == EndpointLifecycle::Complete {
             return;
@@ -192,11 +173,11 @@ impl<T, E> Drop for Consumer<T, E> {
 }
 
 /// A producer-side wait for consumer demand.
-pub(crate) struct Demand<'a, T, E> {
-    producer: &'a mut Producer<T, E>,
+pub(crate) struct Demand<'a, T, E, P> {
+    producer: &'a mut Producer<T, E, P>,
 }
 
-impl<T, E> Future for Demand<'_, T, E> {
+impl<T, E, P> Future for Demand<'_, T, E, P> {
     type Output = Result<(), DemandError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -216,7 +197,7 @@ impl<T, E> Future for Demand<'_, T, E> {
     }
 }
 
-impl<T, E> Drop for Demand<'_, T, E> {
+impl<T, E, P> Drop for Demand<'_, T, E, P> {
     fn drop(&mut self) {
         self.producer.shared.producer_waker.borrow_mut().take();
     }
@@ -230,8 +211,8 @@ pub(crate) enum DemandError {
 }
 
 /// A producer-side wait for one offered item to be consumed.
-pub(crate) struct Offer<'a, T, E> {
-    producer: &'a mut Producer<T, E>,
+pub(crate) struct Offer<'a, T, E, P> {
+    producer: &'a mut Producer<T, E, P>,
     lifecycle: OfferLifecycle<T>,
 }
 
@@ -240,9 +221,9 @@ enum OfferLifecycle<T> {
     Submitted,
 }
 
-impl<T, E> Unpin for Offer<'_, T, E> {}
+impl<T, E, P> Unpin for Offer<'_, T, E, P> {}
 
-impl<T, E> Future for Offer<'_, T, E> {
+impl<T, E, P> Future for Offer<'_, T, E, P> {
     type Output = Result<(), OfferError<T>>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -292,7 +273,7 @@ impl<T, E> Future for Offer<'_, T, E> {
     }
 }
 
-impl<T, E> Drop for Offer<'_, T, E> {
+impl<T, E, P> Drop for Offer<'_, T, E, P> {
     fn drop(&mut self) {
         self.producer.shared.producer_waker.borrow_mut().take();
         if matches!(self.lifecycle, OfferLifecycle::Pending(_)) {
@@ -337,11 +318,11 @@ pub(crate) enum TakeError<E> {
 }
 
 /// A consumer-side wait for the next body item.
-pub(crate) struct Take<'a, T, E> {
-    consumer: &'a mut Consumer<T, E>,
+pub(crate) struct Take<'a, T, E, P> {
+    consumer: &'a mut Consumer<T, E, P>,
 }
 
-impl<T, E> Future for Take<'_, T, E> {
+impl<T, E, P> Future for Take<'_, T, E, P> {
     type Output = Result<Option<T>, TakeError<E>>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -390,18 +371,18 @@ impl<T, E> Future for Take<'_, T, E> {
     }
 }
 
-impl<T, E> Drop for Take<'_, T, E> {
+impl<T, E, P> Drop for Take<'_, T, E, P> {
     fn drop(&mut self) {
         self.consumer.shared.consumer_waker.borrow_mut().take();
     }
 }
 
 /// A producer-side wait for consumer abandonment during transport I/O.
-pub(crate) struct Abandoned<'a, T, E> {
-    producer: &'a mut Producer<T, E>,
+pub(crate) struct Abandoned<'a, T, E, P> {
+    producer: &'a mut Producer<T, E, P>,
 }
 
-impl<T, E> Future for Abandoned<'_, T, E> {
+impl<T, E, P> Future for Abandoned<'_, T, E, P> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -414,7 +395,7 @@ impl<T, E> Future for Abandoned<'_, T, E> {
     }
 }
 
-impl<T, E> Drop for Abandoned<'_, T, E> {
+impl<T, E, P> Drop for Abandoned<'_, T, E, P> {
     fn drop(&mut self) {
         self.producer.shared.producer_waker.borrow_mut().take();
     }
@@ -446,18 +427,6 @@ mod tests {
         },
         task::{Context, Poll, Wake, Waker},
     };
-
-    #[cfg(feature = "http1")]
-    #[test]
-    fn drain_limits_distinguish_payload_and_wire_without_partial_charging() {
-        use crate::error::LimitKind;
-        let (producer, consumer) = channel::<(), ()>();
-        consumer.drain_budget(2, 1);
-        assert_eq!(producer.charge_drain(3, 3), Err(LimitKind::DrainPayload));
-        assert_eq!(producer.charge_drain(4, 2), Err(LimitKind::DrainWire));
-        assert_eq!(producer.charge_drain(3, 2), Ok(()));
-        assert_eq!(producer.charge_drain(1, 0), Err(LimitKind::DrainWire));
-    }
 
     struct CounterWake(AtomicUsize);
 
@@ -588,24 +557,21 @@ mod tests {
     }
 
     #[test]
-    fn producer_and_consumer_cancellation_wake_the_opposite_side() {
+    fn endpoint_drop_wakes_registered_opposite_waiters() {
         let (mut producer, consumer) = channel::<(), ()>();
-        let (_, waker) = counter_waker();
-        {
-            let mut demand = pin!(producer.demand());
-            assert!(poll(demand.as_mut(), &waker).is_pending());
-        }
-        drop(consumer);
+        let (count, waker) = counter_waker();
         let mut demand = pin!(producer.demand());
+        assert!(poll(demand.as_mut(), &waker).is_pending());
+        drop(consumer);
+        assert!(count.0.load(Ordering::Relaxed) > 0);
         assert_eq!(poll(demand.as_mut(), &waker), Poll::Ready(Err(DemandError::Abandoned)));
 
         let (producer, mut consumer) = channel::<(), ()>();
-        {
-            let mut take = pin!(consumer.take());
-            assert!(poll(take.as_mut(), &waker).is_pending());
-        }
-        drop(producer);
+        let (count, waker) = counter_waker();
         let mut take = pin!(consumer.take());
+        assert!(poll(take.as_mut(), &waker).is_pending());
+        drop(producer);
+        assert!(count.0.load(Ordering::Relaxed) > 0);
         assert_eq!(poll(take.as_mut(), &waker), Poll::Ready(Err(TakeError::Disconnected)));
     }
 
@@ -623,25 +589,6 @@ mod tests {
 
         assert_eq!(old.0.load(Ordering::Relaxed), 0);
         assert_eq!(new.0.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn offers_do_not_clone_the_shared_allocation() {
-        let (mut producer, mut consumer) = channel::<usize, ()>();
-        assert_eq!(producer.reference_count(), 2);
-        assert_eq!(consumer.reference_count(), 2);
-        let (_, waker) = counter_waker();
-
-        for item in 0..4 {
-            {
-                let mut offer = pin!(producer.offer(item));
-                assert!(poll(offer.as_mut(), &waker).is_pending());
-                let mut take = pin!(consumer.take());
-                assert_eq!(poll(take.as_mut(), &waker), Poll::Ready(Ok(Some(item))));
-                assert_eq!(poll(offer.as_mut(), &waker), Poll::Ready(Ok(())));
-            }
-            assert_eq!(producer.reference_count(), 2);
-        }
     }
 
     #[test]

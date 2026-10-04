@@ -8,93 +8,25 @@ use karmaio::{
 use std::{
     cell::{Cell, RefCell},
     convert::Infallible,
-    future::{Future, poll_fn},
+    future::Future,
     io,
-    pin::{Pin, pin},
+    pin::pin,
     rc::Rc,
-    task::{Context, Poll, Waker},
 };
+use support::future::{pair, poll};
 use support::transport::{Gate, ReadStep, Reader, Writer};
+use support::transport::{ObservedWriter, output};
 use vakya::{
     Request, Response,
     body::{Body, Empty, Frame, Incoming, SizeHint, TrailerHint},
     client::conn::http1::Builder as Client,
     connection::ConnectionOutcome,
-    error::{Error, ErrorKind},
+    error::{Error, ErrorDetail, ErrorKind, LimitKind},
     server::{RequestContext, conn::http1::Builder as Server},
     service::service_fn,
 };
-struct ObservedWriter {
-    writer: Writer,
-    output: Rc<RefCell<Vec<u8>>>,
-}
-impl ObservedWriter {
-    fn new() -> (Self, Rc<RefCell<Vec<u8>>>) {
-        let output = Rc::new(RefCell::new(Vec::new()));
-        (
-            Self {
-                writer: Writer::limited(3),
-                output: output.clone(),
-            },
-            output,
-        )
-    }
-    fn record(&self) {
-        let mut output = self.output.borrow_mut();
-        let start = output.len();
-        output.extend_from_slice(&self.writer.output[start..]);
-    }
-}
-impl AsyncWrite for ObservedWriter {
-    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
-        let result = self.writer.write(buffer).await;
-        self.record();
-        result
-    }
-    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
-        let result = self.writer.write_vectored(buffers).await;
-        self.record();
-        result
-    }
-    async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
-    }
-    async fn shutdown(&mut self) -> io::Result<()> {
-        self.writer.shutdown().await
-    }
-}
 fn reader(bytes: &'static [u8]) -> Reader {
     Reader::new([ReadStep::Data(Bytes::from_static(bytes))])
-}
-fn output(bytes: &Rc<RefCell<Vec<u8>>>) -> String {
-    String::from_utf8(bytes.borrow().clone()).unwrap()
-}
-fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let mut a = None;
-    let mut b = None;
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }
 
 #[test]
@@ -124,7 +56,7 @@ fn graceful_stops_client_admission_but_finishes_accepted_work() {
 }
 
 #[test]
-fn abort_drops_pending_service_and_closes_reservations() {
+fn abort_terminates_pending_service_and_closes_reservations() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let gate = Gate::default();
         let called = Cell::new(false);
@@ -266,53 +198,6 @@ fn tcp_head_and_demanded_body_timeouts_cancel_real_reads() {
             };
             let (result, ()) = pair(connection.run(), app).await;
             assert_eq!(result.unwrap_err().kind(), ErrorKind::Timeout);
-        }
-    });
-}
-
-#[test]
-fn draining_enforces_payload_and_framing_budgets() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        for (wire, limit, success) in [
-            (b"4\r\nbody\r\n0\r\nx-end: yes\r\n\r\n".to_vec(), 4, true),
-            (b"4\r\nbody\r\n0\r\n\r\n".to_vec(), 3, false),
-            // Valid tiny chunks spend substantially more framing than payload.
-            (
-                [b"1;".as_slice(), &vec![b'a'; 8000], b"\r\nx\r\n"].concat().repeat(9),
-                9,
-                false,
-            ),
-        ] {
-            let input = [
-                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".as_slice(),
-                &wire,
-            ]
-            .concat();
-            let (sender, connection) = Client::new()
-                .handshake::<_, Empty>((Reader::new([ReadStep::Data(Bytes::from(input))]), Writer::new([])));
-            let pending = sender
-                .start_request(
-                    Request::builder()
-                        .uri("/")
-                        .header("host", "example")
-                        .body(Empty::new())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let app = async {
-                let response = pending.response().await.unwrap();
-                let result = response.into_body().drain(limit).await;
-                if success {
-                    result.unwrap();
-                } else {
-                    assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
-                }
-            };
-            let (driver, ()) = pair(connection.run(), app).await;
-            if success {
-                driver.unwrap();
-            }
         }
     });
 }
@@ -736,10 +621,25 @@ fn both_roles_flush_heads_and_streamed_data_before_production_finishes() {
 }
 
 #[test]
-fn configured_drain_wire_allowance_reaches_both_roles() {
+fn draining_enforces_payload_and_wire_budgets_in_both_roles() {
+    fn check<T>(result: Result<T, Error>, expected: Option<LimitKind>) {
+        match (result, expected) {
+            (Ok(_), None) => {}
+            (Err(error), Some(limit)) => {
+                assert_eq!(error.kind(), ErrorKind::Limit);
+                assert_eq!(error.detail(), Some(ErrorDetail::IncomingLimit(limit)));
+            }
+            (Err(error), None) => panic!("unexpected drain failure: {error}"),
+            (Ok(_), Some(limit)) => panic!("missing {limit:?} failure"),
+        }
+    }
     karmaio::Runtime::new().unwrap().block_on(async {
-        for allowance in [0, 64] {
-            let wire = b"1\r\nx\r\n0\r\n\r\n";
+        for (wire, payload_limit, allowance, expected) in [
+            (b"4\r\nbody\r\n0\r\nx-end: yes\r\n\r\n".as_slice(), 4, 64, None),
+            (b"4\r\nbody\r\n0\r\n\r\n", 3, 64, Some(LimitKind::DrainPayload)),
+            (b"1\r\nx\r\n0\r\n\r\n", 1, 0, Some(LimitKind::DrainWire)),
+            (b"1\r\nx\r\n0\r\n\r\n", 1, 64, None),
+        ] {
             let input = [
                 b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".as_slice(),
                 wire,
@@ -760,28 +660,21 @@ fn configured_drain_wire_allowance_reaches_both_roles() {
                 .await
                 .unwrap();
             let app = async {
-                let result = pending.response().await.unwrap().into_body().drain(1).await;
-                if allowance == 0 {
-                    assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
-                } else {
-                    result.unwrap();
-                }
+                check(
+                    pending.response().await.unwrap().into_body().drain(payload_limit).await,
+                    expected,
+                );
             };
             let (result, ()) = pair(connection.run(), app).await;
-            if allowance != 0 {
-                result.unwrap();
-            }
+            check(result, expected);
 
-            let observed = Cell::new(false);
+            // Observe draining outside the service: receive failure may cancel
+            // the service before its drain wait observes the producer error.
+            let retained = RefCell::new(None);
+            let admitted = Gate::default();
             let service = service_fn(async |(request, _): (Request<Incoming>, RequestContext)| {
-                observed.set(true);
-                let result = request.into_body().drain(1).await;
-                if allowance == 0 {
-                    assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
-                } else {
-                    result.unwrap();
-                }
-                observed.set(true);
+                retained.replace(Some(request.into_body()));
+                admitted.open();
                 Ok::<_, Infallible>(Response::new(Empty::new()))
             });
             let input = [
@@ -792,19 +685,17 @@ fn configured_drain_wire_allowance_reaches_both_roles() {
             .concat();
             let mut server = Server::new();
             server.drain_wire_allowance(allowance);
-            let result = server
-                .serve_connection(
-                    (Reader::new([ReadStep::Data(Bytes::from(input))]), Writer::new([])),
-                    service,
-                )
-                .run()
-                .await;
-            if allowance != 0 {
-                result.unwrap();
-            } else {
-                assert_eq!(result.unwrap_err().kind(), ErrorKind::Limit);
-            }
-            assert!(observed.get());
+            let connection = server.serve_connection(
+                (Reader::new([ReadStep::Data(Bytes::from(input))]), Writer::new([])),
+                service,
+            );
+            let app = async {
+                admitted.wait().await;
+                let body = retained.borrow_mut().take().unwrap();
+                check(body.drain(payload_limit).await, expected);
+            };
+            let (result, ()) = pair(connection.run(), app).await;
+            check(result, expected);
         }
     });
 }
@@ -843,8 +734,22 @@ fn asymmetric_head_limits_are_enforced_in_both_roles() {
                     .unwrap(),
             );
             let (driver, response) = pair(connection.run(), app).await;
-            assert_eq!(driver.is_ok(), success);
-            assert_eq!(response.is_ok(), success);
+            let expected = if peer_large {
+                ErrorDetail::IncomingLimit(LimitKind::HeadBytes)
+            } else {
+                ErrorDetail::OutgoingLimit(LimitKind::HeadBytes)
+            };
+            if success {
+                driver.unwrap();
+                response.unwrap();
+            } else {
+                let error = driver.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Limit);
+                assert_eq!(error.detail(), Some(expected));
+                let error = response.unwrap_err();
+                assert_eq!(error.error().kind(), ErrorKind::Limit);
+                assert_eq!(error.error().detail(), Some(expected));
+            }
 
             let request = format!("GET / HTTP/1.1\r\nhost: example\r\nconnection: close\r\n{peer_header}\r\n");
             let mut server = Server::new();
@@ -868,7 +773,13 @@ fn asymmetric_head_limits_are_enforced_in_both_roles() {
                 )
                 .run()
                 .await;
-            assert_eq!(result.is_ok(), success);
+            if success {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Limit);
+                assert_eq!(error.detail(), Some(expected));
+            }
         }
     });
 }

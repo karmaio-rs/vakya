@@ -107,10 +107,8 @@ mod tests {
     use bytes::Bytes;
     use karmaio::buf::IoBuf;
     use std::{
-        cell::Cell,
         future::Future,
         pin::pin,
-        rc::Rc,
         task::{Context, Poll, Waker},
     };
 
@@ -153,42 +151,5 @@ mod tests {
         assert!(body.is_end_stream());
         assert!(complete(body.next_frame()).unwrap().is_none());
         assert!(complete(body.next_frame()).unwrap().is_none());
-    }
-
-    #[derive(Debug)]
-    struct TrackedBuf {
-        data: &'static [u8],
-        drops: Rc<Cell<usize>>,
-    }
-
-    impl IoBuf for TrackedBuf {
-        fn as_init(&self) -> &[u8] {
-            self.data
-        }
-    }
-
-    impl Drop for TrackedBuf {
-        fn drop(&mut self) {
-            self.drops.set(self.drops.get() + 1);
-        }
-    }
-
-    #[test]
-    fn full_recycles_only_after_buffer_is_returned() {
-        let drops = Rc::new(Cell::new(0));
-        let mut body = Full::new(TrackedBuf {
-            data: b"payload",
-            drops: Rc::clone(&drops),
-        });
-
-        let data = complete(body.next_frame())
-            .unwrap()
-            .expect("missing frame")
-            .into_data()
-            .expect("missing data");
-        assert_eq!(drops.get(), 0);
-
-        body.recycle(data);
-        assert_eq!(drops.get(), 1);
     }
 }

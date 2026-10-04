@@ -1,13 +1,9 @@
 #![cfg(all(feature = "client", feature = "server"))]
 mod support;
+use support::future::pair;
 
 use bytes::Bytes;
-use std::{
-    convert::Infallible,
-    future::{Future, poll_fn},
-    pin::pin,
-    task::Poll,
-};
+use std::convert::Infallible;
 use support::transport::{ReadStep, Reader, Writer};
 use vakya::{
     Request, Response,
@@ -24,30 +20,6 @@ fn fragmented(bytes: Vec<u8>) -> Reader {
             .into_iter()
             .map(|byte| ReadStep::Data(Bytes::copy_from_slice(&[byte]))),
     )
-}
-
-async fn pair<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
-    let mut a = pin!(a);
-    let mut b = pin!(b);
-    let mut first = None;
-    let mut second = None;
-    poll_fn(|cx| {
-        if first.is_none()
-            && let Poll::Ready(value) = a.as_mut().poll(cx)
-        {
-            first = Some(value);
-        }
-        if second.is_none()
-            && let Poll::Ready(value) = b.as_mut().poll(cx)
-        {
-            second = Some(value);
-        }
-        match (first.as_ref(), second.as_ref()) {
-            (Some(_), Some(_)) => Poll::Ready((first.take().unwrap(), second.take().unwrap())),
-            _ => Poll::Pending,
-        }
-    })
-    .await
 }
 
 fn check<T>(result: Result<T, Error>, allowed: bool) {

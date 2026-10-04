@@ -517,6 +517,17 @@ mod tests {
         task::{Context, Waker},
     };
 
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct WakeCount(AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn channel() -> (PendingUpgrade, UpgradeSlot) {
         struct Owner(RefCell<UpgradeState>);
         impl UpgradeStorage for Owner {
@@ -582,17 +593,27 @@ mod tests {
             let upgraded = claim.await.unwrap().downcast::<Reader, Writer>().unwrap();
             assert_eq!(upgraded.read_ahead(), b"raw");
 
-            let (pending, mut slot) = channel();
-            drop(slot.claim_boxed());
-            let returned = pending
-                .fulfill(Upgraded {
-                    reader: Reader::new([]),
-                    writer: Writer::new([]),
-                    read_ahead: Bytes::from_static(b"fallback"),
-                    kind: UpgradeKind::Tunnel,
-                })
-                .unwrap_err();
-            assert_eq!(returned.read_ahead(), b"fallback");
+            for boxed in [false, true] {
+                let (pending, mut slot) = channel();
+                if boxed {
+                    drop(slot.claim_boxed());
+                } else {
+                    drop(slot.claim::<Reader, Writer>());
+                }
+                let returned = pending
+                    .fulfill(Upgraded {
+                        reader: Reader::new([]),
+                        writer: Writer::new([]),
+                        read_ahead: Bytes::from_static(b"fallback"),
+                        kind: UpgradeKind::Tunnel,
+                    })
+                    .unwrap_err();
+                let (reader, writer, prefix, kind) = returned.into_parts();
+                assert_eq!(reader.submissions, 0);
+                assert_eq!(writer.submissions, 0);
+                assert_eq!(prefix, b"fallback"[..]);
+                assert_eq!(kind, UpgradeKind::Tunnel);
+            }
         });
     }
 
@@ -623,16 +644,6 @@ mod tests {
 
     #[test]
     fn mismatched_claim_is_woken_when_transport_returns_to_the_driver() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-        struct WakeCount(AtomicUsize);
-        impl std::task::Wake for WakeCount {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let count = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = Waker::from(count.clone());
         let (pending, mut slot) = channel();
@@ -642,57 +653,33 @@ mod tests {
             .fulfill(Upgraded {
                 reader: Reader::new([]),
                 writer: Writer::new([]),
-                read_ahead: Bytes::new(),
+                read_ahead: Bytes::from_static(b"raw"),
                 kind: UpgradeKind::Protocol,
             })
             .unwrap_err();
-        assert_eq!(returned.kind(), UpgradeKind::Protocol);
-        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        let (reader, writer, prefix, kind) = returned.into_parts();
+        assert_eq!(reader.submissions, 0);
+        assert_eq!(writer.submissions, 0);
+        assert_eq!(prefix, b"raw"[..]);
+        assert_eq!(kind, UpgradeKind::Protocol);
+        assert!(count.0.load(Ordering::Relaxed) > 0);
         assert!(
             matches!(claim.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Err(error)) if error.kind() == ErrorKind::Upgrade)
         );
     }
 
     #[test]
-    fn mismatched_or_dropped_claims_return_transport_to_connection_ownership() {
-        karmaio::Runtime::new().unwrap().block_on(async {
-            let (pending, mut slot) = channel();
-            let upgrade = slot.claim::<(), ()>();
-            let handed_off = Upgraded {
-                reader: Reader::new([]),
-                writer: Writer::new([]),
-                read_ahead: Bytes::from_static(b"raw"),
-                kind: UpgradeKind::Protocol,
-            };
-            let returned = pending.fulfill(handed_off).unwrap_err();
-            let (reader, writer, prefix, kind) = returned.into_parts();
-            assert_eq!(reader.submissions, 0);
-            assert_eq!(writer.submissions, 0);
-            assert_eq!(prefix, b"raw"[..]);
-            assert_eq!(kind, UpgradeKind::Protocol);
-            assert_eq!(upgrade.await.unwrap_err().kind(), ErrorKind::Upgrade);
-
-            let (pending, mut slot) = channel();
-            let upgrade = slot.claim::<Reader, Writer>();
-            drop(upgrade);
-            let handed_off = Upgraded {
-                reader: Reader::new([]),
-                writer: Writer::new([]),
-                read_ahead: Bytes::new(),
-                kind: UpgradeKind::Tunnel,
-            };
-            assert!(pending.fulfill(handed_off).is_err());
-        });
-    }
-
-    #[test]
     fn upgrade_claim_is_one_shot_and_non_upgrade_wakes_the_future() {
         karmaio::Runtime::new().unwrap().block_on(async {
             let (pending, mut slot) = channel();
-            let upgrade = slot.claim::<(), ()>();
+            let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+            let waker = Waker::from(count.clone());
+            let mut upgrade = pin!(slot.claim::<(), ()>());
+            assert!(upgrade.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
             let duplicate = slot.claim::<(), ()>();
             assert_eq!(duplicate.await.unwrap_err().kind(), ErrorKind::Upgrade);
             drop(pending);
+            assert!(count.0.load(Ordering::Relaxed) > 0);
             assert_eq!(upgrade.await.unwrap_err().kind(), ErrorKind::Upgrade);
         });
     }

@@ -493,6 +493,7 @@ mod tests {
         let recycled = Rc::new(Cell::new(0));
         let mut left: Either<TestBody, Full<bytes::Bytes>> =
             Either::Left(TestBody::data(b"left", Rc::clone(&recycled)));
+        assert_eq!(left.size_hint(), SizeHint::with_exact(4));
         let data = complete(left.next_frame())
             .unwrap()
             .expect("missing frame")
@@ -510,23 +511,24 @@ mod tests {
             .expect("missing data");
         assert_eq!(data.as_init(), b"right");
         right.recycle(data);
+        // A frame can outlive the enum variant that produced it. Recycling it
+        // after replacement must not call either producer's recycling callback.
+        left = Either::Left(TestBody::data(b"old", Rc::clone(&recycled)));
+        let old = complete(left.next_frame()).unwrap().unwrap().into_data().unwrap();
+        left = Either::Right(Full::new(bytes::Bytes::from_static(b"new")));
+        left.recycle(old);
+        assert_eq!(recycled.get(), 1);
+        assert_eq!(
+            complete(left.next_frame())
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap()
+                .as_init(),
+            b"new"
+        );
         let mut failed: Either<TestBody, Empty> = Either::Left(TestBody::error("failure"));
         assert!(matches!(complete(failed.next_frame()), Err(Either::Left("failure"))));
-    }
-
-    #[test]
-    fn either_left_forwards_frames_length_and_recycling() {
-        let recycled = Rc::new(Cell::new(0));
-        let mut body: Either<TestBody, OtherBody> = Either::Left(TestBody::data(b"left", Rc::clone(&recycled)));
-
-        assert_eq!(body.size_hint(), SizeHint::with_exact(4));
-        let data = complete(body.next_frame())
-            .unwrap()
-            .expect("missing frame")
-            .into_data()
-            .expect("missing data");
-        body.recycle(data);
-        assert_eq!(recycled.get(), 1);
     }
 
     #[test]
@@ -536,33 +538,6 @@ mod tests {
             Either::Right(OtherBody(TestBody::data(b"right", Rc::clone(&recycled))));
 
         assert_eq!(body.size_hint(), SizeHint::with_exact(5));
-        let data = complete(body.next_frame())
-            .unwrap()
-            .expect("missing frame")
-            .into_data()
-            .expect("missing data");
-        body.recycle(data);
-        assert_eq!(recycled.get(), 1);
-    }
-
-    #[test]
-    fn map_error_changes_only_the_error() {
-        let mut body = MapError::new(TestBody::error("body failed"), |error: &'static str| error.len());
-
-        assert_eq!(body.size_hint(), SizeHint::new());
-        assert!(matches!(
-            complete(body.next_frame()),
-            Err(length) if length == "body failed".len()
-        ));
-    }
-
-    #[test]
-    fn map_error_forwards_recycling() {
-        let recycled = Rc::new(Cell::new(0));
-        let mut body = MapError::new(TestBody::data(b"data", Rc::clone(&recycled)), |error: &'static str| {
-            error
-        });
-
         let data = complete(body.next_frame())
             .unwrap()
             .expect("missing frame")

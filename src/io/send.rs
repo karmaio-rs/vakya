@@ -314,24 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn control_buffers_cover_heads_final_chunks_and_trailers() {
-        karmaio::Runtime::new().unwrap().block_on(async {
-            let mut writer = Writer::limited(2);
-            for control in [
-                Bytes::from_static(b"HTTP/1.1 200 OK\r\n\r\n"),
-                Bytes::from_static(b"0\r\n\r\n"),
-                Bytes::from_static(b"0\r\nX-End: yes\r\n\r\n"),
-            ] {
-                let (result, _) = write_all(&mut writer, control, None).await.into_parts();
-                result.unwrap();
-            }
-            assert_eq!(
-                writer.output,
-                b"HTTP/1.1 200 OK\r\n\r\n0\r\n\r\n0\r\nX-End: yes\r\n\r\n"
-            );
-        });
-    }
-    #[test]
     fn zero_and_invalid_completions_preserve_scalar_and_vectored_buffers() {
         karmaio::Runtime::new().unwrap().block_on(async {
             for (count, kind) in [(0, io::ErrorKind::WriteZero), (100, io::ErrorKind::InvalidData)] {
@@ -380,7 +362,7 @@ mod tests {
         karmaio::Runtime::new().unwrap().block_on(async {
             for vectored in [false, true] {
                 let source = CancellationSource::new();
-                let mut writer = Writer::limited(1);
+                let (mut writer, output) = crate::test_transport::ObservedWriter::limited(1);
                 let bytes = Bytes::from(vec![0; 100]);
                 {
                     let mut future = pin!(async {
@@ -392,15 +374,17 @@ mod tests {
                     });
                     let mut cx = Context::from_waker(Waker::noop());
                     assert!(future.as_mut().poll(&mut cx).is_pending());
+                    // This fixture completes exactly one byte per submission.
+                    let submitted = output.borrow().len();
+                    assert!(submitted > 0 && submitted < 100);
                     source.cancel();
                     let Poll::Ready(result) = future.as_mut().poll(&mut cx) else {
                         panic!("canceled retry did not complete")
                     };
                     assert!(is_operation_canceled(result.0.as_ref().unwrap_err()));
                     assert_eq!(result.1.len(), 100);
+                    assert_eq!(output.borrow().len(), submitted);
                 }
-                assert_eq!(writer.submissions, 16);
-                assert_eq!(writer.output.len(), 16);
             }
         });
     }

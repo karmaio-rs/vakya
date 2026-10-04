@@ -244,42 +244,18 @@ fn validate(result: io::Result<usize>, buffer: &BytesMut, width: usize) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_transport::Gate;
     use karmaio::buf::IoBufMut;
     use std::{
-        cell::{Cell, RefCell},
+        cell::RefCell,
         collections::VecDeque,
-        future::poll_fn,
         rc::Rc,
         task::{Context, Poll, Waker},
     };
 
-    #[derive(Default)]
-    struct Gate {
-        open: Cell<bool>,
-        waker: RefCell<Option<Waker>>,
-    }
-    impl Gate {
-        async fn wait(&self) {
-            poll_fn(|cx| {
-                if self.open.get() {
-                    Poll::Ready(())
-                } else {
-                    self.waker.replace(Some(cx.waker().clone()));
-                    Poll::Pending
-                }
-            })
-            .await
-        }
-        fn open(&self) {
-            self.open.set(true);
-            if let Some(waker) = self.waker.borrow_mut().take() {
-                waker.wake();
-            }
-        }
-    }
     struct Reader {
         input: VecDeque<u8>,
-        gate: Rc<Gate>,
+        gate: Gate,
         pointers: Rc<RefCell<Vec<usize>>>,
         widths: Rc<RefCell<Vec<usize>>>,
         failure: bool,
@@ -308,10 +284,13 @@ mod tests {
     fn reader(input: &[u8], open: bool) -> Reader {
         Reader {
             input: input.iter().copied().collect(),
-            gate: Rc::new(Gate {
-                open: Cell::new(open),
-                ..Gate::default()
-            }),
+            gate: {
+                let gate = Gate::default();
+                if open {
+                    gate.open();
+                }
+                gate
+            },
             pointers: Default::default(),
             widths: Default::default(),
             failure: false,

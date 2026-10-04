@@ -17,6 +17,7 @@ use std::{
     sync::Arc,
     task::Poll,
 };
+use support::future::pair;
 use support::transport::Gate;
 use vakya::{
     Request, Response,
@@ -151,31 +152,6 @@ impl<I: IntoOwnedSplit> IntoOwnedSplit for HoldClose<I> {
             },
         )
     }
-}
-
-async fn pair<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
-    let mut a = pin!(a);
-    let mut b = pin!(b);
-    let mut first = None;
-    let mut second = None;
-    poll_fn(|cx| {
-        if first.is_none()
-            && let Poll::Ready(value) = a.as_mut().poll(cx)
-        {
-            first = Some(value);
-        }
-        if second.is_none()
-            && let Poll::Ready(value) = b.as_mut().poll(cx)
-        {
-            second = Some(value);
-        }
-        if first.is_some() && second.is_some() {
-            Poll::Ready((first.take().unwrap(), second.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
 }
 
 fn request<B>(body: B) -> Request<B> {

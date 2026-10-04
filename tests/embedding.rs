@@ -1,97 +1,25 @@
 #![cfg(any(feature = "client", feature = "server"))]
 mod support;
 use bytes::Bytes;
-use std::{
-    future::{Future, poll_fn},
-    pin::pin,
-    task::Poll,
-};
-use support::transport::{ReadStep, Reader, Writer};
+use std::pin::pin;
+use support::future::poll;
+use support::transport::{ReadStep, Reader};
 #[cfg(feature = "server")]
 use vakya::body::Empty;
 #[cfg(feature = "client")]
 use vakya::body::Full;
 use vakya::{Request, connection::ConnectionOutcome};
 
-async fn pair<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
-    let mut first = pin!(first);
-    let mut second = pin!(second);
-    let (mut a, mut b) = (None, None);
-    poll_fn(|cx| {
-        if a.is_none()
-            && let Poll::Ready(value) = first.as_mut().poll(cx)
-        {
-            a = Some(value);
-        }
-        if b.is_none()
-            && let Poll::Ready(value) = second.as_mut().poll(cx)
-        {
-            b = Some(value);
-        }
-        if a.is_some() && b.is_some() {
-            Poll::Ready((a.take().unwrap(), b.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn boxed_client_keeps_borrowed_body_and_concrete_outcome() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        let mut body = Full::new(Bytes::from_static(b"upload"));
-        let (sender, connection) = vakya::client::conn::http1::Builder::new().handshake((
-            Reader::new([ReadStep::Data(Bytes::from_static(
-                b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n",
-            ))]),
-            Writer::new([]),
-        ));
-        let connection: vakya::client::conn::http1::BoxedConnection<'_, Reader, Writer> = connection.boxed();
-        let pending = sender
-            .start_request(
-                Request::builder()
-                    .uri("/")
-                    .header("host", "test")
-                    .body(&mut body)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let (outcome, response) = pair(connection.run(), pending.response()).await;
-        assert!(matches!(outcome.unwrap(), ConnectionOutcome::Closed));
-        assert_eq!(response.unwrap().status(), 204);
-    });
-}
-
-#[cfg(feature = "server")]
-#[test]
-fn boxed_server_keeps_borrowed_local_service_and_control() {
-    karmaio::Runtime::new().unwrap().block_on(async {
-        let calls = std::cell::Cell::new(0);
-        let service = vakya::server::request_service_fn(async |_: Request<vakya::body::Incoming>| {
-            calls.set(calls.get() + 1);
-            Ok::<_, std::convert::Infallible>(vakya::Response::new(Empty::new()))
-        });
-        let connection =
-            vakya::server::conn::http1::Builder::new().serve_connection((Reader::new([]), Writer::new([])), service);
-        let control = connection.control();
-        let connection: vakya::server::conn::http1::BoxedConnection<'_, Reader, Writer> = connection.boxed();
-        control.graceful_shutdown();
-        assert!(matches!(connection.run().await.unwrap(), ConnectionOutcome::Closed));
-        assert_eq!(calls.get(), 0);
-    });
-}
-
 struct Flags {
     flush: support::transport::Gate,
     flushing: std::cell::Cell<bool>,
     shutdowns: std::cell::Cell<usize>,
+    output: std::cell::RefCell<Vec<u8>>,
 }
 struct CountWriter(std::rc::Rc<Flags>);
 impl karmaio::io::AsyncWrite for CountWriter {
     async fn write<B: karmaio::buf::IoBuf>(&mut self, buffer: B) -> karmaio::buf::BufResult<usize, B> {
+        self.0.output.borrow_mut().extend_from_slice(buffer.as_init());
         karmaio::buf::BufResult(Ok(buffer.as_init().len()), buffer)
     }
     async fn flush(&mut self) -> std::io::Result<()> {
@@ -109,10 +37,8 @@ fn flags() -> std::rc::Rc<Flags> {
         flush: Default::default(),
         flushing: Default::default(),
         shutdowns: Default::default(),
+        output: Default::default(),
     })
-}
-fn poll<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
 }
 
 #[cfg(feature = "client")]
@@ -120,23 +46,25 @@ fn poll<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 fn client_recovery_waits_for_flush_preserves_read_ahead_and_avoids_shutdown() {
     karmaio::Runtime::new().unwrap().block_on(async {
         let flags = flags();
+        let mut body = Full::new(Bytes::from_static(b"upload"));
         let (sender, connection) = vakya::client::conn::http1::Builder::new().handshake((
             Reader::new([ReadStep::Data(Bytes::from_static(
                 b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\nprefix",
             ))]),
             CountWriter(flags.clone()),
         ));
+        let connection: vakya::client::conn::http1::BoxedConnection<'_, Reader, CountWriter> = connection.boxed();
         let pending = sender
             .start_request(
                 Request::builder()
                     .uri("/")
                     .header("host", "test")
-                    .body(vakya::body::Empty::new())
+                    .body(&mut body)
                     .unwrap(),
             )
             .await
             .unwrap();
-        let mut run = pin!(connection.boxed().run_without_shutdown());
+        let mut run = pin!(connection.run_without_shutdown());
         assert!(poll(run.as_mut()).is_pending());
         pending.response().await.unwrap();
         assert!(poll(run.as_mut()).is_pending());
@@ -147,6 +75,7 @@ fn client_recovery_waits_for_flush_preserves_read_ahead_and_avoids_shutdown() {
             panic!("missing recovered parts")
         };
         assert_eq!(parts.read_ahead, "prefix");
+        assert!(flags.output.borrow().ends_with(b"upload"));
         assert_eq!(parts.reader.submissions, 1);
         assert!(std::rc::Rc::ptr_eq(&parts.writer.0, &flags));
         assert_eq!(flags.shutdowns.get(), 0);
@@ -160,7 +89,9 @@ fn server_recovery_settles_idle_read_and_preserves_bytes_returned_after_cancel()
         let complete = support::transport::Gate::default();
         let flags = flags();
         flags.flush.open();
+        let calls = std::cell::Cell::new(0);
         let service = vakya::server::request_service_fn(async |_: Request<vakya::body::Incoming>| {
+            calls.set(calls.get() + 1);
             panic!("unadmitted idle input must be returned");
             #[allow(unreachable_code)]
             Ok::<_, std::convert::Infallible>(vakya::Response::new(Empty::new()))
@@ -176,6 +107,7 @@ fn server_recovery_settles_idle_read_and_preserves_bytes_returned_after_cancel()
             service,
         );
         let control = connection.control();
+        let connection: vakya::server::conn::http1::BoxedConnection<'_, Reader, CountWriter> = connection.boxed();
         let mut run = pin!(connection.run_without_shutdown());
         assert!(poll(run.as_mut()).is_pending());
         control.graceful_shutdown();
@@ -186,6 +118,7 @@ fn server_recovery_settles_idle_read_and_preserves_bytes_returned_after_cancel()
             panic!("missing recovered parts")
         };
         assert_eq!(parts.read_ahead, "GET /pending HTTP/1.1\r\n");
+        assert_eq!(calls.get(), 0);
         assert_eq!(parts.reader.submissions, 1);
         assert_eq!(flags.shutdowns.get(), 0);
     });
