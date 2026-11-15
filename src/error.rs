@@ -178,6 +178,27 @@ enum Source {
 }
 
 impl Error {
+    /// Converts an owned body-source error without imposing thread-safety bounds.
+    ///
+    /// An existing Vakya error retains its category, detail, and source. I/O errors
+    /// use the ordinary I/O conversion, preserving cancellation, timeout, and TLS
+    /// classification. Other sources are classified as [`ErrorKind::Body`].
+    /// Source details remain available through [`StdError::source`] and are never
+    /// included in this error's formatted diagnostic text.
+    pub fn from_body(source: impl Into<Box<dyn StdError + 'static>>) -> Self {
+        let source = match source.into().downcast::<Self>() {
+            Ok(error) => return *error,
+            Err(source) => source,
+        };
+        let source = match source.downcast::<io::Error>() {
+            Ok(error) => return Self::from(*error),
+            Err(source) => source,
+        };
+        let mut error = Self::new(ErrorKind::Body, "HTTP body production failed");
+        error.source = Some(Source::Owned(source));
+        error
+    }
+
     pub(crate) fn new(kind: ErrorKind, context: &'static str) -> Self {
         Self {
             kind,
